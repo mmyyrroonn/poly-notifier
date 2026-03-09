@@ -20,5 +20,5 @@ default_cooldown_minutes = 60
 daily_summary_cron = "0 0 9 * * *"  # 9:00 UTC daily
 
 [admin]
-port = 3000
+port = 36363
 # Password set via ADMIN_PASSWORD env var
