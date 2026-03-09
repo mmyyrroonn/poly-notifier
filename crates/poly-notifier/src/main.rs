@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use dotenvy::dotenv;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -20,6 +21,9 @@ use pn_scheduler::DailySummaryJob;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file (ignore if missing)
+    let _ = dotenv();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(

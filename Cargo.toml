@@ -50,6 +50,7 @@ anyhow = "1"
 
 # Config
 config = "0.14"
+dotenvy = "0.15"
 
 # Concurrency
 dashmap = "6"
