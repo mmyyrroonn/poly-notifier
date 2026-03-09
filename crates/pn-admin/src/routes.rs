@@ -26,11 +26,11 @@ use crate::{auth::auth_middleware, handlers, AdminState};
 pub fn build_router(state: AdminState) -> Router {
     Router::new()
         .route(
-            "/admin/users/:telegram_id/tier",
+            "/admin/users/{telegram_id}/tier",
             put(handlers::update_tier),
         )
         .route(
-            "/admin/users/:telegram_id/limit",
+            "/admin/users/{telegram_id}/limit",
             put(handlers::update_limit),
         )
         .route("/admin/users", get(handlers::list_users))
