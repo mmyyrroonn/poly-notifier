@@ -1,10 +1,7 @@
 //! Command handler implementations.
 //!
 //! Each function corresponds to one [`Command`] variant and is called by the
-//! teloxide dispatcher after the command text has been parsed.  All handlers
-//! use dependency injection via teloxide's [`DependencyMap`]: the pool,
-//! `bot_id`, and API clients are stored in the map and extracted by the
-//! handler signatures.
+//! teloxide dispatcher after the command text has been parsed.
 
 use std::sync::Arc;
 
@@ -20,7 +17,7 @@ use teloxide::utils::command::BotCommands;
 use crate::{
     commands::Command,
     dialogues::{handle_alert_start, handle_subscribe_start, MyDialogue},
-    keyboards::{alert_list_keyboard, unsubscribe_keyboard},
+    keyboards::unsubscribe_keyboard,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,8 +113,6 @@ pub async fn list(
             serde_json::from_str(&s.last_prices).unwrap_or_default();
 
         let outcome_label = {
-            // The token_ids column is a JSON array of token IDs, not labels;
-            // we need the outcomes column.  Use a separate query for the label.
             let row = sqlx::query(
                 "SELECT outcomes FROM markets WHERE condition_id = ?",
             )
@@ -138,11 +133,35 @@ pub async fn list(
 
         let price_str = last_prices
             .get(s.outcome_index as usize)
-            .map(|p| format!("${:.2}", p))
+            .map(|p| format!("{:.0}%", *p * 100.0))
             .unwrap_or_else(|| "N/A".to_string());
+
+        // Show alerts for this subscription.
+        let alert_rows = sqlx::query(
+            "SELECT alert_type, threshold FROM alerts WHERE subscription_id = ? ORDER BY created_at",
+        )
+        .bind(s.subscription_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        let alert_str = if alert_rows.is_empty() {
+            "   No alerts".to_string()
+        } else {
+            alert_rows
+                .iter()
+                .map(|r| {
+                    let at: String = r.get("alert_type");
+                    let th: f64 = r.get("threshold");
+                    format!("   Alert: {} {:.0}%", at, th * 100.0)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
         lines.push(format!("{}. {}", i + 1, s.question));
         lines.push(format!("   {} @ {}", outcome_label, price_str));
+        lines.push(alert_str);
         lines.push(String::new());
     }
 
@@ -218,7 +237,11 @@ pub async fn prices(
         let price = match clob_client.get_midpoints(&[token_id.clone()]).await {
             Ok(map) => map
                 .get(token_id)
-                .map(|p| format!("${:.4}", p))
+                .map(|p| {
+                    use rust_decimal::Decimal;
+                    let pct = *p * Decimal::from(100);
+                    format!("{pct:.0}%")
+                })
                 .unwrap_or_else(|| "N/A".to_string()),
             Err(e) => {
                 warn!(token_id, error=%e, "failed to fetch CLOB midpoints");
@@ -280,77 +303,6 @@ pub async fn unsubscribe(
 }
 
 // ---------------------------------------------------------------------------
-// /remove_alert
-// ---------------------------------------------------------------------------
-
-/// Show an inline keyboard of the user's alerts; removal is handled by the
-/// callback-query handler in `lib.rs`.
-#[instrument(skip_all)]
-pub async fn remove_alert(
-    bot: Bot,
-    msg: Message,
-    pool: SqlitePool,
-    bot_id: Arc<String>,
-) -> anyhow::Result<()> {
-    let telegram_id = match msg.from.as_ref() {
-        Some(u) => u.id.0 as i64,
-        None => return Ok(()),
-    };
-
-    let user = get_or_create_user(&pool, telegram_id, &bot_id, None).await?;
-
-    // Fetch all alerts for this user via a join.
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            a.id,
-            a.alert_type,
-            a.threshold,
-            m.question,
-            s.outcome_index
-        FROM alerts a
-        JOIN subscriptions s ON s.id = a.subscription_id
-        JOIN markets m ON m.id = s.market_id
-        WHERE s.user_id = ?
-        ORDER BY a.created_at
-        "#,
-    )
-    .bind(user.id)
-    .fetch_all(&pool)
-    .await?;
-
-    if rows.is_empty() {
-        bot.send_message(msg.chat.id, "You have no active alerts.")
-            .await?;
-        return Ok(());
-    }
-
-    let items: Vec<(i64, String)> = rows
-        .into_iter()
-        .map(|r: sqlx::sqlite::SqliteRow| {
-            let id: i64 = r.get("id");
-            let alert_type: String = r.get("alert_type");
-            let threshold: f64 = r.get("threshold");
-            let question: String = r.get("question");
-            let outcome_index: i64 = r.get("outcome_index");
-            let label = format!(
-                "{} | {} @ {:.2} (outcome {})",
-                question, alert_type, threshold, outcome_index
-            );
-            (id, label)
-        })
-        .collect();
-
-    let kb = alert_list_keyboard(&items);
-
-    bot.send_message(msg.chat.id, "Select an alert to remove:")
-        .reply_markup(kb)
-        .await?;
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // /timezone
 // ---------------------------------------------------------------------------
 
@@ -380,8 +332,6 @@ pub async fn timezone(
 
     let tz_str = tz_str.trim().to_string();
 
-    // Basic validation: check the string is non-empty and doesn't contain
-    // clearly invalid characters.
     if tz_str.contains([';', '\'', '"', '\\']) {
         bot.send_message(msg.chat.id, "Invalid timezone string.").await?;
         return Ok(());
@@ -411,6 +361,7 @@ pub async fn timezone(
 // ---------------------------------------------------------------------------
 
 /// Handle an `"unsub:{id}"` callback – deactivate a subscription.
+/// Alerts are cascade-deleted by the DB when the subscription is removed.
 #[instrument(skip_all)]
 pub async fn callback_unsubscribe(
     bot: Bot,
@@ -425,61 +376,23 @@ pub async fn callback_unsubscribe(
         None => return Ok(()),
     };
 
-    let result = sqlx::query("UPDATE subscriptions SET is_active = 0 WHERE id = ?")
+    // Delete the subscription row so CASCADE removes associated alerts.
+    let result = sqlx::query("DELETE FROM subscriptions WHERE id = ?")
         .bind(sub_id)
         .execute(&pool)
         .await;
 
     match result {
         Ok(r) if r.rows_affected() > 0 => {
-            bot.send_message(chat_id, "Subscription removed.").await?;
+            bot.send_message(chat_id, "Subscription and its alerts removed.")
+                .await?;
         }
         Ok(_) => {
             bot.send_message(chat_id, "Subscription not found.").await?;
         }
         Err(e) => {
-            warn!(error=%e, sub_id, "failed to deactivate subscription");
+            warn!(error=%e, sub_id, "failed to delete subscription");
             bot.send_message(chat_id, "Failed to remove subscription.").await?;
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Callback-query: remove alert
-// ---------------------------------------------------------------------------
-
-/// Handle an `"rm_alert:{id}"` callback – delete an alert.
-#[instrument(skip_all)]
-pub async fn callback_remove_alert(
-    bot: Bot,
-    q: CallbackQuery,
-    pool: SqlitePool,
-    alert_id: i64,
-) -> anyhow::Result<()> {
-    bot.answer_callback_query(q.id.clone()).await?;
-
-    let result = sqlx::query("DELETE FROM alerts WHERE id = ?")
-        .bind(alert_id)
-        .execute(&pool)
-        .await;
-
-    let chat_id = match q.message.as_ref() {
-        Some(m) => m.chat().id,
-        None => return Ok(()),
-    };
-
-    match result {
-        Ok(r) if r.rows_affected() > 0 => {
-            bot.send_message(chat_id, "Alert removed.").await?;
-        }
-        Ok(_) => {
-            bot.send_message(chat_id, "Alert not found.").await?;
-        }
-        Err(e) => {
-            warn!(error=%e, alert_id, "failed to delete alert");
-            bot.send_message(chat_id, "Failed to remove alert.").await?;
         }
     }
 

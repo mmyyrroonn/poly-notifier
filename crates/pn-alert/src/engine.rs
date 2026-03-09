@@ -421,15 +421,16 @@ fn format_notification(rule: &AlertRule, price: Decimal, update: &PriceUpdate) -
 
     let timestamp = update.timestamp.format("%Y-%m-%d %H:%M:%S UTC");
 
+    let threshold_pct = rule.threshold * Decimal::from(100);
     format!(
         "🔔 <b>Price Alert</b>\n\n\
          📊 {question}\n\
-         📈 Type: {alert_type} {threshold}\n\
+         📈 Type: {alert_type} {threshold}%\n\
          💰 Current: {price}\n\
          ⏰ {timestamp}",
         question = rule.market_question,
         alert_type = alert_type_label,
-        threshold = rule.threshold,
+        threshold = threshold_pct,
         price = price,
         timestamp = timestamp,
     )
@@ -474,7 +475,7 @@ mod tests {
         assert!(msg.contains("Price Alert"));
         assert!(msg.contains("Will X happen?"));
         assert!(msg.contains("Above"));
-        assert!(msg.contains("0.70"));
+        assert!(msg.contains("70"));
         assert!(msg.contains("0.75"));
     }
 }

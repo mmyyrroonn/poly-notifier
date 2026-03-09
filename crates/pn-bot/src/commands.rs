@@ -40,10 +40,6 @@ pub enum Command {
     #[command(description = "List your subscriptions")]
     List,
 
-    /// Remove an alert via inline keyboard.
-    #[command(description = "Remove an alert")]
-    RemoveAlert,
-
     /// Fetch and display current prices for subscribed markets.
     #[command(description = "Check current prices")]
     Prices,

@@ -102,20 +102,6 @@ pub fn unsubscribe_keyboard(subscriptions: &[(i64, String)]) -> InlineKeyboardMa
     InlineKeyboardMarkup::new(rows)
 }
 
-/// Keyboard listing user alerts for removal.
-///
-/// `alerts` is a slice of `(alert_id, display_label)` pairs.
-///
-/// Callback data format: `"rm_alert:{id}"`.
-pub fn alert_list_keyboard(alerts: &[(i64, String)]) -> InlineKeyboardMarkup {
-    let rows: Vec<Vec<InlineKeyboardButton>> = alerts
-        .iter()
-        .map(|(id, label)| vec![button(truncate(label), format!("rm_alert:{id}"))])
-        .collect();
-
-    InlineKeyboardMarkup::new(rows)
-}
-
 /// Simple Yes/No confirmation keyboard.
 ///
 /// Callback data: `"confirm:yes"` or `"confirm:no"`.

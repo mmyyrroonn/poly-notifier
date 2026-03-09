@@ -105,6 +105,50 @@ impl GammaClient {
         Ok(markets)
     }
 
+    /// Look up markets by the event slug (the URL path segment).
+    ///
+    /// Queries `GET /events?slug={slug}` and returns a flattened list of all
+    /// markets in the matching event.  If the slug lookup yields no results,
+    /// falls back to a title search via [`search_markets`].
+    #[instrument(skip(self), fields(slug))]
+    pub async fn get_market_by_slug(&self, slug: &str) -> Result<Vec<GammaMarket>> {
+        let url = format!("{}/events", self.base_url);
+        debug!(%url, %slug, "fetching Gamma markets by slug");
+
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("slug", slug)])
+            .send()
+            .await
+            .with_context(|| format!("GET {url} failed"))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .with_context(|| "reading Gamma slug response body")?;
+
+        if !status.is_success() {
+            anyhow::bail!("Gamma API returned {status} for slug '{slug}': {body}");
+        }
+
+        let events: Vec<GammaEvent> =
+            serde_json::from_str(&body).with_context(|| "parsing Gamma events JSON")?;
+
+        let markets: Vec<GammaMarket> = events
+            .into_iter()
+            .flat_map(flatten_event)
+            .collect();
+
+        if markets.is_empty() {
+            debug!(%slug, "slug lookup returned no markets, falling back to title search");
+            return self.search_markets(slug).await;
+        }
+
+        Ok(markets)
+    }
+
     /// Retrieve a single market by its `condition_id`.
     ///
     /// Queries `GET /events?condition_id={condition_id}` and returns the first
