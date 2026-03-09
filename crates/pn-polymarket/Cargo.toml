@@ -1,0 +1,19 @@
+[package]
+name = "pn-polymarket"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pn-common = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }

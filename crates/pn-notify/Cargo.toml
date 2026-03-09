@@ -1,0 +1,15 @@
+[package]
+name = "pn-notify"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pn-common = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+teloxide = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+dashmap = { workspace = true }

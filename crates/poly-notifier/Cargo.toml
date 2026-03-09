@@ -1,0 +1,25 @@
+[package]
+name = "poly-notifier"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "poly-notifier"
+path = "src/main.rs"
+
+[dependencies]
+pn-common = { workspace = true }
+pn-polymarket = { workspace = true }
+pn-monitor = { workspace = true }
+pn-alert = { workspace = true }
+pn-notify = { workspace = true }
+pn-bot = { workspace = true }
+pn-scheduler = { workspace = true }
+pn-admin = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+teloxide = { workspace = true }

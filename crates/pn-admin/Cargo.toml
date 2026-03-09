@@ -1,0 +1,15 @@
+[package]
+name = "pn-admin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pn-common = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

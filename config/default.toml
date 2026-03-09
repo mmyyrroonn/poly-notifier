@@ -1,0 +1,24 @@
+[database]
+url = "sqlite:poly-notifier.db"
+max_connections = 5
+
+[telegram]
+# Bot tokens set via TELEGRAM_BOT_TOKENS env var
+rate_limit_per_user = 20  # messages per minute
+
+[monitor]
+subscription_refresh_interval_secs = 60
+ws_ping_interval_secs = 10
+reconnect_base_delay_secs = 1
+reconnect_max_delay_secs = 60
+
+[alert]
+cache_refresh_interval_secs = 30
+default_cooldown_minutes = 60
+
+[scheduler]
+daily_summary_cron = "0 0 9 * * *"  # 9:00 UTC daily
+
+[admin]
+port = 3000
+# Password set via ADMIN_PASSWORD env var

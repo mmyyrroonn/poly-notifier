@@ -1,0 +1,17 @@
+[package]
+name = "pn-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pn-common = { workspace = true }
+pn-polymarket = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true }

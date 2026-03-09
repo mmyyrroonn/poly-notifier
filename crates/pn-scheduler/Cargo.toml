@@ -1,0 +1,15 @@
+[package]
+name = "pn-scheduler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pn-common = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+cron = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
