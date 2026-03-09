@@ -133,7 +133,7 @@ pub async fn list(
 
         let price_str = last_prices
             .get(s.outcome_index as usize)
-            .map(|p| format!("{:.0}%", *p * 100.0))
+            .map(|p| format!("{:.1}%", *p * 100.0))
             .unwrap_or_else(|| "N/A".to_string());
 
         // Show alerts for this subscription.
@@ -240,7 +240,7 @@ pub async fn prices(
                 .map(|p| {
                     use rust_decimal::Decimal;
                     let pct = *p * Decimal::from(100);
-                    format!("{pct:.0}%")
+                    format!("{pct:.1}%")
                 })
                 .unwrap_or_else(|| "N/A".to_string()),
             Err(e) => {
