@@ -106,7 +106,12 @@ pub async fn list(
         return Ok(());
     }
 
-    let mut lines = vec!["Your Subscriptions:".to_string(), String::new()];
+    let used = subs.len();
+    let max = user.max_subscriptions as usize;
+    let mut lines = vec![
+        format!("Your Subscriptions ({used}/{max}):"),
+        String::new(),
+    ];
 
     for (i, s) in subs.iter().enumerate() {
         let last_prices: Vec<f64> =
