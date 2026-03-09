@@ -232,6 +232,19 @@ pub struct NotificationLog {
 }
 
 // ---------------------------------------------------------------------------
+// feedback
+// ---------------------------------------------------------------------------
+
+/// A user-submitted feedback message.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Feedback {
+    pub id: i64,
+    pub user_id: i64,
+    pub message: String,
+    pub created_at: NaiveDateTime,
+}
+
+// ---------------------------------------------------------------------------
 // Joined / enriched types used by query helpers
 // ---------------------------------------------------------------------------
 

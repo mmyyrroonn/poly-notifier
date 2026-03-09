@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::{
     error::{Error, Result},
-    models::{Alert, Market, NotificationLog, Subscription, SubscriptionDetail, User},
+    models::{Alert, Feedback, Market, NotificationLog, Subscription, SubscriptionDetail, User},
 };
 
 // ---------------------------------------------------------------------------
@@ -438,6 +438,59 @@ pub async fn resolve_user_id_by_telegram(
 
     Ok(row.map(|(id,)| id))
 }
+
+// ---------------------------------------------------------------------------
+// Feedback helpers
+// ---------------------------------------------------------------------------
+
+/// Insert a feedback message and return its `id`.
+pub async fn insert_feedback(
+    pool: &SqlitePool,
+    user_id: i64,
+    message: &str,
+) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO feedback (user_id, message) VALUES (?, ?) RETURNING id",
+    )
+    .bind(user_id)
+    .bind(message)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+/// Return the most recent feedback timestamp for a user, or `None` if they
+/// have never submitted feedback.
+pub async fn get_last_feedback_time(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Option<chrono::NaiveDateTime>> {
+    let row: Option<(chrono::NaiveDateTime,)> = sqlx::query_as(
+        "SELECT created_at FROM feedback WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(ts,)| ts))
+}
+
+/// Fetch all feedback entries, newest first.
+pub async fn get_all_feedback(pool: &SqlitePool) -> Result<Vec<Feedback>> {
+    sqlx::query_as(
+        "SELECT id, user_id, message, created_at \
+         FROM feedback \
+         ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Database)
+}
+
+// ---------------------------------------------------------------------------
+// Notification log helpers (continued)
+// ---------------------------------------------------------------------------
 
 /// Fetch recent notification log entries for a user, newest first.
 pub async fn get_recent_notifications(

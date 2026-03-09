@@ -9,7 +9,10 @@ use sqlx::{Row, SqlitePool};
 use teloxide::prelude::*;
 use tracing::{instrument, warn};
 
-use pn_common::db::{count_active_subscriptions, get_or_create_user, get_user_subscriptions};
+use pn_common::db::{
+    count_active_subscriptions, get_last_feedback_time, get_or_create_user,
+    get_user_subscriptions, insert_feedback,
+};
 use pn_polymarket::ClobClient;
 
 use teloxide::utils::command::BotCommands;
@@ -400,6 +403,71 @@ pub async fn callback_unsubscribe(
             bot.send_message(chat_id, "Failed to remove subscription.").await?;
         }
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// /feedback
+// ---------------------------------------------------------------------------
+
+/// Accept a one-line feedback message from the user, rate-limited to once per
+/// hour.  Usage: `/feedback Your message here`
+#[instrument(skip_all)]
+pub async fn feedback(
+    bot: Bot,
+    msg: Message,
+    pool: SqlitePool,
+    bot_id: Arc<String>,
+) -> anyhow::Result<()> {
+    let telegram_id = match msg.from.as_ref() {
+        Some(u) => u.id.0 as i64,
+        None => return Ok(()),
+    };
+
+    // Extract the feedback text: everything after "/feedback ".
+    let text = msg.text().unwrap_or_default();
+    let body = text
+        .strip_prefix("/feedback")
+        .map(|s| s.trim())
+        .unwrap_or("");
+
+    if body.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "Usage: /feedback <your message>\n\nExample: /feedback I'd love to see Bitcoin markets!",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if body.len() > 1000 {
+        bot.send_message(msg.chat.id, "Feedback is too long. Please keep it under 1000 characters.")
+            .await?;
+        return Ok(());
+    }
+
+    let user = get_or_create_user(&pool, telegram_id, &bot_id, None).await?;
+
+    // Rate limit: 1 feedback per hour.
+    if let Some(last) = get_last_feedback_time(&pool, user.id).await? {
+        let elapsed = chrono::Utc::now().naive_utc() - last;
+        let remaining = chrono::Duration::hours(1) - elapsed;
+        if remaining > chrono::Duration::zero() {
+            let mins = remaining.num_minutes() + 1;
+            bot.send_message(
+                msg.chat.id,
+                format!("You can submit feedback again in {mins} minute(s)."),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    insert_feedback(&pool, user.id, body).await?;
+
+    bot.send_message(msg.chat.id, "Thank you for your feedback! 🙏")
+        .await?;
 
     Ok(())
 }

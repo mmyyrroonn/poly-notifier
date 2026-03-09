@@ -213,6 +213,48 @@ pub async fn list_users(State(state): State<AdminState>) -> Response {
 // GET /admin/stats
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// GET /admin/feedback
+// ---------------------------------------------------------------------------
+
+/// Single entry in the feedback list response.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct FeedbackListEntry {
+    pub id: i64,
+    pub user_id: i64,
+    pub telegram_id: i64,
+    pub username: Option<String>,
+    pub message: String,
+    pub created_at: String,
+}
+
+/// `GET /admin/feedback` — list all user feedback, newest first.
+pub async fn list_feedback(State(state): State<AdminState>) -> Response {
+    let result = sqlx::query_as::<_, FeedbackListEntry>(
+        "SELECT
+            f.id,
+            f.user_id,
+            u.telegram_id,
+            u.username,
+            f.message,
+            strftime('%Y-%m-%dT%H:%M:%SZ', f.created_at) AS created_at
+         FROM feedback f
+         JOIN users u ON u.id = f.user_id
+         ORDER BY f.created_at DESC",
+    )
+    .fetch_all(&state.pool)
+    .await;
+
+    match result {
+        Err(e) => db_error(e),
+        Ok(entries) => Json(entries).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /admin/stats
+// ---------------------------------------------------------------------------
+
 /// System-wide statistics returned by the stats endpoint.
 #[derive(Debug, Serialize)]
 pub struct StatsResponse {

@@ -34,6 +34,7 @@ pub fn build_router(state: AdminState) -> Router {
             put(handlers::update_limit),
         )
         .route("/admin/users", get(handlers::list_users))
+        .route("/admin/feedback", get(handlers::list_feedback))
         .route("/admin/stats", get(handlers::get_stats))
         .layer(middleware::from_fn_with_state(
             state.clone(),

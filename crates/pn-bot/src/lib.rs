@@ -42,7 +42,8 @@ use crate::{
         MyDialogue,
     },
     handlers::{
-        alert, callback_unsubscribe, help, list, prices, start, subscribe, timezone, unsubscribe,
+        alert, callback_unsubscribe, feedback, help, list, prices, start, subscribe, timezone,
+        unsubscribe,
     },
 };
 
@@ -112,6 +113,15 @@ fn schema() -> UpdateHandler<anyhow::Error> {
                      pool: SqlitePool,
                      bot_id: Arc<String>| async move {
                         alert(bot, dialogue, msg, pool, bot_id).await
+                    },
+                ))
+                .branch(dptree::case![Command::Feedback].endpoint(
+                    |bot: Bot,
+                     _dialogue: MyDialogue,
+                     msg: Message,
+                     pool: SqlitePool,
+                     bot_id: Arc<String>| async move {
+                        feedback(bot, msg, pool, bot_id).await
                     },
                 ))
                 .branch(dptree::case![Command::Timezone(tz)].endpoint(

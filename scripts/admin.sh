@@ -3,6 +3,7 @@
 # Usage:
 #   ./scripts/admin.sh users                      - list all users
 #   ./scripts/admin.sh stats                      - system stats
+#   ./scripts/admin.sh feedback                    - list all feedback
 #   ./scripts/admin.sh tier <telegram_id> <tier>  - set tier (free/premium/unlimited)
 #   ./scripts/admin.sh limit <telegram_id> <n>    - set max subscriptions
 
@@ -27,6 +28,9 @@ case "${1:-help}" in
   stats)
     curl -s -H "$AUTH" "$HOST/admin/stats" | jq .
     ;;
+  feedback)
+    curl -s -H "$AUTH" "$HOST/admin/feedback" | jq .
+    ;;
   tier)
     [[ $# -lt 3 ]] && echo "Usage: $0 tier <telegram_id> <free|premium|unlimited>" && exit 1
     curl -s -X PUT -H "$AUTH" -H "Content-Type: application/json" \
@@ -45,6 +49,7 @@ case "${1:-help}" in
     echo "Commands:"
     echo "  users                         List all users"
     echo "  stats                         System statistics"
+    echo "  feedback                      List all user feedback"
     echo "  tier  <telegram_id> <tier>    Set user tier (free/premium/unlimited)"
     echo "  limit <telegram_id> <n>       Set max subscriptions"
     echo ""

@@ -48,6 +48,10 @@ pub enum Command {
     #[command(description = "Set your timezone", parse_with = "split")]
     Timezone(String),
 
+    /// Send feedback to the developer.
+    #[command(description = "Send feedback")]
+    Feedback,
+
     /// Show the command descriptions.
     #[command(description = "Show help")]
     Help,
