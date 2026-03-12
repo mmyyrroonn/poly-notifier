@@ -67,6 +67,8 @@ pub struct EngineConfig {
     pub cache_refresh_interval_secs: u64,
     /// Fallback cooldown used when an alert row has `cooldown_minutes = 0`.
     pub default_cooldown_minutes: i64,
+    /// How often (seconds) in-memory prices are flushed to `markets.last_prices`.
+    pub price_flush_interval_secs: u64,
 }
 
 impl From<AlertConfig> for EngineConfig {
@@ -74,6 +76,7 @@ impl From<AlertConfig> for EngineConfig {
         Self {
             cache_refresh_interval_secs: cfg.cache_refresh_interval_secs,
             default_cooldown_minutes: cfg.default_cooldown_minutes,
+            price_flush_interval_secs: cfg.price_flush_interval_secs,
         }
     }
 }
@@ -96,6 +99,10 @@ pub struct AlertEngine {
     /// `token_id` → last observed price (for cross-detection).
     prev_prices: DashMap<String, Decimal>,
     dedup: AlertDedup,
+    /// `condition_id` → (market_id, ordered list of token_ids).
+    /// Used to map price updates back to the correct market and outcome index
+    /// so that `markets.last_prices` can be kept in sync.
+    condition_tokens: DashMap<String, (i64, Vec<String>)>,
 }
 
 impl AlertEngine {
@@ -117,6 +124,7 @@ impl AlertEngine {
             rule_cache: DashMap::new(),
             prev_prices: DashMap::new(),
             dedup: AlertDedup::new(),
+            condition_tokens: DashMap::new(),
         }
     }
 
@@ -138,6 +146,7 @@ impl AlertEngine {
             rule_cache: DashMap::new(),
             prev_prices: DashMap::new(),
             dedup: AlertDedup::new(),
+            condition_tokens: DashMap::new(),
         }
     }
 
@@ -156,6 +165,10 @@ impl AlertEngine {
         // Skip the first immediate tick – we already refreshed above.
         cache_ticker.tick().await;
 
+        let flush_interval = Duration::from_secs(self.config.price_flush_interval_secs);
+        let mut flush_ticker = time::interval(flush_interval);
+        flush_ticker.tick().await;
+
         info!("alert engine started");
 
         loop {
@@ -165,6 +178,10 @@ impl AlertEngine {
                 // Graceful shutdown takes highest priority.
                 _ = cancel_token.cancelled() => {
                     info!("alert engine shutting down");
+                    // Final flush before exit.
+                    if let Err(e) = self.flush_prices_to_db().await {
+                        error!("final price flush failed: {e:#}");
+                    }
                     break;
                 }
 
@@ -172,6 +189,13 @@ impl AlertEngine {
                 _ = cache_ticker.tick() => {
                     if let Err(e) = self.refresh_cache().await {
                         error!("alert cache refresh failed: {e:#}");
+                    }
+                }
+
+                // Periodic price flush to DB.
+                _ = flush_ticker.tick() => {
+                    if let Err(e) = self.flush_prices_to_db().await {
+                        error!("price flush to DB failed: {e:#}");
                     }
                 }
 
@@ -306,6 +330,100 @@ impl AlertEngine {
         self.dedup.load_from_alerts(&all_rules);
 
         debug!(rule_count = all_rules.len(), "alert cache refreshed");
+
+        // Also refresh the condition → (market_id, token_ids) mapping used for
+        // price persistence.
+        if let Err(e) = self.refresh_condition_tokens().await {
+            warn!("failed to refresh condition_tokens map: {e:#}");
+        }
+
+        Ok(())
+    }
+
+    /// Refresh the `condition_tokens` mapping from the database.
+    ///
+    /// Loads all active markets that have at least one active subscription so
+    /// that incoming price updates can be mapped back to the correct market row
+    /// and outcome index.
+    async fn refresh_condition_tokens(&self) -> anyhow::Result<()> {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT DISTINCT m.id, m.condition_id, m.token_ids \
+             FROM markets m \
+             INNER JOIN subscriptions s ON s.market_id = m.id \
+             WHERE m.is_active = 1 AND s.is_active = 1",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("fetching condition_tokens from DB")?;
+
+        self.condition_tokens.clear();
+        for (market_id, condition_id, token_ids_json) in rows {
+            let token_ids: Vec<String> = match serde_json::from_str(&token_ids_json) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    warn!(
+                        condition_id = %condition_id,
+                        "invalid token_ids JSON: {e}"
+                    );
+                    continue;
+                }
+            };
+            self.condition_tokens
+                .insert(condition_id, (market_id, token_ids));
+        }
+
+        debug!(
+            count = self.condition_tokens.len(),
+            "condition_tokens map refreshed"
+        );
+        Ok(())
+    }
+
+    /// Flush all in-memory prices to the database.
+    ///
+    /// For each condition in `condition_tokens`, build the `last_prices` JSON
+    /// array from `prev_prices` and write it to the `markets` table.
+    async fn flush_prices_to_db(&self) -> anyhow::Result<()> {
+        let mut flushed = 0u32;
+
+        for entry in self.condition_tokens.iter() {
+            let condition_id = entry.key();
+            let (market_id, token_ids) = entry.value();
+
+            // Build the prices array by looking up each token's latest price.
+            let prices: Vec<Decimal> = token_ids
+                .iter()
+                .map(|tid| {
+                    self.prev_prices
+                        .get(tid)
+                        .map(|p| *p)
+                        .unwrap_or(Decimal::ZERO)
+                })
+                .collect();
+
+            // Skip if all prices are zero (no updates received yet).
+            if prices.iter().all(|p| p.is_zero()) {
+                continue;
+            }
+
+            let prices_json = serde_json::to_string(&prices).unwrap_or_else(|_| "[]".to_string());
+
+            if let Err(e) =
+                pn_common::db::update_market_prices(&self.pool, *market_id, &prices_json).await
+            {
+                warn!(
+                    condition_id = %condition_id,
+                    market_id = market_id,
+                    "failed to flush prices: {e}"
+                );
+            } else {
+                flushed += 1;
+            }
+        }
+
+        if flushed > 0 {
+            debug!(flushed, "prices flushed to DB");
+        }
         Ok(())
     }
 

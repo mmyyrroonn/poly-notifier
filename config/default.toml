@@ -15,6 +15,7 @@ reconnect_max_delay_secs = 60
 [alert]
 cache_refresh_interval_secs = 30
 default_cooldown_minutes = 60
+price_flush_interval_secs = 30
 
 [scheduler]
 daily_summary_cron = "0 0 9 * * *"  # 9:00 UTC daily

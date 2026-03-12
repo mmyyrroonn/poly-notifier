@@ -30,7 +30,7 @@
 //! # let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
 //! # let (price_tx, price_rx): (tokio::sync::broadcast::Sender<PriceUpdate>, _) = tokio::sync::broadcast::channel(1024);
 //! # let (notify_tx, _notify_rx): (tokio::sync::mpsc::Sender<NotificationRequest>, _) = tokio::sync::mpsc::channel(1024);
-//! # let alert_cfg = AlertConfig { cache_refresh_interval_secs: 60, default_cooldown_minutes: 60 };
+//! # let alert_cfg = AlertConfig { cache_refresh_interval_secs: 60, default_cooldown_minutes: 60, price_flush_interval_secs: 30 };
 //! let cancel = CancellationToken::new();
 //! let engine = AlertEngine::new(pool, price_rx, notify_tx, alert_cfg);
 //! engine.run(cancel).await?;

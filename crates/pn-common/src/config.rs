@@ -43,6 +43,14 @@ pub struct AlertConfig {
     pub cache_refresh_interval_secs: u64,
     /// Default cooldown (minutes) before an alert may fire again.
     pub default_cooldown_minutes: i64,
+    /// How often (seconds) in-memory prices are flushed to the database.
+    /// Defaults to 30 seconds if omitted.
+    #[serde(default = "default_price_flush_interval")]
+    pub price_flush_interval_secs: u64,
+}
+
+fn default_price_flush_interval() -> u64 {
+    30
 }
 
 /// Scheduler settings.
