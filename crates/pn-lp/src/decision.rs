@@ -120,6 +120,7 @@ mod tests {
     use std::collections::HashMap;
 
     use chrono::Utc;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     use super::{DecisionConfig, DecisionEngine};
@@ -211,6 +212,27 @@ mod tests {
         assert_eq!(outcome.desired_quotes.len(), 2);
         assert_eq!(outcome.desired_quotes[0].size, dec!(10));
         assert_eq!(outcome.desired_quotes[1].size, dec!(10));
+    }
+
+    #[test]
+    fn generated_quotes_remain_tick_aligned() {
+        let engine = DecisionEngine::new(DecisionConfig {
+            quote_size: dec!(10),
+            min_spread: dec!(0.01),
+            min_depth: dec!(20),
+            quote_offset_ticks: 1,
+            min_usdc_balance: dec!(50),
+            min_token_balance: dec!(10),
+        });
+        let state = test_state();
+        let tick_size = state.market.tokens[0].tick_size;
+
+        let outcome = engine.evaluate(&state);
+
+        assert!(!outcome.desired_quotes.is_empty());
+        for quote in outcome.desired_quotes {
+            assert_eq!(quote.price % tick_size, Decimal::ZERO);
+        }
     }
 
     #[test]
