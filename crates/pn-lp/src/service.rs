@@ -222,6 +222,28 @@ impl LpService {
         }
 
         info!("LP service stopping");
+        if !state.open_orders.is_empty() {
+            match self.exchange.cancel_all().await {
+                Ok(()) => {
+                    if let Err(error) = self
+                        .mark_orders_status(
+                            &state.market.condition_id,
+                            &state.open_orders,
+                            "CANCELED",
+                        )
+                        .await
+                    {
+                        error!(?error, "failed to persist shutdown cancel status");
+                    }
+                    state.open_orders.clear();
+                }
+                Err(error) => error!(?error, "failed to cancel orders during shutdown"),
+            }
+        }
+        if let Err(error) = self.persist_positions_snapshot(&state, "shutdown").await {
+            error!(?error, "failed to persist final position snapshot");
+        }
+        info!("LP service stopped");
         Ok(())
     }
 
@@ -378,6 +400,7 @@ impl LpService {
                 );
                 state.last_user_event_at = Some(now);
                 self.persist_trade(state, &fill).await?;
+                apply_fill_to_positions(state, &fill);
                 let actions = self.risk.on_fill(&fill, state);
                 self.apply_risk_actions(state, actions).await?;
             }
@@ -524,6 +547,7 @@ impl LpService {
         );
         match self.exchange.flatten(intent).await {
             Ok(Some(fill)) => {
+                state.flags.flattening = false;
                 self.persist_trade(state, &fill).await?;
                 info!(
                     target: "lp.flatten",
@@ -983,6 +1007,47 @@ fn flatten_reference_price(
     }
 }
 
+fn apply_fill_to_positions(state: &mut RuntimeState, fill: &TradeFill) {
+    let position = state
+        .positions
+        .entry(fill.asset_id.clone())
+        .or_insert_with(|| PositionSnapshot {
+            asset_id: fill.asset_id.clone(),
+            size: Decimal::ZERO,
+            avg_price: Decimal::ZERO,
+        });
+
+    let delta = match fill.side {
+        QuoteSide::Buy => fill.size,
+        QuoteSide::Sell => -fill.size,
+    };
+    let previous_size = position.size;
+    let new_size = previous_size + delta;
+    position.size = new_size;
+
+    if new_size == Decimal::ZERO {
+        position.avg_price = Decimal::ZERO;
+        return;
+    }
+
+    let extended_same_direction = (previous_size > Decimal::ZERO && delta > Decimal::ZERO)
+        || (previous_size < Decimal::ZERO && delta < Decimal::ZERO);
+    let flipped_direction = previous_size != Decimal::ZERO
+        && previous_size.is_sign_positive() != new_size.is_sign_positive();
+
+    if previous_size == Decimal::ZERO || flipped_direction {
+        position.avg_price = fill.price;
+        return;
+    }
+
+    if extended_same_direction {
+        let previous_abs = previous_size.abs();
+        let delta_abs = delta.abs();
+        position.avg_price =
+            ((position.avg_price * previous_abs) + (fill.price * delta_abs)) / new_size.abs();
+    }
+}
+
 impl std::fmt::Display for QuoteSide {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -997,11 +1062,13 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use chrono::Utc;
+    use pn_common::db::init_db;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
     use tokio::sync::mpsc;
@@ -1009,15 +1076,16 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ExchangeAdapter, LpService, ReconciliationSnapshot, ServiceConfig, flatten_reference_price,
-        missing_open_orders,
+        ExchangeAdapter, ExchangeEvent, LpService, ReconciliationSnapshot, ServiceConfig,
+        flatten_reference_price, missing_open_orders,
     };
     use crate::control::ControlCommand;
     use crate::decision::DecisionConfig;
-    use crate::risk::RiskConfig;
+    use crate::risk::{FlattenIntent, RiskConfig};
     use crate::types::{
         AccountSnapshot, BookLevel, BookSnapshot, ManagedOrder, MarketMetadata, QuoteIntent,
-        RuntimeFlags, RuntimeState, SignalState, TokenMetadata, TradeFill,
+        PositionSnapshot, QuoteSide, RuntimeFlags, RuntimeState, SignalState, TokenMetadata,
+        TradeFill,
     };
 
     fn runtime_state_with_book() -> RuntimeState {
@@ -1120,6 +1188,88 @@ mod tests {
         reconcile_calls: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct RecordingExchange {
+        cancel_all_calls: AtomicUsize,
+        flatten_calls: Mutex<Vec<FlattenIntent>>,
+        flatten_result: Option<TradeFill>,
+    }
+
+    impl RecordingExchange {
+        fn with_flatten_result(flatten_result: Option<TradeFill>) -> Self {
+            Self {
+                flatten_result,
+                ..Self::default()
+            }
+        }
+
+        fn flatten_calls(&self) -> Vec<FlattenIntent> {
+            self.flatten_calls
+                .lock()
+                .expect("flatten calls mutex")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ExchangeAdapter for RecordingExchange {
+        fn start(
+            &self,
+            event_tx: mpsc::UnboundedSender<super::ExchangeEvent>,
+            cancel: CancellationToken,
+        ) {
+            tokio::spawn(async move {
+                let _event_tx = event_tx;
+                cancel.cancelled().await;
+            });
+        }
+
+        async fn reconcile(&self) -> Result<ReconciliationSnapshot> {
+            Ok(ReconciliationSnapshot {
+                open_orders: Vec::new(),
+                positions: Vec::new(),
+                account: AccountSnapshot {
+                    usdc_balance: dec!(0),
+                    token_balances: HashMap::new(),
+                    updated_at: Utc::now(),
+                },
+            })
+        }
+
+        async fn post_quotes(&self, _quotes: &[QuoteIntent]) -> Result<Vec<ManagedOrder>> {
+            Ok(Vec::new())
+        }
+
+        async fn cancel_orders(&self, _order_ids: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn cancel_all(&self) -> Result<()> {
+            self.cancel_all_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn flatten(&self, intent: &crate::risk::FlattenIntent) -> Result<Option<TradeFill>> {
+            self.flatten_calls
+                .lock()
+                .expect("flatten calls mutex")
+                .push(intent.clone());
+            Ok(self.flatten_result.clone())
+        }
+
+        async fn post_heartbeat(&self, _last_heartbeat_id: Option<&str>) -> Result<String> {
+            Ok("hb-test".to_string())
+        }
+
+        async fn split(&self, _amount: rust_decimal::Decimal) -> Result<String> {
+            Ok("tx-test".to_string())
+        }
+
+        async fn merge(&self, _amount: rust_decimal::Decimal) -> Result<String> {
+            Ok("tx-test".to_string())
+        }
+    }
+
     #[async_trait]
     impl ExchangeAdapter for ReconcileErrorExchange {
         fn start(
@@ -1191,6 +1341,138 @@ mod tests {
             snapshot_interval: Duration::from_secs(3600),
             max_quote_age: Duration::from_secs(10),
         }
+    }
+
+    async fn migrated_pool() -> SqlitePool {
+        init_db("sqlite::memory:", 1)
+            .await
+            .expect("migrated in-memory sqlite pool")
+    }
+
+    #[tokio::test]
+    async fn trade_event_updates_position_before_risk_flatten() {
+        let exchange = Arc::new(RecordingExchange::default());
+        let pool = migrated_pool().await;
+        let mut state = runtime_state_with_book();
+        state.positions.insert(
+            "asset-yes".to_string(),
+            PositionSnapshot {
+                asset_id: "asset-yes".to_string(),
+                size: dec!(25),
+                avg_price: dec!(0.42),
+            },
+        );
+        let (service, _) = LpService::new(exchange.clone(), pool, service_config(), None, state.clone());
+        let fill = TradeFill {
+            trade_id: "trade-1".to_string(),
+            order_id: Some("order-1".to_string()),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Buy,
+            price: dec!(0.44),
+            size: dec!(12),
+            status: "MATCHED".to_string(),
+            received_at: Utc::now(),
+        };
+
+        service
+            .handle_exchange_event(&mut state, ExchangeEvent::Trade(fill))
+            .await
+            .expect("trade event handled");
+
+        let position = state
+            .positions
+            .get("asset-yes")
+            .expect("updated position present");
+        assert_eq!(position.size, dec!(37));
+        assert_eq!(position.avg_price, dec!(0.4264864864864864864864864865));
+        assert_eq!(exchange.flatten_calls().len(), 1);
+        assert_eq!(exchange.flatten_calls()[0].size, dec!(37));
+    }
+
+    #[tokio::test]
+    async fn execute_flatten_clears_flattening_after_acknowledged_fill() {
+        let exchange = Arc::new(RecordingExchange::with_flatten_result(Some(TradeFill {
+            trade_id: "trade-ack".to_string(),
+            order_id: Some("order-ack".to_string()),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Sell,
+            price: dec!(0.43),
+            size: dec!(25),
+            status: "MATCHED".to_string(),
+            received_at: Utc::now(),
+        })));
+        let pool = migrated_pool().await;
+        let mut state = runtime_state_with_book();
+        let (service, _) = LpService::new(exchange, pool, service_config(), None, state.clone());
+
+        service
+            .execute_flatten(
+                &mut state,
+                "test flatten",
+                &FlattenIntent {
+                    asset_id: "asset-yes".to_string(),
+                    side: QuoteSide::Sell,
+                    price: dec!(0.43),
+                    size: dec!(25),
+                    use_fok: false,
+                },
+            )
+            .await
+            .expect("flatten succeeded");
+
+        assert!(!state.flags.flattening);
+    }
+
+    #[tokio::test]
+    async fn run_cancels_open_orders_on_shutdown() {
+        let exchange = Arc::new(RecordingExchange::default());
+        let pool = migrated_pool().await;
+        let mut initial_state = runtime_state_with_book();
+        let now = Utc::now();
+        initial_state
+            .account
+            .token_balances
+            .insert("asset-yes".to_string(), dec!(40));
+        initial_state.open_orders = vec![
+            ManagedOrder {
+                order_id: "buy-1".to_string(),
+                asset_id: "asset-yes".to_string(),
+                side: QuoteSide::Buy,
+                price: dec!(0.41),
+                size: dec!(10),
+                created_at: now,
+                status: "LIVE".to_string(),
+            },
+            ManagedOrder {
+                order_id: "sell-1".to_string(),
+                asset_id: "asset-yes".to_string(),
+                side: QuoteSide::Sell,
+                price: dec!(0.45),
+                size: dec!(10),
+                created_at: now,
+                status: "LIVE".to_string(),
+            },
+        ];
+        let mut config = service_config();
+        config.heartbeat_interval = Duration::from_secs(3600);
+        config.reconciliation_interval = Duration::from_secs(3600);
+        config.report_interval = Duration::from_secs(3600);
+        config.snapshot_interval = Duration::from_secs(3600);
+
+        let (service, _) =
+            LpService::new(exchange.clone(), pool, config, None, initial_state);
+        let cancel = CancellationToken::new();
+        let service_cancel = cancel.clone();
+        let handle = tokio::spawn(async move { service.run(service_cancel).await });
+
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("service task join")
+            .expect("service task panicked");
+
+        assert!(result.is_ok());
+        assert_eq!(exchange.cancel_all_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

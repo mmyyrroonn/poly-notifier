@@ -41,6 +41,7 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/admin/lp/pause", post(handlers::lp_pause))
         .route("/admin/lp/resume", post(handlers::lp_resume))
         .route("/admin/lp/cancel-all", post(handlers::lp_cancel_all))
+        .route("/admin/lp/signal", post(handlers::lp_signal))
         .route("/admin/lp/flatten", post(handlers::lp_flatten))
         .route("/admin/lp/split", post(handlers::lp_split))
         .route("/admin/lp/merge", post(handlers::lp_merge))

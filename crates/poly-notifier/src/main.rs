@@ -176,16 +176,7 @@ impl ExchangeAdapter for LiveExchangeAdapter {
                 use_fok: intent.use_fok,
             })
             .await?;
-        Ok(Some(TradeFill {
-            trade_id: fill.trade_id,
-            order_id: fill.order_id,
-            asset_id: fill.asset_id,
-            side: map_sdk_side(fill.side),
-            price: fill.price,
-            size: fill.size,
-            status: fill.status,
-            received_at: Utc::now(),
-        }))
+        Ok(map_flatten_fill(fill))
     }
 
     async fn post_heartbeat(&self, last_heartbeat_id: Option<&str>) -> Result<String> {
@@ -236,6 +227,7 @@ impl Reporter for TelegramReporter {
 async fn main() -> Result<()> {
     let _ = dotenv();
     let config = AppConfig::load()?;
+    validate_condition_id(&config.lp.trading.condition_id)?;
     let _logging_guards = init_tracing(&config)?;
 
     let pool = init_db(&config.database.url, config.database.max_connections).await?;
@@ -591,6 +583,33 @@ fn map_lp_side(side: QuoteSide) -> SdkQuoteSide {
     }
 }
 
+fn map_flatten_fill(fill: pn_polymarket::TradeFill) -> Option<TradeFill> {
+    if fill.size <= Decimal::ZERO {
+        return None;
+    }
+
+    Some(TradeFill {
+        trade_id: fill.trade_id,
+        order_id: fill.order_id,
+        asset_id: fill.asset_id,
+        side: map_sdk_side(fill.side),
+        price: fill.price,
+        size: fill.size,
+        status: fill.status,
+        received_at: Utc::now(),
+    })
+}
+
+fn validate_condition_id(condition_id: &str) -> Result<()> {
+    if condition_id.trim().is_empty() || condition_id == "replace-me" {
+        anyhow::bail!(
+            "lp.trading.condition_id is not configured. Set APP__LP__TRADING__CONDITION_ID or update config/default.toml"
+        );
+    }
+
+    Ok(())
+}
+
 fn html_escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -600,7 +619,8 @@ fn html_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::decimal;
+    use super::{decimal, map_flatten_fill, validate_condition_id};
+    use pn_polymarket::QuoteSide as SdkQuoteSide;
 
     #[test]
     fn decimal_round_trip_preserves_expected_lp_config_values() {
@@ -608,5 +628,25 @@ mod tests {
         assert_eq!(decimal(25.0).unwrap(), "25.0".parse().unwrap());
         assert_eq!(decimal(0.01).unwrap(), "0.01".parse().unwrap());
         assert_eq!(decimal(1.25).unwrap(), "1.25".parse().unwrap());
+    }
+
+    #[test]
+    fn map_flatten_fill_drops_zero_size_acknowledgements() {
+        assert!(map_flatten_fill(pn_polymarket::TradeFill {
+            trade_id: "trade-1".to_string(),
+            order_id: Some("order-1".to_string()),
+            asset_id: "asset-yes".to_string(),
+            side: SdkQuoteSide::Sell,
+            price: "0".parse().unwrap(),
+            size: "0".parse().unwrap(),
+            status: "UNMATCHED:unconfirmed".to_string(),
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn validate_condition_id_rejects_placeholder_value() {
+        assert!(validate_condition_id("replace-me").is_err());
+        assert!(validate_condition_id("0xabc").is_ok());
     }
 }

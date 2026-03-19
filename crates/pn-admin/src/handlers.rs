@@ -313,6 +313,13 @@ pub struct ReasonBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SignalBody {
+    pub name: String,
+    pub active: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AmountBody {
     pub amount: String,
     pub reason: Option<String>,
@@ -415,6 +422,27 @@ pub async fn lp_cancel_all(
         .and_then(|body| body.reason.clone())
         .unwrap_or_else(|| "admin cancel-all".to_string());
     match handle.send(ControlCommand::CancelAll { reason }) {
+        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
+        Err(error) => lp_command_error(error),
+    }
+}
+
+pub async fn lp_signal(
+    State(state): State<AdminState>,
+    Json(body): Json<SignalBody>,
+) -> Response {
+    let handle = match lp_handle(&state) {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let reason = body
+        .reason
+        .unwrap_or_else(|| format!("admin signal {}", body.name));
+    match handle.send(ControlCommand::ExternalSignal {
+        name: body.name,
+        active: body.active,
+        reason,
+    }) {
         Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
         Err(error) => lp_command_error(error),
     }
@@ -581,7 +609,7 @@ mod tests {
     use sqlx::SqlitePool;
     use tokio::sync::{mpsc, watch};
 
-    use super::{AmountBody, lp_merge, lp_split};
+    use super::{AmountBody, SignalBody, lp_merge, lp_signal, lp_split};
     use crate::AdminState;
 
     async fn test_admin_state() -> (AdminState, mpsc::UnboundedReceiver<ControlCommand>) {
@@ -678,5 +706,34 @@ mod tests {
             serde_json::json!({ "error": "invalid or non-positive amount" })
         );
         assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn lp_signal_dispatches_external_signal_command() {
+        let (state, mut cmd_rx) = test_admin_state().await;
+
+        let response = lp_signal(
+            State(state),
+            axum::Json(SignalBody {
+                name: "external".to_string(),
+                active: false,
+                reason: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        match cmd_rx.try_recv().unwrap() {
+            ControlCommand::ExternalSignal {
+                name,
+                active,
+                reason,
+            } => {
+                assert_eq!(name, "external");
+                assert!(!active);
+                assert_eq!(reason, "admin signal external");
+            }
+            other => panic!("expected external signal command, got {other:?}"),
+        }
     }
 }

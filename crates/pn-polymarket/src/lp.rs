@@ -8,10 +8,12 @@ use alloy::sol;
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::try_join_all};
 use polymarket_client_sdk::auth::{LocalSigner, Signer, Uuid};
 use polymarket_client_sdk::clob;
-use polymarket_client_sdk::clob::types::{Amount, AssetType, OrderType, Side, SignatureType};
+use polymarket_client_sdk::clob::types::{
+    Amount, AssetType, OrderStatusType, OrderType, Side, SignatureType, TraderSide,
+};
 use polymarket_client_sdk::clob::types::request::{
     BalanceAllowanceRequest, CancelMarketOrderRequest, OrderBookSummaryRequest, OrdersRequest,
 };
@@ -368,7 +370,7 @@ impl PolymarketExecutionClient {
 
         for target in self.approval_targets(include_inventory) {
             let usdc_allowance_ready = if target.require_usdc_allowance {
-                check_allowance(&usdc, self.wallet_address, target.address).await? > U256::ZERO
+                allowance_is_ready(check_allowance(&usdc, self.wallet_address, target.address).await?)
             } else {
                 true
             };
@@ -532,13 +534,29 @@ impl PolymarketExecutionClient {
         let posted = responses
             .into_iter()
             .zip(quotes.iter())
-            .map(|(response, quote)| ManagedOrder {
-                order_id: response.order_id,
-                asset_id: quote.asset_id.clone(),
-                side: quote.side.clone(),
-                price: quote.price,
-                size: quote.size,
-                status: response.status.to_string(),
+            .filter_map(|(response, quote)| {
+                if !response.success {
+                    warn!(
+                        target: "pn_polymarket::execution",
+                        order_id = %response.order_id,
+                        status = %response.status,
+                        asset_id = %quote.asset_id,
+                        side = %quote.side,
+                        price = %quote.price,
+                        size = %quote.size,
+                        "CLOB rejected quote; not tracking rejected order"
+                    );
+                    return None;
+                }
+
+                Some(ManagedOrder {
+                    order_id: response.order_id,
+                    asset_id: quote.asset_id.clone(),
+                    side: quote.side.clone(),
+                    price: quote.price,
+                    size: quote.size,
+                    status: response.status.to_string(),
+                })
             })
             .collect::<Vec<_>>();
 
@@ -700,12 +718,25 @@ impl PolymarketExecutionClient {
 
     async fn fetch_open_orders(&self) -> Result<Vec<ManagedOrder>> {
         let request = OrdersRequest::builder().market(self.condition_id).build();
-        let page = self.clob.orders(&request, None).await?;
-        Ok(page
-            .data
-            .into_iter()
-            .map(map_open_order)
-            .collect())
+        let mut orders = Vec::new();
+        let mut cursor = None;
+
+        loop {
+            let page = self.clob.orders(&request, cursor.clone()).await?;
+            orders.extend(
+                page.data
+                    .into_iter()
+                    .map(map_open_order)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+
+            if page.next_cursor.is_empty() {
+                break;
+            }
+            cursor = Some(page.next_cursor);
+        }
+
+        Ok(orders)
     }
 
     async fn fetch_positions(&self) -> Result<Vec<PositionSnapshot>> {
@@ -733,19 +764,21 @@ impl PolymarketExecutionClient {
                     .build(),
             )
             .await?;
-        let mut token_balances = HashMap::new();
-        for asset_id in self.asset_ids.iter() {
-            let response = self
-                .clob
+        let clob = &self.clob;
+        let token_balances = try_join_all(self.asset_ids.iter().copied().map(|asset_id| async move {
+            let response = clob
                 .balance_allowance(
                     BalanceAllowanceRequest::builder()
                         .asset_type(AssetType::Conditional)
-                        .token_id(*asset_id)
+                        .token_id(asset_id)
                         .build(),
                 )
                 .await?;
-            token_balances.insert(asset_id.to_string(), response.balance);
-        }
+            Ok::<_, anyhow::Error>((asset_id.to_string(), response.balance))
+        }))
+        .await?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
 
         Ok(AccountSnapshot {
             usdc_balance: usdc.balance,
@@ -777,10 +810,7 @@ impl PolymarketExecutionClient {
                 }
 
                 let stream = match client.subscribe_orderbook(asset_ids.clone()) {
-                    Ok(stream) => {
-                        backoff_secs = 1;
-                        stream
-                    }
+                    Ok(stream) => stream,
                     Err(error) => {
                         warn!(?error, "failed to subscribe to market orderbook stream");
                         sleep(Duration::from_secs(backoff_secs)).await;
@@ -791,12 +821,14 @@ impl PolymarketExecutionClient {
                 tokio::pin!(stream);
 
                 let mut disconnected = false;
+                let mut received_message = false;
                 while !cancel.is_cancelled() {
                     tokio::select! {
                         () = cancel.cancelled() => break,
                         message = stream.next() => {
                             match message {
                                 Some(Ok(book)) => {
+                                    mark_stream_message_received(&mut received_message, &mut backoff_secs);
                                     let event = StreamEvent::Book(BookSnapshot {
                                         asset_id: book.asset_id.to_string(),
                                         bids: book.bids.into_iter().map(|level| BookLevel {
@@ -851,10 +883,7 @@ impl PolymarketExecutionClient {
                 }
 
                 let stream = match client.subscribe_tick_size_change(asset_ids.clone()) {
-                    Ok(stream) => {
-                        backoff_secs = 1;
-                        stream
-                    }
+                    Ok(stream) => stream,
                     Err(error) => {
                         warn!(?error, "failed to subscribe to tick size stream");
                         sleep(Duration::from_secs(backoff_secs)).await;
@@ -865,12 +894,14 @@ impl PolymarketExecutionClient {
                 tokio::pin!(stream);
 
                 let mut disconnected = false;
+                let mut received_message = false;
                 while !cancel.is_cancelled() {
                     tokio::select! {
                         () = cancel.cancelled() => break,
                         message = stream.next() => {
                             match message {
                                 Some(Ok(change)) => {
+                                    mark_stream_message_received(&mut received_message, &mut backoff_secs);
                                     if event_tx.send(StreamEvent::TickSize {
                                         asset_id: change.asset_id.to_string(),
                                         new_tick_size: change.new_tick_size,
@@ -917,10 +948,7 @@ impl PolymarketExecutionClient {
                 }
 
                 let stream = match client.subscribe_orders(markets.clone()) {
-                    Ok(stream) => {
-                        backoff_secs = 1;
-                        stream
-                    }
+                    Ok(stream) => stream,
                     Err(error) => {
                         warn!(?error, "failed to subscribe to user order stream");
                         sleep(Duration::from_secs(backoff_secs)).await;
@@ -931,18 +959,30 @@ impl PolymarketExecutionClient {
                 tokio::pin!(stream);
 
                 let mut disconnected = false;
+                let mut received_message = false;
                 while !cancel.is_cancelled() {
                     tokio::select! {
                         () = cancel.cancelled() => break,
                         message = stream.next() => {
                             match message {
                                 Some(Ok(order)) => {
+                                    mark_stream_message_received(&mut received_message, &mut backoff_secs);
+                                    let side = match side_from_sdk(order.side) {
+                                        Ok(side) => side,
+                                        Err(error) => {
+                                            warn!(?error, "dropping user order update with unsupported side");
+                                            continue;
+                                        }
+                                    };
                                     let event = StreamEvent::Order(ManagedOrder {
                                         order_id: order.id,
                                         asset_id: order.asset_id.to_string(),
-                                        side: side_from_sdk(order.side),
+                                        side,
                                         price: order.price,
-                                        size: order.original_size.unwrap_or(Decimal::ZERO),
+                                        size: remaining_order_size(
+                                            order.original_size.unwrap_or(Decimal::ZERO),
+                                            order.size_matched.unwrap_or(Decimal::ZERO),
+                                        ),
                                         status: order.status.map(|status| status.to_string()).unwrap_or_else(|| "UNKNOWN".to_string()),
                                     });
                                     if event_tx.send(event).is_err() {
@@ -988,10 +1028,7 @@ impl PolymarketExecutionClient {
                 }
 
                 let stream = match client.subscribe_trades(markets.clone()) {
-                    Ok(stream) => {
-                        backoff_secs = 1;
-                        stream
-                    }
+                    Ok(stream) => stream,
                     Err(error) => {
                         warn!(?error, "failed to subscribe to user trade stream");
                         sleep(Duration::from_secs(backoff_secs)).await;
@@ -1002,20 +1039,31 @@ impl PolymarketExecutionClient {
                 tokio::pin!(stream);
 
                 let mut disconnected = false;
+                let mut received_message = false;
                 while !cancel.is_cancelled() {
                     tokio::select! {
                         () = cancel.cancelled() => break,
                         message = stream.next() => {
                             match message {
                                 Some(Ok(trade)) => {
+                                    mark_stream_message_received(&mut received_message, &mut backoff_secs);
+                                    let side = match side_from_sdk(trade.side) {
+                                        Ok(side) => side,
+                                        Err(error) => {
+                                            warn!(?error, "dropping user trade update with unsupported side");
+                                            continue;
+                                        }
+                                    };
+                                    let order_id = trade_order_id(&trade);
+                                    let status = trade_status_label(&trade.status);
                                     let event = StreamEvent::Trade(TradeFill {
                                         trade_id: trade.id,
-                                        order_id: trade.taker_order_id,
+                                        order_id,
                                         asset_id: trade.asset_id.to_string(),
-                                        side: side_from_sdk(trade.side),
+                                        side,
                                         price: trade.price,
                                         size: trade.size,
-                                        status: format!("{:?}", trade.status),
+                                        status,
                                     });
                                     if event_tx.send(event).is_err() {
                                         return;
@@ -1046,15 +1094,17 @@ impl PolymarketExecutionClient {
     }
 }
 
-fn map_open_order(order: polymarket_client_sdk::clob::types::response::OpenOrderResponse) -> ManagedOrder {
-    ManagedOrder {
+fn map_open_order(
+    order: polymarket_client_sdk::clob::types::response::OpenOrderResponse,
+) -> Result<ManagedOrder> {
+    Ok(ManagedOrder {
         order_id: order.id,
         asset_id: order.asset_id.to_string(),
-        side: side_from_sdk(order.side),
+        side: side_from_sdk(order.side)?,
         price: order.price,
-        size: order.original_size,
+        size: remaining_order_size(order.original_size, order.size_matched),
         status: order.status.to_string(),
-    }
+    })
 }
 
 fn side_to_sdk(side: &QuoteSide) -> Side {
@@ -1064,14 +1114,11 @@ fn side_to_sdk(side: &QuoteSide) -> Side {
     }
 }
 
-fn side_from_sdk(side: Side) -> QuoteSide {
+fn side_from_sdk(side: Side) -> Result<QuoteSide> {
     match side {
-        Side::Buy => QuoteSide::Buy,
-        Side::Sell => QuoteSide::Sell,
-        other => {
-            warn!(received_side = ?other, "unexpected SDK side variant; defaulting to BUY");
-            QuoteSide::Buy
-        }
+        Side::Buy => Ok(QuoteSide::Buy),
+        Side::Sell => Ok(QuoteSide::Sell),
+        other => anyhow::bail!("unexpected SDK side variant: {other:?}"),
     }
 }
 
@@ -1083,6 +1130,7 @@ fn flatten_trade_fill(
     request: &FlattenRequest,
     response: polymarket_client_sdk::clob::types::response::PostOrderResponse,
 ) -> TradeFill {
+    let matched = response.success && response.status == OrderStatusType::Matched;
     TradeFill {
         trade_id: response
             .trade_ids
@@ -1092,9 +1140,79 @@ fn flatten_trade_fill(
         order_id: Some(response.order_id),
         asset_id: request.asset_id.clone(),
         side: request.side.clone(),
-        price: request.price, // Best-effort acknowledgment; trade stream carries actual fill price.
-        size: request.size,   // Requested size only; partial fills arrive on the trade stream.
+        price: if matched {
+            request.price
+        } else {
+            Decimal::ZERO
+        },
+        size: if matched {
+            request.size
+        } else {
+            Decimal::ZERO
+        },
         status: format!("{}:unconfirmed", response.status),
+    }
+}
+
+fn allowance_is_ready(allowance: U256) -> bool {
+    allowance > U256::MAX / U256::from(2u8)
+}
+
+fn remaining_order_size(original_size: Decimal, size_matched: Decimal) -> Decimal {
+    let remaining = original_size - size_matched;
+    if remaining.is_sign_negative() {
+        Decimal::ZERO
+    } else {
+        remaining
+    }
+}
+
+fn mark_stream_message_received(received_message: &mut bool, backoff_secs: &mut u64) {
+    if !*received_message {
+        *received_message = true;
+        *backoff_secs = 1;
+    }
+}
+
+fn trade_order_id(
+    trade: &polymarket_client_sdk::clob::ws::types::response::TradeMessage,
+) -> Option<String> {
+    select_trade_order_id(
+        trade.trader_side.clone(),
+        trade.taker_order_id.clone(),
+        trade.maker_orders.first().map(|maker_order| maker_order.order_id.clone()),
+    )
+}
+
+fn select_trade_order_id(
+    trader_side: Option<TraderSide>,
+    taker_order_id: Option<String>,
+    maker_order_id: Option<String>,
+) -> Option<String> {
+    match trader_side {
+        Some(TraderSide::Maker) => maker_order_id.or(taker_order_id),
+        Some(TraderSide::Taker) => taker_order_id.or(maker_order_id),
+        _ => taker_order_id.or(maker_order_id),
+    }
+}
+
+fn trade_status_label(
+    status: &polymarket_client_sdk::clob::ws::types::response::TradeMessageStatus,
+) -> String {
+    match status {
+        polymarket_client_sdk::clob::ws::types::response::TradeMessageStatus::Matched => {
+            "MATCHED".to_string()
+        }
+        polymarket_client_sdk::clob::ws::types::response::TradeMessageStatus::Mined => {
+            "MINED".to_string()
+        }
+        polymarket_client_sdk::clob::ws::types::response::TradeMessageStatus::Confirmed => {
+            "CONFIRMED".to_string()
+        }
+        polymarket_client_sdk::clob::ws::types::response::TradeMessageStatus::Unknown(value) => {
+            value.to_uppercase()
+        }
+        _ => "UNKNOWN".to_string(),
     }
 }
 
@@ -1239,14 +1357,16 @@ async fn set_ctf_approval<P: alloy::providers::Provider>(
 
 #[cfg(test)]
 mod tests {
-    use polymarket_client_sdk::clob::types::OrderStatusType;
-    use polymarket_client_sdk::clob::types::response::PostOrderResponse;
-    use polymarket_client_sdk::types::address;
+    use polymarket_client_sdk::auth::Uuid;
+    use polymarket_client_sdk::clob::types::{OrderStatusType, Side, TraderSide};
+    use polymarket_client_sdk::clob::types::response::{OpenOrderResponse, PostOrderResponse};
+    use polymarket_client_sdk::types::{B256, U256, address};
     use rust_decimal_macros::dec;
 
     use super::{
         ApprovalCheck, ApprovalStatus, FlattenRequest, QuoteSide, build_approval_targets,
-        flatten_trade_fill, next_reconnect_backoff_secs,
+        allowance_is_ready, flatten_trade_fill, map_open_order, mark_stream_message_received,
+        next_reconnect_backoff_secs, select_trade_order_id, side_from_sdk,
     };
 
     #[test]
@@ -1351,5 +1471,106 @@ mod tests {
         assert_eq!(fill.price, dec!(0.41));
         assert_eq!(fill.size, dec!(17));
         assert_eq!(fill.status, "MATCHED:unconfirmed");
+    }
+
+    #[test]
+    fn flatten_trade_fill_zeroes_size_for_unmatched_ack() {
+        let request = FlattenRequest {
+            asset_id: "123".to_string(),
+            side: QuoteSide::Sell,
+            price: dec!(0.41),
+            size: dec!(17),
+            use_fok: true,
+        };
+        let response = PostOrderResponse::builder()
+            .making_amount(dec!(0))
+            .taking_amount(dec!(0))
+            .order_id("order-2")
+            .status(OrderStatusType::Unmatched)
+            .success(false)
+            .trade_ids(Vec::<String>::new())
+            .build();
+
+        let fill = flatten_trade_fill(&request, response);
+
+        assert_eq!(fill.price, dec!(0));
+        assert_eq!(fill.size, dec!(0));
+        assert_eq!(fill.status, "UNMATCHED:unconfirmed");
+    }
+
+    #[test]
+    fn map_open_order_uses_remaining_size_after_partial_fill() {
+        let order = OpenOrderResponse::builder()
+            .id("order-1")
+            .status(OrderStatusType::Live)
+            .owner(Uuid::parse_str("9180014b-33c8-9240-a14b-bdca11c0a465").unwrap())
+            .maker_address(address!("0x1000000000000000000000000000000000000001"))
+            .market(B256::ZERO)
+            .asset_id(U256::from(123u64))
+            .side(Side::Buy)
+            .original_size(dec!(10))
+            .size_matched(dec!(2.5))
+            .price(dec!(0.41))
+            .associate_trades(Vec::<String>::new())
+            .outcome("YES")
+            .created_at(chrono::Utc::now())
+            .expiration(chrono::Utc::now())
+            .order_type(polymarket_client_sdk::clob::types::OrderType::GTC)
+            .build();
+
+        let mapped = map_open_order(order).unwrap();
+
+        assert_eq!(mapped.size, dec!(7.5));
+    }
+
+    #[test]
+    fn select_trade_order_id_uses_maker_order_for_maker_trades() {
+        let order_id = select_trade_order_id(
+            Some(TraderSide::Maker),
+            Some("taker-1".to_string()),
+            Some("maker-1".to_string()),
+        );
+
+        assert_eq!(order_id.as_deref(), Some("maker-1"));
+    }
+
+    #[test]
+    fn select_trade_order_id_uses_taker_order_for_taker_trades() {
+        let order_id = select_trade_order_id(
+            Some(TraderSide::Taker),
+            Some("taker-1".to_string()),
+            Some("maker-1".to_string()),
+        );
+
+        assert_eq!(order_id.as_deref(), Some("taker-1"));
+    }
+
+    #[test]
+    fn side_from_sdk_rejects_unknown_variant() {
+        let error = side_from_sdk(Side::Unknown).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unexpected SDK side variant"));
+    }
+
+    #[test]
+    fn mark_stream_message_received_resets_backoff_only_once() {
+        let mut received_message = false;
+        let mut backoff_secs = 16;
+
+        mark_stream_message_received(&mut received_message, &mut backoff_secs);
+        assert!(received_message);
+        assert_eq!(backoff_secs, 1);
+
+        backoff_secs = 8;
+        mark_stream_message_received(&mut received_message, &mut backoff_secs);
+        assert_eq!(backoff_secs, 8);
+    }
+
+    #[test]
+    fn allowance_is_ready_requires_large_allowance() {
+        assert!(!allowance_is_ready(U256::from(1u64)));
+        assert!(allowance_is_ready(U256::MAX));
     }
 }
