@@ -348,11 +348,12 @@ pub struct LpReport {
     pub created_at: NaiveDateTime,
 }
 
-/// Persisted manual/admin control action.
+/// Persisted control action together with its originating actor.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct LpControlAction {
     pub id: i64,
     pub action: String,
+    pub actor: String,
     pub reason: Option<String>,
     pub created_at: NaiveDateTime,
 }

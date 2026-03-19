@@ -105,14 +105,12 @@ pub async fn get_or_create_user(
         // Opportunistically update the username if it has changed.
         if username.is_some() && username != user.username.as_deref() {
             let now = Utc::now().naive_utc();
-            sqlx::query(
-                "UPDATE users SET username = ?, updated_at = ? WHERE id = ?",
-            )
-            .bind(username)
-            .bind(now)
-            .bind(user.id)
-            .execute(pool)
-            .await?;
+            sqlx::query("UPDATE users SET username = ?, updated_at = ? WHERE id = ?")
+                .bind(username)
+                .bind(now)
+                .bind(user.id)
+                .execute(pool)
+                .await?;
 
             return fetch_user_by_id(pool, user.id).await;
         }
@@ -120,15 +118,14 @@ pub async fn get_or_create_user(
     }
 
     // Insert a new user with all defaults.
-    let inserted_id: i64 = sqlx::query(
-        "INSERT INTO users (telegram_id, bot_id, username) VALUES (?, ?, ?)",
-    )
-    .bind(telegram_id)
-    .bind(bot_id)
-    .bind(username)
-    .execute(pool)
-    .await?
-    .last_insert_rowid();
+    let inserted_id: i64 =
+        sqlx::query("INSERT INTO users (telegram_id, bot_id, username) VALUES (?, ?, ?)")
+            .bind(telegram_id)
+            .bind(bot_id)
+            .bind(username)
+            .execute(pool)
+            .await?
+            .last_insert_rowid();
 
     fetch_user_by_id(pool, inserted_id).await
 }
@@ -249,12 +246,11 @@ pub async fn get_subscriptions_for_user(
 
 /// Count the number of active subscriptions a user currently has.
 pub async fn count_active_subscriptions(pool: &SqlitePool, user_id: i64) -> Result<i64> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM subscriptions WHERE user_id = ? AND is_active = 1",
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await?;
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM subscriptions WHERE user_id = ? AND is_active = 1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
     Ok(row.0)
 }
 
@@ -326,14 +322,12 @@ pub async fn update_market_prices(
     last_prices_json: &str,
 ) -> Result<()> {
     let now = Utc::now().naive_utc();
-    sqlx::query(
-        "UPDATE markets SET last_prices = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(last_prices_json)
-    .bind(now)
-    .bind(market_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE markets SET last_prices = ?, updated_at = ? WHERE id = ?")
+        .bind(last_prices_json)
+        .bind(now)
+        .bind(market_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -530,10 +524,7 @@ pub async fn insert_lp_risk_event(
 }
 
 /// Return the most recent LP risk events.
-pub async fn get_recent_lp_risk_events(
-    pool: &SqlitePool,
-    limit: i64,
-) -> Result<Vec<LpRiskEvent>> {
+pub async fn get_recent_lp_risk_events(pool: &SqlitePool, limit: i64) -> Result<Vec<LpRiskEvent>> {
     sqlx::query_as(
         "SELECT id, event_type, severity, details_json, created_at \
          FROM lp_risk_events \
@@ -582,18 +573,13 @@ pub async fn get_recent_lp_heartbeats(pool: &SqlitePool, limit: i64) -> Result<V
 }
 
 /// Persist a generated operator report.
-pub async fn insert_lp_report(
-    pool: &SqlitePool,
-    report_type: &str,
-    payload: &str,
-) -> Result<i64> {
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO lp_reports (report_type, payload) VALUES (?, ?) RETURNING id",
-    )
-    .bind(report_type)
-    .bind(payload)
-    .fetch_one(pool)
-    .await?;
+pub async fn insert_lp_report(pool: &SqlitePool, report_type: &str, payload: &str) -> Result<i64> {
+    let row: (i64,) =
+        sqlx::query_as("INSERT INTO lp_reports (report_type, payload) VALUES (?, ?) RETURNING id")
+            .bind(report_type)
+            .bind(payload)
+            .fetch_one(pool)
+            .await?;
 
     Ok(row.0)
 }
@@ -612,16 +598,18 @@ pub async fn get_recent_lp_reports(pool: &SqlitePool, limit: i64) -> Result<Vec<
     .map_err(Error::Database)
 }
 
-/// Persist a manual control action requested through the control plane.
+/// Persist a control action together with its originating actor.
 pub async fn insert_lp_control_action(
     pool: &SqlitePool,
     action: &str,
     reason: Option<&str>,
+    actor: &str,
 ) -> Result<i64> {
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO lp_control_actions (action, reason) VALUES (?, ?) RETURNING id",
+        "INSERT INTO lp_control_actions (action, actor, reason) VALUES (?, ?, ?) RETURNING id",
     )
     .bind(action)
+    .bind(actor)
     .bind(reason)
     .fetch_one(pool)
     .await?;
@@ -635,7 +623,7 @@ pub async fn get_recent_lp_control_actions(
     limit: i64,
 ) -> Result<Vec<LpControlAction>> {
     sqlx::query_as(
-        "SELECT id, action, reason, created_at \
+        "SELECT id, action, actor, reason, created_at \
          FROM lp_control_actions \
          ORDER BY created_at DESC \
          LIMIT ?",
@@ -671,13 +659,11 @@ pub async fn get_alerts_for_subscription(
 /// Mark an alert as triggered and record the current timestamp.
 pub async fn record_alert_triggered(pool: &SqlitePool, alert_id: i64) -> Result<()> {
     let now = Utc::now().naive_utc();
-    sqlx::query(
-        "UPDATE alerts SET is_triggered = 1, last_triggered_at = ? WHERE id = ?",
-    )
-    .bind(now)
-    .bind(alert_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE alerts SET is_triggered = 1, last_triggered_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(alert_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -740,13 +726,11 @@ pub async fn resolve_user_id_by_telegram(
     pool: &SqlitePool,
     telegram_id: i64,
 ) -> Result<Option<i64>> {
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT id FROM users WHERE telegram_id = ? LIMIT 1",
-    )
-    .bind(telegram_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(Error::Database)?;
+    let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM users WHERE telegram_id = ? LIMIT 1")
+        .bind(telegram_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(Error::Database)?;
 
     Ok(row.map(|(id,)| id))
 }
@@ -756,18 +740,13 @@ pub async fn resolve_user_id_by_telegram(
 // ---------------------------------------------------------------------------
 
 /// Insert a feedback message and return its `id`.
-pub async fn insert_feedback(
-    pool: &SqlitePool,
-    user_id: i64,
-    message: &str,
-) -> Result<i64> {
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO feedback (user_id, message) VALUES (?, ?) RETURNING id",
-    )
-    .bind(user_id)
-    .bind(message)
-    .fetch_one(pool)
-    .await?;
+pub async fn insert_feedback(pool: &SqlitePool, user_id: i64, message: &str) -> Result<i64> {
+    let row: (i64,) =
+        sqlx::query_as("INSERT INTO feedback (user_id, message) VALUES (?, ?) RETURNING id")
+            .bind(user_id)
+            .bind(message)
+            .fetch_one(pool)
+            .await?;
 
     Ok(row.0)
 }
@@ -823,4 +802,26 @@ pub async fn get_recent_notifications(
     .fetch_all(pool)
     .await
     .map_err(Error::Database)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_recent_lp_control_actions, init_db, insert_lp_control_action};
+
+    #[tokio::test]
+    async fn insert_lp_control_action_persists_actor() {
+        let pool = init_db("sqlite::memory:", 1)
+            .await
+            .expect("in-memory sqlite pool");
+
+        insert_lp_control_action(&pool, "pause", Some("test"), "admin_api")
+            .await
+            .expect("control action inserted");
+
+        let actions = get_recent_lp_control_actions(&pool, 1)
+            .await
+            .expect("control actions fetched");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].actor, "admin_api");
+    }
 }

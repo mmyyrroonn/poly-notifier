@@ -13,11 +13,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use pn_admin::create_router;
 use pn_common::config::AppConfig;
 use pn_common::db::init_db;
+use pn_lp::types::SignalState;
 use pn_lp::{
     AccountSnapshot, ExchangeAdapter, ExchangeEvent, FlattenIntent, LpService, ManagedOrder,
     MarketMetadata, PositionSnapshot, QuoteIntent, QuoteSide, ReconciliationSnapshot, Reporter,
@@ -28,7 +29,6 @@ use pn_polymarket::{
     BootstrapState, ExecutionConfig, PolymarketExecutionClient, QuoteRequest,
     QuoteSide as SdkQuoteSide, StreamEvent as SdkStreamEvent,
 };
-use pn_lp::types::SignalState;
 
 #[derive(Clone)]
 struct LiveExchangeAdapter {
@@ -244,16 +244,20 @@ async fn main() -> Result<()> {
         })
         .await?,
     );
-    let include_inventory_approval = config.lp.inventory.auto_split_on_startup
-        && config.lp.inventory.startup_split_amount > 0.0;
-    let approval_status = sdk_client.check_approvals(include_inventory_approval).await?;
+    let include_inventory_approval =
+        config.lp.inventory.auto_split_on_startup && config.lp.inventory.startup_split_amount > 0.0;
+    let approval_status = sdk_client
+        .check_approvals(include_inventory_approval)
+        .await?;
     if !approval_status.is_ready() {
         if config.lp.approvals.auto_approve_on_startup {
             warn!(
                 missing = ?approval_status.missing_permissions(),
                 "startup approvals missing; auto-approve enabled"
             );
-            sdk_client.ensure_approvals(include_inventory_approval).await?;
+            sdk_client
+                .ensure_approvals(include_inventory_approval)
+                .await?;
         } else if config.lp.approvals.require_on_startup {
             anyhow::bail!(
                 "missing required approvals: {}",
@@ -387,10 +391,7 @@ fn build_bot_registry() -> Arc<BotRegistry> {
     Arc::new(registry)
 }
 
-fn build_reporter(
-    config: &AppConfig,
-    bot_registry: Arc<BotRegistry>,
-) -> Option<Arc<dyn Reporter>> {
+fn build_reporter(config: &AppConfig, bot_registry: Arc<BotRegistry>) -> Option<Arc<dyn Reporter>> {
     if config.lp.reporting.operator_chat_ids.is_empty() {
         return None;
     }
@@ -554,8 +555,14 @@ fn build_initial_state(config: &AppConfig, bootstrap: BootstrapState) -> Runtime
                 },
             ),
         ]),
-        flags: RuntimeFlags::default(),
-        last_market_event_at: Some(now),
+        flags: RuntimeFlags {
+            paused: false,
+            flattening: false,
+            heartbeat_healthy: false,
+            market_feed_healthy: false,
+            user_feed_healthy: true,
+        },
+        last_market_event_at: None,
         last_user_event_at: Some(now),
         last_heartbeat_at: None,
         last_heartbeat_id: None,
@@ -619,8 +626,21 @@ fn html_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decimal, map_flatten_fill, validate_condition_id};
-    use pn_polymarket::QuoteSide as SdkQuoteSide;
+    use std::collections::HashMap;
+
+    use pn_common::config::{
+        AdminConfig, AlertConfig, AppConfig, DatabaseConfig, LpApprovalConfig, LpConfig,
+        LpControlConfig, LpInventoryConfig, LpLoggingConfig, LpReportingConfig, LpRiskConfig,
+        LpStrategyConfig, LpTradingConfig, MonitorConfig, SchedulerConfig, TelegramConfig,
+    };
+    use pn_polymarket::{
+        AccountSnapshot as SdkAccountSnapshot, BookLevel as SdkBookLevel,
+        BookSnapshot as SdkBookSnapshot, BootstrapState, ManagedOrder as SdkManagedOrder,
+        MarketMetadata as SdkMarketMetadata, PositionSnapshot as SdkPositionSnapshot,
+        QuoteSide as SdkQuoteSide, TokenMetadata as SdkTokenMetadata,
+    };
+
+    use super::{build_initial_state, decimal, map_flatten_fill, validate_condition_id};
 
     #[test]
     fn decimal_round_trip_preserves_expected_lp_config_values() {
@@ -648,5 +668,134 @@ mod tests {
     fn validate_condition_id_rejects_placeholder_value() {
         assert!(validate_condition_id("replace-me").is_err());
         assert!(validate_condition_id("0xabc").is_ok());
+    }
+
+    #[test]
+    fn build_initial_state_starts_with_market_feed_gated_until_live_book_arrives() {
+        let config = AppConfig {
+            database: DatabaseConfig {
+                url: "sqlite::memory:".to_string(),
+                max_connections: 1,
+            },
+            telegram: TelegramConfig {
+                rate_limit_per_user: 60,
+            },
+            monitor: MonitorConfig {
+                subscription_refresh_interval_secs: 60,
+                ws_ping_interval_secs: 30,
+                reconnect_base_delay_secs: 1,
+                reconnect_max_delay_secs: 60,
+            },
+            alert: AlertConfig {
+                cache_refresh_interval_secs: 60,
+                default_cooldown_minutes: 5,
+                price_flush_interval_secs: 30,
+            },
+            scheduler: SchedulerConfig {
+                daily_summary_cron: "0 0 9 * * *".to_string(),
+            },
+            admin: AdminConfig { port: 3000 },
+            lp: LpConfig {
+                trading: LpTradingConfig {
+                    condition_id: "0xabc".to_string(),
+                    clob_base_url: "https://clob.example".to_string(),
+                    gamma_base_url: "https://gamma.example".to_string(),
+                    data_api_base_url: "https://data.example".to_string(),
+                    chain_id: 137,
+                },
+                inventory: LpInventoryConfig {
+                    min_usdc_balance: 100.0,
+                    min_token_balance: 10.0,
+                    auto_split_on_startup: false,
+                    startup_split_amount: 0.0,
+                },
+                strategy: LpStrategyConfig {
+                    quote_size: 10.0,
+                    min_spread: 0.01,
+                    min_depth: 50.0,
+                    quote_offset_ticks: 1,
+                    max_quote_age_secs: 10,
+                    default_external_signal: true,
+                },
+                risk: LpRiskConfig {
+                    max_position: 100.0,
+                    flat_position_tolerance: 1.0,
+                    auto_flatten_after_fill: true,
+                    flatten_use_fok: false,
+                    stale_feed_after_secs: 15,
+                },
+                approvals: LpApprovalConfig {
+                    require_on_startup: true,
+                    auto_approve_on_startup: false,
+                },
+                reporting: LpReportingConfig {
+                    operator_bot_id: None,
+                    operator_chat_ids: Vec::new(),
+                    summary_interval_secs: 60,
+                },
+                control: LpControlConfig {
+                    bind_addr: "127.0.0.1".to_string(),
+                    heartbeat_interval_secs: 30,
+                    reconciliation_interval_secs: 30,
+                },
+                logging: LpLoggingConfig {
+                    snapshot_interval_secs: 60,
+                    directory: "logs".to_string(),
+                    file_prefix: "lp".to_string(),
+                    max_files: 3,
+                    json: true,
+                },
+            },
+        };
+        let state = build_initial_state(
+            &config,
+            BootstrapState {
+                market: SdkMarketMetadata {
+                    condition_id: "condition-1".to_string(),
+                    question: "Will X happen?".to_string(),
+                    tokens: vec![SdkTokenMetadata {
+                        asset_id: "asset-yes".to_string(),
+                        outcome: "Yes".to_string(),
+                        tick_size: "0.01".parse().unwrap(),
+                    }],
+                },
+                books: vec![SdkBookSnapshot {
+                    asset_id: "asset-yes".to_string(),
+                    bids: vec![SdkBookLevel {
+                        price: "0.40".parse().unwrap(),
+                        size: "100".parse().unwrap(),
+                    }],
+                    asks: vec![SdkBookLevel {
+                        price: "0.45".parse().unwrap(),
+                        size: "100".parse().unwrap(),
+                    }],
+                }],
+                open_orders: vec![SdkManagedOrder {
+                    order_id: "order-1".to_string(),
+                    asset_id: "asset-yes".to_string(),
+                    side: SdkQuoteSide::Buy,
+                    price: "0.41".parse().unwrap(),
+                    size: "10".parse().unwrap(),
+                    status: "LIVE".to_string(),
+                }],
+                positions: vec![SdkPositionSnapshot {
+                    asset_id: "asset-yes".to_string(),
+                    size: "10".parse().unwrap(),
+                    avg_price: "0.41".parse().unwrap(),
+                }],
+                account: SdkAccountSnapshot {
+                    usdc_balance: "500".parse().unwrap(),
+                    token_balances: HashMap::from([(
+                        "asset-yes".to_string(),
+                        "10".parse().unwrap(),
+                    )]),
+                },
+            },
+        );
+
+        assert!(!state.flags.market_feed_healthy);
+        assert!(state.flags.user_feed_healthy);
+        assert!(state.last_market_event_at.is_none());
+        assert!(state.last_user_event_at.is_some());
     }
 }

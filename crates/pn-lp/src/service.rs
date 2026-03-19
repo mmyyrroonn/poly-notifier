@@ -13,7 +13,7 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -152,7 +152,10 @@ impl LpService {
             bootstrap_positions = state.positions.len(),
             "LP runtime bootstrapped"
         );
-        if let Some(amount) = self.config.startup_split_amount.filter(|amount| *amount > Decimal::ZERO)
+        if let Some(amount) = self
+            .config
+            .startup_split_amount
+            .filter(|amount| *amount > Decimal::ZERO)
         {
             self.handle_control_command(
                 &mut state,
@@ -160,9 +163,12 @@ impl LpService {
                     amount: amount.to_string(),
                     reason: "startup auto split".to_string(),
                 },
+                "startup",
             )
             .await?;
         }
+        self.handle_heartbeat_tick(&mut state).await?;
+        self.refresh_health_flags(&mut state);
         self.recompute_quotes(&mut state).await?;
         self.publish_snapshot(&state);
 
@@ -172,7 +178,10 @@ impl LpService {
                 maybe_cmd = self.control_rx.recv() => {
                     match maybe_cmd {
                         Some(command) => {
-                            if let Err(error) = self.handle_control_command(&mut state, command).await {
+                            if let Err(error) = self
+                                .handle_control_command(&mut state, command, "admin_api")
+                                .await
+                            {
                                 error!(?error, "control command handler failed");
                             }
                         }
@@ -251,25 +260,28 @@ impl LpService {
         &self,
         state: &mut RuntimeState,
         command: ControlCommand,
+        actor: &str,
     ) -> Result<()> {
         let aggregator = SignalAggregator;
         match command {
             ControlCommand::Pause { reason } => {
                 warn!(target: "lp.control", reason = %reason, "pause requested");
-                insert_lp_control_action(&self.pool, "pause", Some(&reason)).await?;
+                insert_lp_control_action(&self.pool, "pause", Some(&reason), actor).await?;
                 state.flags.paused = true;
-                self.emit_risk("control_pause", "info", json!({ "reason": reason })).await?;
+                self.emit_risk("control_pause", "info", json!({ "reason": reason }))
+                    .await?;
             }
             ControlCommand::Resume { reason } => {
                 info!(target: "lp.control", reason = %reason, "resume requested");
-                insert_lp_control_action(&self.pool, "resume", Some(&reason)).await?;
+                insert_lp_control_action(&self.pool, "resume", Some(&reason), actor).await?;
                 state.flags.paused = false;
                 state.flags.flattening = false;
-                self.emit_risk("control_resume", "info", json!({ "reason": reason })).await?;
+                self.emit_risk("control_resume", "info", json!({ "reason": reason }))
+                    .await?;
             }
             ControlCommand::CancelAll { reason } => {
                 warn!(target: "lp.control", reason = %reason, open_orders = state.open_orders.len(), "cancel-all requested");
-                insert_lp_control_action(&self.pool, "cancel_all", Some(&reason)).await?;
+                insert_lp_control_action(&self.pool, "cancel_all", Some(&reason), actor).await?;
                 self.exchange.cancel_all().await?;
                 self.mark_orders_status(&state.market.condition_id, &state.open_orders, "CANCELED")
                     .await?;
@@ -279,7 +291,7 @@ impl LpService {
             }
             ControlCommand::Flatten { reason } => {
                 warn!(target: "lp.control", reason = %reason, positions = state.positions.len(), "flatten requested");
-                insert_lp_control_action(&self.pool, "flatten", Some(&reason)).await?;
+                insert_lp_control_action(&self.pool, "flatten", Some(&reason), actor).await?;
                 state.flags.paused = true;
                 state.flags.flattening = true;
                 self.exchange.cancel_all().await?;
@@ -293,7 +305,7 @@ impl LpService {
             }
             ControlCommand::Split { amount, reason } => {
                 info!(target: "lp.control", reason = %reason, amount = %amount, "split requested");
-                insert_lp_control_action(&self.pool, "split", Some(&reason)).await?;
+                insert_lp_control_action(&self.pool, "split", Some(&reason), actor).await?;
                 let amount = amount
                     .parse::<Decimal>()
                     .with_context(|| format!("invalid split amount {amount}"))?;
@@ -308,7 +320,7 @@ impl LpService {
             }
             ControlCommand::Merge { amount, reason } => {
                 info!(target: "lp.control", reason = %reason, amount = %amount, "merge requested");
-                insert_lp_control_action(&self.pool, "merge", Some(&reason)).await?;
+                insert_lp_control_action(&self.pool, "merge", Some(&reason), actor).await?;
                 let amount = amount
                     .parse::<Decimal>()
                     .with_context(|| format!("invalid merge amount {amount}"))?;
@@ -326,8 +338,13 @@ impl LpService {
                 active,
                 reason,
             } => {
-                insert_lp_control_action(&self.pool, &format!("signal:{name}"), Some(&reason))
-                    .await?;
+                insert_lp_control_action(
+                    &self.pool,
+                    &format!("signal:{name}"),
+                    Some(&reason),
+                    actor,
+                )
+                .await?;
                 let before = state.signals.clone();
                 aggregator.apply(
                     state,
@@ -499,12 +516,16 @@ impl LpService {
                 RiskAction::None => {}
                 RiskAction::Pause { reason } => {
                     warn!(target: "lp.risk", reason = %reason, "risk pause triggered");
+                    insert_lp_control_action(&self.pool, "pause", Some(&reason), "risk_engine")
+                        .await?;
                     state.flags.paused = true;
                     self.emit_risk("pause", "warn", json!({ "reason": reason }))
                         .await?;
                 }
                 RiskAction::Resume { reason } => {
                     info!(target: "lp.risk", reason = %reason, "risk resume triggered");
+                    insert_lp_control_action(&self.pool, "resume", Some(&reason), "risk_engine")
+                        .await?;
                     state.flags.paused = false;
                     state.flags.flattening = false;
                     self.emit_risk("resume", "info", json!({ "reason": reason }))
@@ -512,14 +533,32 @@ impl LpService {
                 }
                 RiskAction::CancelAll { reason } => {
                     warn!(target: "lp.risk", reason = %reason, open_orders = state.open_orders.len(), "risk cancel-all triggered");
+                    insert_lp_control_action(
+                        &self.pool,
+                        "cancel_all",
+                        Some(&reason),
+                        "risk_engine",
+                    )
+                    .await?;
                     self.exchange.cancel_all().await?;
-                    self.mark_orders_status(&state.market.condition_id, &state.open_orders, "CANCELED")
-                        .await?;
+                    self.mark_orders_status(
+                        &state.market.condition_id,
+                        &state.open_orders,
+                        "CANCELED",
+                    )
+                    .await?;
                     state.open_orders.clear();
                     self.emit_risk("cancel_all", "warn", json!({ "reason": reason }))
                         .await?;
                 }
                 RiskAction::Flatten(intent) => {
+                    insert_lp_control_action(
+                        &self.pool,
+                        "flatten",
+                        Some("risk flatten"),
+                        "risk_engine",
+                    )
+                    .await?;
                     self.execute_flatten(state, "risk flatten", &intent).await?;
                 }
             }
@@ -853,9 +892,15 @@ impl LpService {
         let payload = serde_json::to_string(&details)?;
         insert_lp_risk_event(&self.pool, event_type, severity, &payload).await?;
         match severity {
-            "error" => error!(target: "lp.risk", event_type = %event_type, details = %payload, "risk event"),
-            "warn" => warn!(target: "lp.risk", event_type = %event_type, details = %payload, "risk event"),
-            _ => info!(target: "lp.risk", event_type = %event_type, details = %payload, "risk event"),
+            "error" => {
+                error!(target: "lp.risk", event_type = %event_type, details = %payload, "risk event")
+            }
+            "warn" => {
+                warn!(target: "lp.risk", event_type = %event_type, details = %payload, "risk event")
+            }
+            _ => {
+                info!(target: "lp.risk", event_type = %event_type, details = %payload, "risk event")
+            }
         }
         if let Some(reporter) = &self.reporter {
             reporter.send(event_type, &payload).await?;
@@ -895,7 +940,11 @@ impl LpService {
                 .previous_reason
                 .clone()
                 .unwrap_or_else(|| "none".to_string());
-            let level = if transition.active { "enabled" } else { "disabled" };
+            let level = if transition.active {
+                "enabled"
+            } else {
+                "disabled"
+            };
             info!(
                 target: "lp.signal",
                 signal = %transition.name,
@@ -931,7 +980,9 @@ impl LpService {
 fn upsert_order_state(state: &mut RuntimeState, order: ManagedOrder) {
     let terminal = matches!(order.status.as_str(), "CANCELED" | "MATCHED");
     if terminal {
-        state.open_orders.retain(|existing| existing.order_id != order.order_id);
+        state
+            .open_orders
+            .retain(|existing| existing.order_id != order.order_id);
     } else if let Some(existing) = state
         .open_orders
         .iter_mut()
@@ -963,9 +1014,14 @@ fn desired_quotes_match(
         }
 
         let matched = outcome.desired_quotes.iter().any(|quote| {
+            let tick_tolerance = state
+                .market
+                .token(&order.asset_id)
+                .map(|token| token.tick_size)
+                .unwrap_or(Decimal::ZERO);
             quote.asset_id == order.asset_id
                 && quote.side == order.side
-                && quote.price == order.price
+                && (quote.price - order.price).abs() <= tick_tolerance
                 && quote.size == order.size
         });
         if !matched {
@@ -998,7 +1054,9 @@ fn flatten_reference_price(
 ) -> Decimal {
     match state.books.get(asset_id) {
         Some(book) => match (book.best_bid(), book.best_ask()) {
-            (Some(best_bid), Some(best_ask)) => (best_bid.price + best_ask.price) / Decimal::from(2),
+            (Some(best_bid), Some(best_ask)) => {
+                (best_bid.price + best_ask.price) / Decimal::from(2)
+            }
             (Some(best_bid), None) => best_bid.price,
             (None, Some(best_ask)) => best_ask.price,
             (None, None) => fallback_price,
@@ -1060,12 +1118,12 @@ impl std::fmt::Display for QuoteSide {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use anyhow::{Result, anyhow};
+    use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use chrono::Utc;
     use pn_common::db::init_db;
@@ -1076,16 +1134,16 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ExchangeAdapter, ExchangeEvent, LpService, ReconciliationSnapshot, ServiceConfig,
-        flatten_reference_price, missing_open_orders,
+        desired_quotes_match, flatten_reference_price, missing_open_orders, ExchangeAdapter,
+        ExchangeEvent, LpService, ReconciliationSnapshot, ServiceConfig,
     };
     use crate::control::ControlCommand;
     use crate::decision::DecisionConfig;
+    use crate::decision::DecisionOutcome;
     use crate::risk::{FlattenIntent, RiskConfig};
     use crate::types::{
-        AccountSnapshot, BookLevel, BookSnapshot, ManagedOrder, MarketMetadata, QuoteIntent,
-        PositionSnapshot, QuoteSide, RuntimeFlags, RuntimeState, SignalState, TokenMetadata,
-        TradeFill,
+        AccountSnapshot, BookLevel, BookSnapshot, ManagedOrder, MarketMetadata, PositionSnapshot,
+        QuoteIntent, QuoteSide, RuntimeFlags, RuntimeState, SignalState, TokenMetadata, TradeFill,
     };
 
     fn runtime_state_with_book() -> RuntimeState {
@@ -1362,7 +1420,13 @@ mod tests {
                 avg_price: dec!(0.42),
             },
         );
-        let (service, _) = LpService::new(exchange.clone(), pool, service_config(), None, state.clone());
+        let (service, _) = LpService::new(
+            exchange.clone(),
+            pool,
+            service_config(),
+            None,
+            state.clone(),
+        );
         let fill = TradeFill {
             trade_id: "trade-1".to_string(),
             order_id: Some("order-1".to_string()),
@@ -1459,8 +1523,7 @@ mod tests {
         config.report_interval = Duration::from_secs(3600);
         config.snapshot_interval = Duration::from_secs(3600);
 
-        let (service, _) =
-            LpService::new(exchange.clone(), pool, config, None, initial_state);
+        let (service, _) = LpService::new(exchange.clone(), pool, config, None, initial_state);
         let cancel = CancellationToken::new();
         let service_cancel = cancel.clone();
         let handle = tokio::spawn(async move { service.run(service_cancel).await });
@@ -1478,12 +1541,16 @@ mod tests {
     #[tokio::test]
     async fn run_keeps_loop_alive_after_transient_reconciliation_error() {
         let exchange = Arc::new(ReconcileErrorExchange::default());
-        let pool = SqlitePool::connect("sqlite::memory:")
-            .await
-            .expect("in-memory sqlite pool");
+        let pool = migrated_pool().await;
         let mut initial_state = runtime_state_with_book();
         initial_state.flags.paused = true;
-        let (service, control) = LpService::new(exchange.clone(), pool, service_config(), None, initial_state);
+        let (service, control) = LpService::new(
+            exchange.clone(),
+            pool,
+            service_config(),
+            None,
+            initial_state,
+        );
         let cancel = CancellationToken::new();
         let service_cancel = cancel.clone();
 
@@ -1509,5 +1576,69 @@ mod tests {
             .expect("service task join")
             .expect("service task panicked");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn desired_quotes_match_tolerates_one_tick_price_difference() {
+        let mut state = runtime_state_with_book();
+        let now = Utc::now();
+        state.open_orders = vec![ManagedOrder {
+            order_id: "order-1".to_string(),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Buy,
+            price: dec!(0.41),
+            size: dec!(10),
+            created_at: now,
+            status: "LIVE".to_string(),
+        }];
+        let outcome = DecisionOutcome {
+            desired_quotes: vec![QuoteIntent {
+                asset_id: "asset-yes".to_string(),
+                side: QuoteSide::Buy,
+                price: dec!(0.42),
+                size: dec!(10),
+                reason: "test".to_string(),
+            }],
+            cancel_all: false,
+            reason: "test".to_string(),
+        };
+
+        assert!(desired_quotes_match(
+            &state,
+            &outcome,
+            Duration::from_secs(10),
+        ));
+    }
+
+    #[test]
+    fn desired_quotes_match_rejects_prices_beyond_one_tick() {
+        let mut state = runtime_state_with_book();
+        let now = Utc::now();
+        state.open_orders = vec![ManagedOrder {
+            order_id: "order-1".to_string(),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Buy,
+            price: dec!(0.41),
+            size: dec!(10),
+            created_at: now,
+            status: "LIVE".to_string(),
+        }];
+        let outcome = DecisionOutcome {
+            desired_quotes: vec![QuoteIntent {
+                asset_id: "asset-yes".to_string(),
+                side: QuoteSide::Buy,
+                price: dec!(0.43),
+                size: dec!(10),
+                reason: "test".to_string(),
+            }],
+            cancel_all: false,
+            reason: "test".to_string(),
+        };
+
+        assert!(!desired_quotes_match(
+            &state,
+            &outcome,
+            Duration::from_secs(10),
+        ));
     }
 }
