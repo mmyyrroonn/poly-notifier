@@ -1,0 +1,147 @@
+# poly-lp
+
+单市场的 Polymarket LP daemon。当前版本是事件驱动架构，负责：
+
+- 订阅市场盘口和用户订单/成交流
+- 根据盘口深度和价差决定是否挂单、撤单
+- 成交后触发风控和平仓
+- 记录订单、成交、风控事件、心跳和运行日志
+- 通过本地 admin API 做暂停、恢复、全撤、flatten、split、merge
+
+更详细的运行逻辑见 [lp-architecture.md](docs/lp-architecture.md)。
+
+## 快速启动
+
+1. 复制 [.env.example](.env.example) 为 `.env`
+2. 修改 [config/default.toml](config/default.toml)
+3. 启动：
+
+```bash
+cargo run -p poly-lp --release
+```
+
+## 必配项
+
+- `POLYMARKET_PRIVATE_KEY`
+- `APP__LP__TRADING__CONDITION_ID`
+- `ADMIN_PASSWORD`
+
+推荐也一起配：
+
+- `POLYMARKET_RPC_URL`
+  现在不只是 `split/merge` 用，启动时 approval 检查和自动 approve 也会用到。
+- `APP__DATABASE__URL`
+- `APP__LP__REPORTING__OPERATOR_CHAT_IDS`
+- `TELEGRAM_BOT_TOKENS`
+
+## 当前可配置参数
+
+主要配置都在 [config/default.toml](config/default.toml)：
+
+- `[lp.trading]`
+  `condition_id`、API base URL、`chain_id`
+- `[lp.inventory]`
+  最低 USDC / token 库存、是否启动自动 split、启动 split 数量
+- `[lp.strategy]`
+  `quote_size`、`min_spread`、`min_depth`、`quote_offset_ticks`、`max_quote_age_secs`
+- `[lp.risk]`
+  `max_position`、`flat_position_tolerance`、`auto_flatten_after_fill`、`flatten_use_fok`
+- `[lp.approvals]`
+  `require_on_startup`、`auto_approve_on_startup`
+- `[lp.reporting]`
+  Telegram operator 报告
+- `[lp.control]`
+  admin bind、heartbeat interval、reconciliation interval
+- `[lp.logging]`
+  snapshot 周期、日志目录、滚动文件前缀、保留文件数、JSON 输出
+
+## 挂单逻辑
+
+当前策略是单层、对称、被动做市：
+
+- 每边挂单量 = `lp.strategy.quote_size`
+- 只有当 spread `>= min_spread` 且顶档深度 `>= min_depth` 才挂
+- 买价 = `best_bid + quote_offset_ticks * tick_size`
+- 卖价 = `best_ask - quote_offset_ticks * tick_size`
+- 价格会被钳制，避免穿价
+- 被动单使用 `GTC + post-only`
+- fill 后 flatten 使用 `FAK`，除非 `flatten_use_fok = true`
+
+## approve 支持
+
+启动时会先检查所需授权：
+
+- 市场 exchange：USDC allowance + CTF `setApprovalForAll`
+- neg-risk market 额外检查 adapter
+- 如果启用了启动自动 split，还会检查 Conditional Tokens 合约的 USDC allowance
+
+配置行为：
+
+- `lp.approvals.require_on_startup = true`
+  缺授权直接拒绝启动
+- `lp.approvals.auto_approve_on_startup = true`
+  启动时自动发链上 approve 交易，然后再继续启动
+
+当前自动授权模式发的是：
+
+- `USDC approve(MAX)`
+- `CTF setApprovalForAll(true)`
+
+默认是安全模式：检查，但不自动放权。
+
+## condition_id 怎么确认
+
+`condition_id` 是市场 ID，不是 YES/NO token id。官方概念说明见：
+
+- `Condition ID` / `Token IDs`：<https://docs.polymarket.com/concepts/markets-events>
+- market by slug：<https://docs.polymarket.com/api-reference/markets/get-market-by-slug>
+
+最稳的确认方法有两种：
+
+1. 你直接给我 Polymarket 的 market URL 或 event URL
+2. 你自己查官方 Gamma API
+
+按 slug 查单个 market：
+
+```bash
+curl "https://gamma-api.polymarket.com/markets/slug/<slug>"
+```
+
+返回里重点看：
+
+- `conditionId`
+- `question`
+- `slug`
+- `clobTokenIds`
+
+按 event slug 查整组市场：
+
+```bash
+curl "https://gamma-api.polymarket.com/events?slug=<event-slug>"
+```
+
+如果你把具体的 event 链接、market 链接、slug，或者完整 question 发我，我可以帮你确认该填哪个 `condition_id`。
+
+## 启动后检查
+
+健康检查：
+
+```bash
+curl -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/health
+curl -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/state
+```
+
+常用控制：
+
+```bash
+curl -X POST -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/pause
+curl -X POST -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/resume
+curl -X POST -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/cancel-all
+curl -X POST -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/flatten
+```
+
+## 日志
+
+- stdout：实时进程日志
+- `logs/`：按天滚动的结构化日志
+- SQLite：订单、成交、仓位、heartbeat、risk event、control action

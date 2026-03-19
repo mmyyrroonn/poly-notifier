@@ -17,7 +17,10 @@ use tracing::info;
 
 use crate::{
     error::{Error, Result},
-    models::{Alert, Feedback, Market, NotificationLog, Subscription, SubscriptionDetail, User},
+    models::{
+        Alert, Feedback, LpControlAction, LpHeartbeat, LpOrder, LpPositionSnapshot, LpReport,
+        LpRiskEvent, LpTrade, Market, NotificationLog, Subscription, SubscriptionDetail, User,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -332,6 +335,313 @@ pub async fn update_market_prices(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// LP daemon helpers
+// ---------------------------------------------------------------------------
+
+/// Insert or update an LP-managed order by its exchange order ID.
+pub async fn upsert_lp_order(
+    pool: &SqlitePool,
+    order_id: &str,
+    client_order_id: Option<&str>,
+    condition_id: &str,
+    asset_id: &str,
+    side: &str,
+    price: &str,
+    size: &str,
+    status: &str,
+    strategy_reason: Option<&str>,
+) -> Result<i64> {
+    let now = Utc::now().naive_utc();
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO lp_orders \
+            (order_id, client_order_id, condition_id, asset_id, side, price, size, status, strategy_reason, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(order_id) DO UPDATE SET \
+            client_order_id = excluded.client_order_id, \
+            price = excluded.price, \
+            size = excluded.size, \
+            status = excluded.status, \
+            strategy_reason = excluded.strategy_reason, \
+            updated_at = excluded.updated_at \
+         RETURNING id",
+    )
+    .bind(order_id)
+    .bind(client_order_id)
+    .bind(condition_id)
+    .bind(asset_id)
+    .bind(side)
+    .bind(price)
+    .bind(size)
+    .bind(status)
+    .bind(strategy_reason)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+/// Return the most recently updated LP order rows for a condition.
+pub async fn get_lp_orders_for_condition(
+    pool: &SqlitePool,
+    condition_id: &str,
+) -> Result<Vec<LpOrder>> {
+    sqlx::query_as(
+        "SELECT id, order_id, client_order_id, condition_id, asset_id, side, price, size, status, strategy_reason, created_at, updated_at \
+         FROM lp_orders \
+         WHERE condition_id = ? \
+         ORDER BY updated_at DESC",
+    )
+    .bind(condition_id)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Database)
+}
+
+/// Insert or update an LP trade by exchange trade ID.
+pub async fn upsert_lp_trade(
+    pool: &SqlitePool,
+    trade_id: &str,
+    order_id: Option<&str>,
+    condition_id: &str,
+    asset_id: &str,
+    side: &str,
+    price: &str,
+    size: &str,
+    status: &str,
+) -> Result<i64> {
+    let now = Utc::now().naive_utc();
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO lp_trades \
+            (trade_id, order_id, condition_id, asset_id, side, price, size, status, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(trade_id) DO UPDATE SET \
+            status = excluded.status, \
+            updated_at = excluded.updated_at \
+         RETURNING id",
+    )
+    .bind(trade_id)
+    .bind(order_id)
+    .bind(condition_id)
+    .bind(asset_id)
+    .bind(side)
+    .bind(price)
+    .bind(size)
+    .bind(status)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+/// Fetch recent LP trades for a condition.
+pub async fn get_recent_lp_trades(
+    pool: &SqlitePool,
+    condition_id: &str,
+    limit: i64,
+) -> Result<Vec<LpTrade>> {
+    sqlx::query_as(
+        "SELECT id, trade_id, order_id, condition_id, asset_id, side, price, size, status, created_at, updated_at \
+         FROM lp_trades \
+         WHERE condition_id = ? \
+         ORDER BY updated_at DESC \
+         LIMIT ?",
+    )
+    .bind(condition_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Database)
+}
+
+/// Persist a position snapshot for reporting and reconciliation history.
+pub async fn insert_lp_position_snapshot(
+    pool: &SqlitePool,
+    condition_id: &str,
+    asset_id: &str,
+    position_size: &str,
+    avg_price: &str,
+    usdc_balance: &str,
+    snapshot_type: &str,
+) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO lp_positions \
+            (condition_id, asset_id, position_size, avg_price, usdc_balance, snapshot_type) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         RETURNING id",
+    )
+    .bind(condition_id)
+    .bind(asset_id)
+    .bind(position_size)
+    .bind(avg_price)
+    .bind(usdc_balance)
+    .bind(snapshot_type)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+/// Fetch recent position snapshots, newest first.
+pub async fn get_recent_lp_positions(
+    pool: &SqlitePool,
+    condition_id: &str,
+    limit: i64,
+) -> Result<Vec<LpPositionSnapshot>> {
+    sqlx::query_as(
+        "SELECT id, condition_id, asset_id, position_size, avg_price, usdc_balance, snapshot_type, created_at \
+         FROM lp_positions \
+         WHERE condition_id = ? \
+         ORDER BY created_at DESC \
+         LIMIT ?",
+    )
+    .bind(condition_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Database)
+}
+
+/// Persist a risk/control event.
+pub async fn insert_lp_risk_event(
+    pool: &SqlitePool,
+    event_type: &str,
+    severity: &str,
+    details_json: &str,
+) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO lp_risk_events (event_type, severity, details_json) \
+         VALUES (?, ?, ?) \
+         RETURNING id",
+    )
+    .bind(event_type)
+    .bind(severity)
+    .bind(details_json)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+/// Return the most recent LP risk events.
+pub async fn get_recent_lp_risk_events(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<LpRiskEvent>> {
+    sqlx::query_as(
+        "SELECT id, event_type, severity, details_json, created_at \
+         FROM lp_risk_events \
+         ORDER BY created_at DESC \
+         LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Database)
+}
+
+/// Persist a heartbeat acknowledgement or failure.
+pub async fn insert_lp_heartbeat(
+    pool: &SqlitePool,
+    heartbeat_id: &str,
+    status: &str,
+    note: Option<&str>,
+) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO lp_heartbeats (heartbeat_id, status, note) \
+         VALUES (?, ?, ?) \
+         RETURNING id",
+    )
+    .bind(heartbeat_id)
+    .bind(status)
+    .bind(note)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+/// Fetch recent heartbeat rows.
+pub async fn get_recent_lp_heartbeats(pool: &SqlitePool, limit: i64) -> Result<Vec<LpHeartbeat>> {
+    sqlx::query_as(
+        "SELECT id, heartbeat_id, status, note, created_at \
+         FROM lp_heartbeats \
+         ORDER BY created_at DESC \
+         LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Database)
+}
+
+/// Persist a generated operator report.
+pub async fn insert_lp_report(
+    pool: &SqlitePool,
+    report_type: &str,
+    payload: &str,
+) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO lp_reports (report_type, payload) VALUES (?, ?) RETURNING id",
+    )
+    .bind(report_type)
+    .bind(payload)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+/// Fetch recent reports.
+pub async fn get_recent_lp_reports(pool: &SqlitePool, limit: i64) -> Result<Vec<LpReport>> {
+    sqlx::query_as(
+        "SELECT id, report_type, payload, created_at \
+         FROM lp_reports \
+         ORDER BY created_at DESC \
+         LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Database)
+}
+
+/// Persist a manual control action requested through the control plane.
+pub async fn insert_lp_control_action(
+    pool: &SqlitePool,
+    action: &str,
+    reason: Option<&str>,
+) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO lp_control_actions (action, reason) VALUES (?, ?) RETURNING id",
+    )
+    .bind(action)
+    .bind(reason)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+/// Fetch recent control actions.
+pub async fn get_recent_lp_control_actions(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<LpControlAction>> {
+    sqlx::query_as(
+        "SELECT id, action, reason, created_at \
+         FROM lp_control_actions \
+         ORDER BY created_at DESC \
+         LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Database)
 }
 
 // ---------------------------------------------------------------------------

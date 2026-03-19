@@ -268,3 +268,91 @@ pub struct SubscriptionDetail {
     pub bot_id: String,
     pub timezone: String,
 }
+
+// ---------------------------------------------------------------------------
+// LP daemon models
+// ---------------------------------------------------------------------------
+
+/// Persisted view of an LP-managed order.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LpOrder {
+    pub id: i64,
+    pub order_id: String,
+    pub client_order_id: Option<String>,
+    pub condition_id: String,
+    pub asset_id: String,
+    pub side: String,
+    pub price: String,
+    pub size: String,
+    pub status: String,
+    pub strategy_reason: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+/// Persisted trade/fill record for the LP daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LpTrade {
+    pub id: i64,
+    pub trade_id: String,
+    pub order_id: Option<String>,
+    pub condition_id: String,
+    pub asset_id: String,
+    pub side: String,
+    pub price: String,
+    pub size: String,
+    pub status: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+/// Persisted inventory and cash snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LpPositionSnapshot {
+    pub id: i64,
+    pub condition_id: String,
+    pub asset_id: String,
+    pub position_size: String,
+    pub avg_price: String,
+    pub usdc_balance: String,
+    pub snapshot_type: String,
+    pub created_at: NaiveDateTime,
+}
+
+/// Persisted risk or control event emitted by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LpRiskEvent {
+    pub id: i64,
+    pub event_type: String,
+    pub severity: String,
+    pub details_json: String,
+    pub created_at: NaiveDateTime,
+}
+
+/// Persisted heartbeat result.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LpHeartbeat {
+    pub id: i64,
+    pub heartbeat_id: String,
+    pub status: String,
+    pub note: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
+/// Persisted outbound operator report.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LpReport {
+    pub id: i64,
+    pub report_type: String,
+    pub payload: String,
+    pub created_at: NaiveDateTime,
+}
+
+/// Persisted manual/admin control action.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LpControlAction {
+    pub id: i64,
+    pub action: String,
+    pub reason: Option<String>,
+    pub created_at: NaiveDateTime,
+}

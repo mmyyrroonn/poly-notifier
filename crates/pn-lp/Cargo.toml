@@ -1,16 +1,21 @@
 [package]
-name = "pn-admin"
+name = "pn-lp"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 pn-common = { workspace = true }
-pn-lp = { workspace = true }
+pn-polymarket = { workspace = true }
 tokio = { workspace = true }
-axum = { workspace = true }
+tokio-util = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+rust_decimal = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }

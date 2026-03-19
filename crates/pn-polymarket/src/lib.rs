@@ -23,10 +23,17 @@
 
 pub mod clob;
 pub mod gamma;
+pub mod lp;
 pub mod types;
 pub mod ws;
 
 pub use clob::ClobClient;
 pub use gamma::GammaClient;
+pub use lp::{
+    AccountSnapshot, ApprovalCheck, ApprovalStatus, ApprovalTarget, BookLevel, BookSnapshot,
+    BootstrapState, ExecutionConfig, FlattenRequest, ManagedOrder, MarketMetadata,
+    PolymarketExecutionClient, PositionSnapshot, QuoteRequest, QuoteSide, ReconciliationState,
+    StreamEvent, TokenMetadata, TradeFill,
+};
 pub use types::{GammaMarket, GammaToken, WsEvent};
 pub use ws::PolymarketWs;

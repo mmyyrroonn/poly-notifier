@@ -26,7 +26,7 @@
 //! use pn_admin::create_router;
 //!
 //! # async fn example(pool: SqlitePool) {
-//! let router = create_router(pool, "s3cr3t".to_string());
+//! let router = create_router(pool, "s3cr3t".to_string(), None);
 //!
 //! let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
 //!     .await
@@ -40,6 +40,7 @@ pub mod handlers;
 pub mod routes;
 
 use axum::Router;
+use pn_lp::LpControlHandle;
 use sqlx::SqlitePool;
 
 /// Shared application state threaded through both the auth middleware and
@@ -54,14 +55,21 @@ pub struct AdminState {
     pub pool: SqlitePool,
     /// Expected admin Bearer token.
     pub admin_password: String,
+    /// Optional LP runtime control handle.
+    pub lp_control: Option<LpControlHandle>,
 }
 
 impl AdminState {
     /// Create a new `AdminState`.
-    pub fn new(pool: SqlitePool, admin_password: String) -> Self {
+    pub fn new(
+        pool: SqlitePool,
+        admin_password: String,
+        lp_control: Option<LpControlHandle>,
+    ) -> Self {
         Self {
             pool,
             admin_password,
+            lp_control,
         }
     }
 }
@@ -76,7 +84,11 @@ impl AdminState {
 /// * `pool` – SQLite connection pool shared with the rest of the application.
 /// * `admin_password` – Secret token that callers must supply in the
 ///   `Authorization: Bearer <token>` header.
-pub fn create_router(pool: SqlitePool, admin_password: String) -> Router {
-    let state = AdminState::new(pool, admin_password);
+pub fn create_router(
+    pool: SqlitePool,
+    admin_password: String,
+    lp_control: Option<LpControlHandle>,
+) -> Router {
+    let state = AdminState::new(pool, admin_password, lp_control);
     routes::build_router(state)
 }

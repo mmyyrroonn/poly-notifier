@@ -16,7 +16,7 @@
 //! use sqlx::SqlitePool;
 //!
 //! # async fn example(pool: SqlitePool) {
-//! let state = AdminState::new(pool, "s3cr3t".to_string());
+//! let state = AdminState::new(pool, "s3cr3t".to_string(), None);
 //! let app: Router = Router::new()
 //!     .route("/admin/ping", get(|| async { "pong" }))
 //!     .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))

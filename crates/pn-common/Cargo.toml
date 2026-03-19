@@ -14,3 +14,4 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 config = { workspace = true }
+rust_decimal_macros = { workspace = true }

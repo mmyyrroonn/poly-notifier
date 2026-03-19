@@ -1,5 +1,5 @@
 [database]
-url = "sqlite:poly-notifier.db"
+url = "sqlite:poly-lp.db"
 max_connections = 5
 
 [telegram]
@@ -23,3 +23,52 @@ daily_summary_cron = "0 0 9 * * *"  # 9:00 UTC daily
 [admin]
 port = 36363
 # Password set via ADMIN_PASSWORD env var
+
+[lp.trading]
+condition_id = "replace-me"
+clob_base_url = "https://clob.polymarket.com"
+gamma_base_url = "https://gamma-api.polymarket.com"
+data_api_base_url = "https://data-api.polymarket.com"
+chain_id = 137
+
+[lp.inventory]
+min_usdc_balance = 50.0
+min_token_balance = 10.0
+auto_split_on_startup = false
+startup_split_amount = 0.0
+
+[lp.strategy]
+quote_size = 25.0
+min_spread = 0.01
+min_depth = 25.0
+quote_offset_ticks = 1
+max_quote_age_secs = 10
+default_external_signal = true
+
+[lp.risk]
+max_position = 100.0
+flat_position_tolerance = 1.0
+auto_flatten_after_fill = true
+flatten_use_fok = false
+stale_feed_after_secs = 15
+
+[lp.approvals]
+require_on_startup = true
+auto_approve_on_startup = false
+
+[lp.reporting]
+operator_bot_id = ""
+operator_chat_ids = []
+summary_interval_secs = 300
+
+[lp.control]
+bind_addr = "127.0.0.1"
+heartbeat_interval_secs = 5
+reconciliation_interval_secs = 10
+
+[lp.logging]
+snapshot_interval_secs = 60
+directory = "logs"
+file_prefix = "poly-lp"
+max_files = 14
+json = true

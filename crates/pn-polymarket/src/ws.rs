@@ -25,7 +25,7 @@
 //! # async fn main() -> anyhow::Result<()> {
 //! let ws = PolymarketWs::with_ping_interval(Duration::from_secs(10));
 //! let token_ids = vec!["0xtoken_a".to_string()];
-//! let (tx, mut rx) = mpsc::unbounded_channel();
+//! let (tx, mut rx) = mpsc::unbounded_channel::<pn_polymarket::WsEvent>();
 //! let cancel = CancellationToken::new();
 //!
 //! // In production this would run in a spawned task.

@@ -1,26 +1,29 @@
 [package]
-name = "poly-notifier"
+name = "poly-lp"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "poly-notifier"
+name = "poly-lp"
 path = "src/main.rs"
 
 [dependencies]
 pn-common = { workspace = true }
 pn-polymarket = { workspace = true }
-pn-monitor = { workspace = true }
-pn-alert = { workspace = true }
 pn-notify = { workspace = true }
-pn-bot = { workspace = true }
-pn-scheduler = { workspace = true }
+pn-lp = { workspace = true }
 pn-admin = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
 dotenvy = { workspace = true }
 axum = { workspace = true }
+rust_decimal = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
 teloxide = { workspace = true }

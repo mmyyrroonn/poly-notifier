@@ -1,0 +1,1275 @@
+use std::collections::HashMap;
+use std::env;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use alloy::sol;
+use alloy::providers::ProviderBuilder;
+use alloy::signers::local::PrivateKeySigner;
+use anyhow::{Context, Result};
+use futures_util::StreamExt;
+use polymarket_client_sdk::auth::{LocalSigner, Signer, Uuid};
+use polymarket_client_sdk::clob;
+use polymarket_client_sdk::clob::types::{Amount, AssetType, OrderType, Side, SignatureType};
+use polymarket_client_sdk::clob::types::request::{
+    BalanceAllowanceRequest, CancelMarketOrderRequest, OrderBookSummaryRequest, OrdersRequest,
+};
+use polymarket_client_sdk::ctf;
+use polymarket_client_sdk::data;
+use polymarket_client_sdk::data::types::MarketFilter;
+use polymarket_client_sdk::data::types::request::PositionsRequest;
+use polymarket_client_sdk::types::{Address, B256, Decimal, U256};
+use polymarket_client_sdk::{PRIVATE_KEY_VAR, contract_config};
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+
+const DEFAULT_POLYGON_RPC_URL: &str = "https://polygon-rpc.com";
+
+sol! {
+    #[sol(rpc)]
+    interface IERC20 {
+        function approve(address spender, uint256 value) external returns (bool);
+        function allowance(address owner, address spender) external view returns (uint256);
+    }
+
+    #[sol(rpc)]
+    interface IERC1155 {
+        function setApprovalForAll(address operator, bool approved) external;
+        function isApprovedForAll(address account, address operator) external view returns (bool);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionConfig {
+    pub condition_id: String,
+    pub clob_base_url: String,
+    pub data_api_base_url: String,
+    pub chain_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalTarget {
+    pub label: String,
+    pub address: Address,
+    pub require_usdc_allowance: bool,
+    pub require_ctf_approval: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalCheck {
+    pub label: String,
+    pub address: Address,
+    pub require_usdc_allowance: bool,
+    pub require_ctf_approval: bool,
+    pub usdc_allowance_ready: bool,
+    pub ctf_approval_ready: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalStatus {
+    pub targets: Vec<ApprovalCheck>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenMetadata {
+    pub asset_id: String,
+    pub outcome: String,
+    pub tick_size: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketMetadata {
+    pub condition_id: String,
+    pub question: String,
+    pub tokens: Vec<TokenMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BookLevel {
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct BookSnapshot {
+    pub asset_id: String,
+    pub bids: Vec<BookLevel>,
+    pub asks: Vec<BookLevel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManagedOrder {
+    pub order_id: String,
+    pub asset_id: String,
+    pub side: QuoteSide,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeFill {
+    pub trade_id: String,
+    pub order_id: Option<String>,
+    pub asset_id: String,
+    pub side: QuoteSide,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PositionSnapshot {
+    pub asset_id: String,
+    pub size: Decimal,
+    pub avg_price: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountSnapshot {
+    pub usdc_balance: Decimal,
+    pub token_balances: HashMap<String, Decimal>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuoteRequest {
+    pub asset_id: String,
+    pub side: QuoteSide,
+    pub price: Decimal,
+    pub size: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlattenRequest {
+    pub asset_id: String,
+    pub side: QuoteSide,
+    pub size: Decimal,
+    pub use_fok: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BootstrapState {
+    pub market: MarketMetadata,
+    pub books: Vec<BookSnapshot>,
+    pub open_orders: Vec<ManagedOrder>,
+    pub positions: Vec<PositionSnapshot>,
+    pub account: AccountSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconciliationState {
+    pub open_orders: Vec<ManagedOrder>,
+    pub positions: Vec<PositionSnapshot>,
+    pub account: AccountSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub enum QuoteSide {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    Book(BookSnapshot),
+    Order(ManagedOrder),
+    Trade(TradeFill),
+    TickSize {
+        asset_id: String,
+        new_tick_size: Decimal,
+    },
+}
+
+#[derive(Clone)]
+pub struct PolymarketExecutionClient {
+    config: ExecutionConfig,
+    signer: PrivateKeySigner,
+    clob: clob::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    market_ws: clob::ws::Client,
+    user_ws: clob::ws::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    data: data::Client,
+    condition_id: B256,
+    market: Arc<MarketMetadata>,
+    asset_ids: Arc<Vec<U256>>,
+    wallet_address: Address,
+    exchange_contract: Address,
+    collateral_token: Address,
+    conditional_tokens: Address,
+    neg_risk_adapter: Option<Address>,
+}
+
+impl PolymarketExecutionClient {
+    pub async fn connect(config: ExecutionConfig) -> Result<Self> {
+        info!(
+            target: "pn_polymarket::execution",
+            condition_id = %config.condition_id,
+            clob_base_url = %config.clob_base_url,
+            data_api_base_url = %config.data_api_base_url,
+            chain_id = config.chain_id,
+            "connecting authenticated Polymarket execution client"
+        );
+        let private_key = env::var(PRIVATE_KEY_VAR)
+            .with_context(|| format!("{PRIVATE_KEY_VAR} environment variable is required"))?;
+        let signer =
+            LocalSigner::from_str(&private_key)?.with_chain_id(Some(config.chain_id));
+
+        let clob_config = clob::Config::builder()
+            .heartbeat_interval(Duration::from_secs(5))
+            .build();
+        let mut clob = clob::Client::new(&config.clob_base_url, clob_config)?
+            .authentication_builder(&signer)
+            .signature_type(SignatureType::Eoa)
+            .authenticate()
+            .await?;
+
+        if clob.heartbeats_active() {
+            clob.stop_heartbeats().await?;
+        }
+
+        let condition_id = B256::from_str(&config.condition_id)
+            .with_context(|| format!("invalid condition id {}", config.condition_id))?;
+        let market_response = clob.market(&config.condition_id).await?;
+        let question = market_response.question.clone();
+        let token_records = market_response.tokens;
+        let mut tokens = Vec::with_capacity(token_records.len());
+        let mut asset_ids = Vec::with_capacity(token_records.len());
+        for token in token_records {
+            let tick_size = clob.tick_size(token.token_id).await?.minimum_tick_size.as_decimal();
+            tokens.push(TokenMetadata {
+                asset_id: token.token_id.to_string(),
+                outcome: token.outcome,
+                tick_size,
+            });
+            asset_ids.push(token.token_id);
+        }
+
+        let market = Arc::new(MarketMetadata {
+            condition_id: config.condition_id.clone(),
+            question,
+            tokens,
+        });
+
+        let credentials = clob.credentials().clone();
+        let address = clob.address();
+        let market_ws = clob::ws::Client::default();
+        let user_ws = clob::ws::Client::default().authenticate(credentials, address)?;
+        let data = data::Client::new(&config.data_api_base_url)?;
+        let contracts = contract_config(config.chain_id, market_response.neg_risk)
+            .with_context(|| format!("missing contract config for chain {}", config.chain_id))?;
+
+        info!(
+            target: "pn_polymarket::execution",
+            condition_id = %config.condition_id,
+            question = %market.question,
+            tokens = market.tokens.len(),
+            "Polymarket execution client connected"
+        );
+
+        Ok(Self {
+            config,
+            signer,
+            clob,
+            market_ws,
+            user_ws,
+            data,
+            condition_id,
+            market,
+            asset_ids: Arc::new(asset_ids),
+            wallet_address: address,
+            exchange_contract: contracts.exchange,
+            collateral_token: contracts.collateral,
+            conditional_tokens: contracts.conditional_tokens,
+            neg_risk_adapter: contracts.neg_risk_adapter,
+        })
+    }
+
+    pub async fn bootstrap(&self) -> Result<BootstrapState> {
+        info!(
+            target: "pn_polymarket::execution",
+            condition_id = %self.market.condition_id,
+            assets = self.asset_ids.len(),
+            "bootstrapping market state"
+        );
+        let mut requests = Vec::with_capacity(self.asset_ids.len());
+        for asset_id in self.asset_ids.iter() {
+            requests.push(
+                OrderBookSummaryRequest::builder()
+                    .token_id(*asset_id)
+                    .build(),
+            );
+        }
+        let books: Vec<BookSnapshot> = self
+            .clob
+            .order_books(&requests)
+            .await?
+            .into_iter()
+            .map(|book| BookSnapshot {
+                asset_id: book.asset_id.to_string(),
+                bids: book
+                    .bids
+                    .into_iter()
+                    .map(|level| BookLevel {
+                        price: level.price,
+                        size: level.size,
+                    })
+                    .collect(),
+                asks: book
+                    .asks
+                    .into_iter()
+                    .map(|level| BookLevel {
+                        price: level.price,
+                        size: level.size,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let reconcile = self.reconcile().await?;
+
+        info!(
+            target: "pn_polymarket::execution",
+            condition_id = %self.market.condition_id,
+            books = books.len(),
+            open_orders = reconcile.open_orders.len(),
+            positions = reconcile.positions.len(),
+            usdc_balance = %reconcile.account.usdc_balance,
+            "bootstrap snapshot ready"
+        );
+
+        Ok(BootstrapState {
+            market: (*self.market).clone(),
+            books,
+            open_orders: reconcile.open_orders,
+            positions: reconcile.positions,
+            account: reconcile.account,
+        })
+    }
+
+    pub async fn check_approvals(&self, include_inventory: bool) -> Result<ApprovalStatus> {
+        let rpc_url = rpc_url();
+        info!(
+            target: "pn_polymarket::execution",
+            wallet = %self.wallet_address,
+            rpc_url = %rpc_url,
+            include_inventory,
+            "checking on-chain approvals"
+        );
+
+        let provider = ProviderBuilder::new()
+            .wallet(self.signer.clone())
+            .connect(&rpc_url)
+            .await?;
+        let usdc = IERC20::new(self.collateral_token, provider.clone());
+        let ctf = IERC1155::new(self.conditional_tokens, provider.clone());
+        let mut checks = Vec::new();
+
+        for target in self.approval_targets(include_inventory) {
+            let usdc_allowance_ready = if target.require_usdc_allowance {
+                check_allowance(&usdc, self.wallet_address, target.address).await? > U256::ZERO
+            } else {
+                true
+            };
+            let ctf_approval_ready = if target.require_ctf_approval {
+                check_approval_for_all(&ctf, self.wallet_address, target.address).await?
+            } else {
+                true
+            };
+
+            info!(
+                target: "pn_polymarket::execution",
+                label = %target.label,
+                address = %target.address,
+                usdc_allowance_ready,
+                ctf_approval_ready,
+                "approval target checked"
+            );
+
+            checks.push(ApprovalCheck {
+                label: target.label,
+                address: target.address,
+                require_usdc_allowance: target.require_usdc_allowance,
+                require_ctf_approval: target.require_ctf_approval,
+                usdc_allowance_ready,
+                ctf_approval_ready,
+            });
+        }
+
+        Ok(ApprovalStatus { targets: checks })
+    }
+
+    pub async fn ensure_approvals(&self, include_inventory: bool) -> Result<ApprovalStatus> {
+        let status = self.check_approvals(include_inventory).await?;
+        if status.is_ready() {
+            return Ok(status);
+        }
+
+        warn!(
+            target: "pn_polymarket::execution",
+            missing = ?status.missing_permissions(),
+            "missing approvals detected; submitting chain transactions"
+        );
+
+        let provider = ProviderBuilder::new()
+            .wallet(self.signer.clone())
+            .connect(&rpc_url())
+            .await?;
+        let usdc = IERC20::new(self.collateral_token, provider.clone());
+        let ctf = IERC1155::new(self.conditional_tokens, provider.clone());
+
+        for target in &status.targets {
+            if target.require_usdc_allowance && !target.usdc_allowance_ready {
+                let tx_hash = approve_usdc(&usdc, target.address, U256::MAX).await?;
+                info!(
+                    target: "pn_polymarket::execution",
+                    label = %target.label,
+                    address = %target.address,
+                    tx_hash = %tx_hash,
+                    "USDC approval submitted"
+                );
+            }
+
+            if target.require_ctf_approval && !target.ctf_approval_ready {
+                let tx_hash = set_ctf_approval(&ctf, target.address, true).await?;
+                info!(
+                    target: "pn_polymarket::execution",
+                    label = %target.label,
+                    address = %target.address,
+                    tx_hash = %tx_hash,
+                    "CTF approval submitted"
+                );
+            }
+        }
+
+        let verified = self.check_approvals(include_inventory).await?;
+        if !verified.is_ready() {
+            anyhow::bail!(
+                "approval verification failed: {}",
+                verified.missing_permissions().join(", ")
+            );
+        }
+
+        Ok(verified)
+    }
+
+    pub fn start_streams(
+        &self,
+        event_tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: CancellationToken,
+    ) {
+        self.start_market_stream(event_tx.clone(), cancel.clone());
+        self.start_tick_size_stream(event_tx.clone(), cancel.clone());
+        self.start_order_stream(event_tx.clone(), cancel.clone());
+        self.start_trade_stream(event_tx, cancel);
+    }
+
+    pub async fn reconcile(&self) -> Result<ReconciliationState> {
+        let open_orders = self.fetch_open_orders().await?;
+        let positions = self.fetch_positions().await?;
+        let account = self.fetch_account_snapshot().await?;
+
+        info!(
+            target: "pn_polymarket::execution",
+            condition_id = %self.market.condition_id,
+            open_orders = open_orders.len(),
+            positions = positions.len(),
+            usdc_balance = %account.usdc_balance,
+            "reconciled exchange state"
+        );
+
+        Ok(ReconciliationState {
+            open_orders,
+            positions,
+            account,
+        })
+    }
+
+    pub async fn post_quotes(&self, quotes: &[QuoteRequest]) -> Result<Vec<ManagedOrder>> {
+        if quotes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        info!(
+            target: "pn_polymarket::execution",
+            condition_id = %self.market.condition_id,
+            quote_count = quotes.len(),
+            "posting passive quotes"
+        );
+
+        let mut signed_orders = Vec::with_capacity(quotes.len());
+        for quote in quotes {
+            let token_id = parse_u256(&quote.asset_id)?;
+            let signable = self
+                .clob
+                .limit_order()
+                .token_id(token_id)
+                .side(side_to_sdk(&quote.side))
+                .price(quote.price)
+                .size(quote.size)
+                .order_type(OrderType::GTC)
+                .post_only(true)
+                .build()
+                .await?;
+            signed_orders.push(self.clob.sign(&self.signer, signable).await?);
+        }
+
+        let responses = match self.clob.post_orders(signed_orders).await {
+            Ok(responses) => responses,
+            Err(error) => {
+                error!(
+                    target: "pn_polymarket::execution",
+                    condition_id = %self.market.condition_id,
+                    quote_count = quotes.len(),
+                    error = %error,
+                    "passive quote request failed"
+                );
+                return Err(error.into());
+            }
+        };
+
+        let posted = responses
+            .into_iter()
+            .zip(quotes.iter())
+            .map(|(response, quote)| ManagedOrder {
+                order_id: response.order_id,
+                asset_id: quote.asset_id.clone(),
+                side: quote.side.clone(),
+                price: quote.price,
+                size: quote.size,
+                status: response.status.to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        for order in &posted {
+            info!(
+                target: "pn_polymarket::execution",
+                order_id = %order.order_id,
+                asset_id = %order.asset_id,
+                side = %order.side,
+                price = %order.price,
+                size = %order.size,
+                status = %order.status,
+                "passive quote accepted by CLOB"
+            );
+        }
+
+        Ok(posted)
+    }
+
+    pub async fn cancel_orders(&self, order_ids: &[String]) -> Result<()> {
+        if order_ids.is_empty() {
+            return Ok(());
+        }
+        info!(
+            target: "pn_polymarket::execution",
+            order_count = order_ids.len(),
+            "canceling explicit order set"
+        );
+        let refs: Vec<&str> = order_ids.iter().map(String::as_str).collect();
+        self.clob.cancel_orders(&refs).await?;
+        Ok(())
+    }
+
+    pub async fn cancel_market_orders(&self, asset_id: Option<&str>) -> Result<()> {
+        info!(
+            target: "pn_polymarket::execution",
+            condition_id = %self.market.condition_id,
+            asset_id = asset_id.unwrap_or("all"),
+            "canceling market-scoped orders"
+        );
+        let request = match optional_u256(asset_id)? {
+            Some(asset_id) => CancelMarketOrderRequest::builder()
+                .market(self.condition_id)
+                .asset_id(asset_id)
+                .build(),
+            None => CancelMarketOrderRequest::builder()
+                .market(self.condition_id)
+                .build(),
+        };
+        self.clob.cancel_market_orders(&request).await?;
+        Ok(())
+    }
+
+    pub async fn cancel_all(&self) -> Result<()> {
+        info!(
+            target: "pn_polymarket::execution",
+            condition_id = %self.market.condition_id,
+            "canceling all open orders"
+        );
+        self.clob.cancel_all_orders().await?;
+        Ok(())
+    }
+
+    pub async fn flatten(&self, request: &FlattenRequest) -> Result<TradeFill> {
+        warn!(
+            target: "pn_polymarket::execution",
+            asset_id = %request.asset_id,
+            side = %request.side,
+            size = %request.size,
+            use_fok = request.use_fok,
+            "submitting flatten market order"
+        );
+        let token_id = parse_u256(&request.asset_id)?;
+        let signable = self
+            .clob
+            .market_order()
+            .token_id(token_id)
+            .side(side_to_sdk(&request.side))
+            .amount(Amount::shares(request.size)?)
+            .order_type(if request.use_fok {
+                OrderType::FOK
+            } else {
+                OrderType::FAK
+            })
+            .build()
+            .await?;
+        let signed = self.clob.sign(&self.signer, signable).await?;
+        let response = self.clob.post_order(signed).await?;
+
+        info!(
+            target: "pn_polymarket::execution",
+            order_id = %response.order_id,
+            trade_ids = ?response.trade_ids,
+            status = %response.status,
+            asset_id = %request.asset_id,
+            side = %request.side,
+            size = %request.size,
+            "flatten order accepted by CLOB"
+        );
+
+        Ok(TradeFill {
+            trade_id: response
+                .trade_ids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| response.order_id.clone()),
+            order_id: Some(response.order_id),
+            asset_id: request.asset_id.clone(),
+            side: request.side.clone(),
+            price: Decimal::ZERO,
+            size: request.size,
+            status: response.status.to_string(),
+        })
+    }
+
+    pub async fn post_heartbeat(&self, heartbeat_id: Option<&str>) -> Result<String> {
+        let parsed = match heartbeat_id {
+            Some(id) if !id.is_empty() => Some(Uuid::parse_str(id)?),
+            _ => None,
+        };
+        let response = self.clob.post_heartbeat(parsed).await?;
+        info!(
+            target: "pn_polymarket::execution",
+            heartbeat_id = %response.heartbeat_id,
+            "heartbeat posted to CLOB"
+        );
+        Ok(response.heartbeat_id.to_string())
+    }
+
+    pub async fn split_position(&self, amount: Decimal) -> Result<String> {
+        info!(target: "pn_polymarket::execution", amount = %amount, "submitting split transaction");
+        let rpc_url = env::var("POLYMARKET_RPC_URL")
+            .context("POLYMARKET_RPC_URL is required for split operations")?;
+        let provider = ProviderBuilder::new()
+            .wallet(self.signer.clone())
+            .connect(&rpc_url)
+            .await?;
+        let client = ctf::Client::new(provider, self.config.chain_id)?;
+        let request = ctf::types::SplitPositionRequest::for_binary_market(
+            self.collateral_token,
+            self.condition_id,
+            decimal_to_u256(amount, 6)?,
+        );
+        let response = client.split_position(&request).await?;
+        info!(target: "pn_polymarket::execution", amount = %amount, tx_hash = %response.transaction_hash, "split transaction submitted");
+        Ok(response.transaction_hash.to_string())
+    }
+
+    pub async fn merge_positions(&self, amount: Decimal) -> Result<String> {
+        info!(target: "pn_polymarket::execution", amount = %amount, "submitting merge transaction");
+        let rpc_url = env::var("POLYMARKET_RPC_URL")
+            .context("POLYMARKET_RPC_URL is required for merge operations")?;
+        let provider = ProviderBuilder::new()
+            .wallet(self.signer.clone())
+            .connect(&rpc_url)
+            .await?;
+        let client = ctf::Client::new(provider, self.config.chain_id)?;
+        let request = ctf::types::MergePositionsRequest::for_binary_market(
+            self.collateral_token,
+            self.condition_id,
+            decimal_to_u256(amount, 6)?,
+        );
+        let response = client.merge_positions(&request).await?;
+        info!(target: "pn_polymarket::execution", amount = %amount, tx_hash = %response.transaction_hash, "merge transaction submitted");
+        Ok(response.transaction_hash.to_string())
+    }
+
+    pub fn market(&self) -> &MarketMetadata {
+        &self.market
+    }
+
+    async fn fetch_open_orders(&self) -> Result<Vec<ManagedOrder>> {
+        let request = OrdersRequest::builder().market(self.condition_id).build();
+        let page = self.clob.orders(&request, None).await?;
+        Ok(page
+            .data
+            .into_iter()
+            .map(map_open_order)
+            .collect())
+    }
+
+    async fn fetch_positions(&self) -> Result<Vec<PositionSnapshot>> {
+        let request = PositionsRequest::builder()
+            .user(self.clob.address())
+            .filter(MarketFilter::markets([self.condition_id]))
+            .build();
+        let positions = self.data.positions(&request).await?;
+        Ok(positions
+            .into_iter()
+            .map(|position| PositionSnapshot {
+                asset_id: position.asset.to_string(),
+                size: position.size,
+                avg_price: position.avg_price,
+            })
+            .collect())
+    }
+
+    async fn fetch_account_snapshot(&self) -> Result<AccountSnapshot> {
+        let usdc = self
+            .clob
+            .balance_allowance(
+                BalanceAllowanceRequest::builder()
+                    .asset_type(AssetType::Collateral)
+                    .build(),
+            )
+            .await?;
+        let mut token_balances = HashMap::new();
+        for asset_id in self.asset_ids.iter() {
+            let response = self
+                .clob
+                .balance_allowance(
+                    BalanceAllowanceRequest::builder()
+                        .asset_type(AssetType::Conditional)
+                        .token_id(*asset_id)
+                        .build(),
+                )
+                .await?;
+            token_balances.insert(asset_id.to_string(), response.balance);
+        }
+
+        Ok(AccountSnapshot {
+            usdc_balance: usdc.balance,
+            token_balances,
+        })
+    }
+
+    fn approval_targets(&self, include_inventory: bool) -> Vec<ApprovalTarget> {
+        build_approval_targets(
+            self.exchange_contract,
+            self.conditional_tokens,
+            self.neg_risk_adapter,
+            include_inventory,
+        )
+    }
+
+    fn start_market_stream(
+        &self,
+        event_tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: CancellationToken,
+    ) {
+        let client = self.market_ws.clone();
+        let asset_ids = (*self.asset_ids).clone();
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                let stream = match client.subscribe_orderbook(asset_ids.clone()) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        warn!(?error, "failed to subscribe to market orderbook stream");
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                tokio::pin!(stream);
+
+                let mut disconnected = false;
+                while !cancel.is_cancelled() {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        message = stream.next() => {
+                            match message {
+                                Some(Ok(book)) => {
+                                    let event = StreamEvent::Book(BookSnapshot {
+                                        asset_id: book.asset_id.to_string(),
+                                        bids: book.bids.into_iter().map(|level| BookLevel {
+                                            price: level.price,
+                                            size: level.size,
+                                        }).collect(),
+                                        asks: book.asks.into_iter().map(|level| BookLevel {
+                                            price: level.price,
+                                            size: level.size,
+                                        }).collect(),
+                                    });
+                                    if event_tx.send(event).is_err() {
+                                        return;
+                                    }
+                                }
+                                Some(Err(error)) => {
+                                    warn!(?error, "market orderbook stream disconnected");
+                                    disconnected = true;
+                                    break;
+                                }
+                                None => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !disconnected || cancel.is_cancelled() {
+                    break;
+                }
+
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    fn start_tick_size_stream(
+        &self,
+        event_tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: CancellationToken,
+    ) {
+        let client = self.market_ws.clone();
+        let asset_ids = (*self.asset_ids).clone();
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                let stream = match client.subscribe_tick_size_change(asset_ids.clone()) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        warn!(?error, "failed to subscribe to tick size stream");
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                tokio::pin!(stream);
+
+                let mut disconnected = false;
+                while !cancel.is_cancelled() {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        message = stream.next() => {
+                            match message {
+                                Some(Ok(change)) => {
+                                    if event_tx.send(StreamEvent::TickSize {
+                                        asset_id: change.asset_id.to_string(),
+                                        new_tick_size: change.new_tick_size,
+                                    }).is_err() {
+                                        return;
+                                    }
+                                }
+                                Some(Err(error)) => {
+                                    warn!(?error, "tick size stream disconnected");
+                                    disconnected = true;
+                                    break;
+                                }
+                                None => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !disconnected || cancel.is_cancelled() {
+                    break;
+                }
+
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    fn start_order_stream(
+        &self,
+        event_tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: CancellationToken,
+    ) {
+        let client = self.user_ws.clone();
+        let markets = vec![self.condition_id];
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                let stream = match client.subscribe_orders(markets.clone()) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        warn!(?error, "failed to subscribe to user order stream");
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                tokio::pin!(stream);
+
+                let mut disconnected = false;
+                while !cancel.is_cancelled() {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        message = stream.next() => {
+                            match message {
+                                Some(Ok(order)) => {
+                                    let event = StreamEvent::Order(ManagedOrder {
+                                        order_id: order.id,
+                                        asset_id: order.asset_id.to_string(),
+                                        side: side_from_sdk(order.side),
+                                        price: order.price,
+                                        size: order.original_size.unwrap_or(Decimal::ZERO),
+                                        status: order.status.map(|status| status.to_string()).unwrap_or_else(|| "UNKNOWN".to_string()),
+                                    });
+                                    if event_tx.send(event).is_err() {
+                                        return;
+                                    }
+                                }
+                                Some(Err(error)) => {
+                                    warn!(?error, "user order stream disconnected");
+                                    disconnected = true;
+                                    break;
+                                }
+                                None => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !disconnected || cancel.is_cancelled() {
+                    break;
+                }
+
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    fn start_trade_stream(
+        &self,
+        event_tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: CancellationToken,
+    ) {
+        let client = self.user_ws.clone();
+        let markets = vec![self.condition_id];
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                let stream = match client.subscribe_trades(markets.clone()) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        warn!(?error, "failed to subscribe to user trade stream");
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                tokio::pin!(stream);
+
+                let mut disconnected = false;
+                while !cancel.is_cancelled() {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        message = stream.next() => {
+                            match message {
+                                Some(Ok(trade)) => {
+                                    let event = StreamEvent::Trade(TradeFill {
+                                        trade_id: trade.id,
+                                        order_id: trade.taker_order_id,
+                                        asset_id: trade.asset_id.to_string(),
+                                        side: side_from_sdk(trade.side),
+                                        price: trade.price,
+                                        size: trade.size,
+                                        status: format!("{:?}", trade.status),
+                                    });
+                                    if event_tx.send(event).is_err() {
+                                        return;
+                                    }
+                                }
+                                Some(Err(error)) => {
+                                    warn!(?error, "user trade stream disconnected");
+                                    disconnected = true;
+                                    break;
+                                }
+                                None => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !disconnected || cancel.is_cancelled() {
+                    break;
+                }
+
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+}
+
+fn map_open_order(order: polymarket_client_sdk::clob::types::response::OpenOrderResponse) -> ManagedOrder {
+    ManagedOrder {
+        order_id: order.id,
+        asset_id: order.asset_id.to_string(),
+        side: side_from_sdk(order.side),
+        price: order.price,
+        size: order.original_size,
+        status: order.status.to_string(),
+    }
+}
+
+fn side_to_sdk(side: &QuoteSide) -> Side {
+    match side {
+        QuoteSide::Buy => Side::Buy,
+        QuoteSide::Sell => Side::Sell,
+    }
+}
+
+fn side_from_sdk(side: Side) -> QuoteSide {
+    match side {
+        Side::Sell => QuoteSide::Sell,
+        _ => QuoteSide::Buy,
+    }
+}
+
+fn parse_u256(value: &str) -> Result<U256> {
+    U256::from_str(value).with_context(|| format!("invalid asset id {value}"))
+}
+
+fn optional_u256(value: Option<&str>) -> Result<Option<U256>> {
+    value.map(parse_u256).transpose()
+}
+
+fn build_approval_targets(
+    exchange: Address,
+    conditional_tokens: Address,
+    neg_risk_adapter: Option<Address>,
+    include_inventory: bool,
+) -> Vec<ApprovalTarget> {
+    let mut targets = vec![ApprovalTarget {
+        label: "market exchange".to_string(),
+        address: exchange,
+        require_usdc_allowance: true,
+        require_ctf_approval: true,
+    }];
+
+    if let Some(adapter) = neg_risk_adapter {
+        targets.push(ApprovalTarget {
+            label: "neg-risk adapter".to_string(),
+            address: adapter,
+            require_usdc_allowance: true,
+            require_ctf_approval: true,
+        });
+    }
+
+    if include_inventory {
+        targets.push(ApprovalTarget {
+            label: "conditional tokens".to_string(),
+            address: conditional_tokens,
+            require_usdc_allowance: true,
+            require_ctf_approval: false,
+        });
+    }
+
+    targets
+}
+
+fn decimal_to_u256(value: Decimal, scale: u32) -> Result<U256> {
+    let scaled = value.round_dp(scale) * Decimal::from(10u64.pow(scale));
+    let integer = scaled
+        .trunc()
+        .to_string();
+    U256::from_str(&integer).with_context(|| format!("unable to convert {value} into base units"))
+}
+
+impl std::fmt::Display for QuoteSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Buy => f.write_str("BUY"),
+            Self::Sell => f.write_str("SELL"),
+        }
+    }
+}
+
+impl std::fmt::Display for TradeFill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} @ {}",
+            self.side, self.size, self.asset_id, self.price
+        )
+    }
+}
+
+impl ApprovalCheck {
+    fn missing_permissions(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        if self.require_usdc_allowance && !self.usdc_allowance_ready {
+            missing.push(format!("{}: USDC allowance", self.label));
+        }
+        if self.require_ctf_approval && !self.ctf_approval_ready {
+            missing.push(format!("{}: CTF approval", self.label));
+        }
+        missing
+    }
+}
+
+impl ApprovalStatus {
+    pub fn is_ready(&self) -> bool {
+        self.targets
+            .iter()
+            .all(|target| target.missing_permissions().is_empty())
+    }
+
+    pub fn missing_permissions(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .flat_map(ApprovalCheck::missing_permissions)
+            .collect()
+    }
+}
+
+fn rpc_url() -> String {
+    env::var("POLYMARKET_RPC_URL").unwrap_or_else(|_| DEFAULT_POLYGON_RPC_URL.to_string())
+}
+
+async fn check_allowance<P: alloy::providers::Provider>(
+    usdc: &IERC20::IERC20Instance<P>,
+    owner: Address,
+    spender: Address,
+) -> Result<U256> {
+    Ok(usdc.allowance(owner, spender).call().await?)
+}
+
+async fn check_approval_for_all<P: alloy::providers::Provider>(
+    ctf: &IERC1155::IERC1155Instance<P>,
+    owner: Address,
+    operator: Address,
+) -> Result<bool> {
+    Ok(ctf.isApprovedForAll(owner, operator).call().await?)
+}
+
+async fn approve_usdc<P: alloy::providers::Provider>(
+    usdc: &IERC20::IERC20Instance<P>,
+    spender: Address,
+    amount: U256,
+) -> Result<String> {
+    Ok(usdc.approve(spender, amount).send().await?.watch().await?.to_string())
+}
+
+async fn set_ctf_approval<P: alloy::providers::Provider>(
+    ctf: &IERC1155::IERC1155Instance<P>,
+    operator: Address,
+    approved: bool,
+) -> Result<String> {
+    Ok(ctf
+        .setApprovalForAll(operator, approved)
+        .send()
+        .await?
+        .watch()
+        .await?
+        .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use polymarket_client_sdk::types::address;
+
+    use super::{ApprovalCheck, ApprovalStatus, build_approval_targets};
+
+    #[test]
+    fn build_approval_targets_for_standard_market_only_requires_exchange() {
+        let exchange = address!("0x1000000000000000000000000000000000000001");
+        let conditional_tokens = address!("0x2000000000000000000000000000000000000002");
+
+        let targets = build_approval_targets(exchange, conditional_tokens, None, false);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].label, "market exchange");
+        assert_eq!(targets[0].address, exchange);
+        assert!(targets[0].require_usdc_allowance);
+        assert!(targets[0].require_ctf_approval);
+    }
+
+    #[test]
+    fn build_approval_targets_adds_adapter_and_split_contract_when_needed() {
+        let exchange = address!("0x1000000000000000000000000000000000000001");
+        let conditional_tokens = address!("0x2000000000000000000000000000000000000002");
+        let adapter = address!("0x3000000000000000000000000000000000000003");
+
+        let targets =
+            build_approval_targets(exchange, conditional_tokens, Some(adapter), true);
+
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[1].label, "neg-risk adapter");
+        assert_eq!(targets[1].address, adapter);
+        assert!(targets[1].require_usdc_allowance);
+        assert!(targets[1].require_ctf_approval);
+
+        assert_eq!(targets[2].label, "conditional tokens");
+        assert_eq!(targets[2].address, conditional_tokens);
+        assert!(targets[2].require_usdc_allowance);
+        assert!(!targets[2].require_ctf_approval);
+    }
+
+    #[test]
+    fn approval_status_reports_only_missing_permissions() {
+        let exchange = address!("0x1000000000000000000000000000000000000001");
+        let adapter = address!("0x3000000000000000000000000000000000000003");
+        let status = ApprovalStatus {
+            targets: vec![
+                ApprovalCheck {
+                    label: "market exchange".to_string(),
+                    address: exchange,
+                    require_usdc_allowance: true,
+                    require_ctf_approval: true,
+                    usdc_allowance_ready: false,
+                    ctf_approval_ready: true,
+                },
+                ApprovalCheck {
+                    label: "neg-risk adapter".to_string(),
+                    address: adapter,
+                    require_usdc_allowance: true,
+                    require_ctf_approval: true,
+                    usdc_allowance_ready: true,
+                    ctf_approval_ready: false,
+                },
+            ],
+        };
+
+        assert!(!status.is_ready());
+        assert_eq!(
+            status.missing_permissions(),
+            vec![
+                "market exchange: USDC allowance".to_string(),
+                "neg-risk adapter: CTF approval".to_string(),
+            ]
+        );
+    }
+}

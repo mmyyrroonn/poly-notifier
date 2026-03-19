@@ -15,6 +15,7 @@ use axum::{
     Json,
 };
 use chrono::Utc;
+use pn_lp::{ControlCommand, RuntimeSnapshot};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
@@ -32,6 +33,26 @@ fn db_error(e: sqlx::Error) -> Response {
         Json(serde_json::json!({"error": "internal database error"})),
     )
         .into_response()
+}
+
+fn lp_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "lp runtime is not configured"})),
+    )
+        .into_response()
+}
+
+fn lp_command_error(error: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": error })),
+    )
+        .into_response()
+}
+
+fn lp_handle(state: &AdminState) -> Result<pn_lp::LpControlHandle, Response> {
+    state.lp_control.clone().ok_or_else(lp_unavailable)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +297,198 @@ pub async fn get_stats(State(state): State<AdminState>) -> Response {
     match fetch_stats(&state).await {
         Err(e) => db_error(e),
         Ok(s) => Json(s).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LP control plane
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ReasonBody {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AmountBody {
+    pub amount: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LpHealthResponse {
+    pub paused: bool,
+    pub flattening: bool,
+    pub heartbeat_healthy: bool,
+    pub market_feed_healthy: bool,
+    pub user_feed_healthy: bool,
+    pub open_orders: usize,
+    pub positions: usize,
+    pub last_market_event_at: Option<String>,
+    pub last_user_event_at: Option<String>,
+    pub last_heartbeat_at: Option<String>,
+    pub last_decision_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LpCommandResponse {
+    pub status: &'static str,
+}
+
+pub async fn lp_health(State(state): State<AdminState>) -> Response {
+    let handle = match lp_handle(&state) {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let snapshot = handle.snapshot();
+    Json(LpHealthResponse {
+        paused: snapshot.flags.paused,
+        flattening: snapshot.flags.flattening,
+        heartbeat_healthy: snapshot.flags.heartbeat_healthy,
+        market_feed_healthy: snapshot.flags.market_feed_healthy,
+        user_feed_healthy: snapshot.flags.user_feed_healthy,
+        open_orders: snapshot.open_orders.len(),
+        positions: snapshot.positions.len(),
+        last_market_event_at: snapshot.last_market_event_at.map(|ts| ts.to_rfc3339()),
+        last_user_event_at: snapshot.last_user_event_at.map(|ts| ts.to_rfc3339()),
+        last_heartbeat_at: snapshot.last_heartbeat_at.map(|ts| ts.to_rfc3339()),
+        last_decision_reason: snapshot.last_decision_reason,
+    })
+    .into_response()
+}
+
+pub async fn lp_state(State(state): State<AdminState>) -> Response {
+    let handle = match lp_handle(&state) {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let snapshot: RuntimeSnapshot = handle.snapshot();
+    Json(snapshot).into_response()
+}
+
+pub async fn lp_pause(
+    State(state): State<AdminState>,
+    body: Option<Json<ReasonBody>>,
+) -> Response {
+    let handle = match lp_handle(&state) {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let reason = body
+        .map(|body| body.reason.clone())
+        .flatten()
+        .unwrap_or_else(|| "admin pause".to_string());
+    match handle.send(ControlCommand::Pause { reason }) {
+        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
+        Err(error) => lp_command_error(error),
+    }
+}
+
+pub async fn lp_resume(
+    State(state): State<AdminState>,
+    body: Option<Json<ReasonBody>>,
+) -> Response {
+    let handle = match lp_handle(&state) {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let reason = body
+        .map(|body| body.reason.clone())
+        .flatten()
+        .unwrap_or_else(|| "admin resume".to_string());
+    match handle.send(ControlCommand::Resume { reason }) {
+        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
+        Err(error) => lp_command_error(error),
+    }
+}
+
+pub async fn lp_cancel_all(
+    State(state): State<AdminState>,
+    body: Option<Json<ReasonBody>>,
+) -> Response {
+    let handle = match lp_handle(&state) {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let reason = body
+        .map(|body| body.reason.clone())
+        .flatten()
+        .unwrap_or_else(|| "admin cancel-all".to_string());
+    match handle.send(ControlCommand::CancelAll { reason }) {
+        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
+        Err(error) => lp_command_error(error),
+    }
+}
+
+pub async fn lp_flatten(
+    State(state): State<AdminState>,
+    body: Option<Json<ReasonBody>>,
+) -> Response {
+    let handle = match lp_handle(&state) {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let reason = body
+        .map(|body| body.reason.clone())
+        .flatten()
+        .unwrap_or_else(|| "admin flatten".to_string());
+    match handle.send(ControlCommand::Flatten { reason }) {
+        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
+        Err(error) => lp_command_error(error),
+    }
+}
+
+pub async fn lp_split(
+    State(state): State<AdminState>,
+    body: Option<Json<AmountBody>>,
+) -> Response {
+    let handle = match lp_handle(&state) {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let Some(body) = body else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "split amount is required"})),
+        )
+            .into_response();
+    };
+    match handle.send(ControlCommand::Split {
+        amount: body.amount.clone(),
+        reason: body
+            .reason
+            .clone()
+            .unwrap_or_else(|| "admin split".to_string()),
+    }) {
+        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
+        Err(error) => lp_command_error(error),
+    }
+}
+
+pub async fn lp_merge(
+    State(state): State<AdminState>,
+    body: Option<Json<AmountBody>>,
+) -> Response {
+    let handle = match lp_handle(&state) {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let Some(body) = body else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "merge amount is required"})),
+        )
+            .into_response();
+    };
+    match handle.send(ControlCommand::Merge {
+        amount: body.amount.clone(),
+        reason: body
+            .reason
+            .clone()
+            .unwrap_or_else(|| "admin merge".to_string()),
+    }) {
+        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
+        Err(error) => lp_command_error(error),
     }
 }
 

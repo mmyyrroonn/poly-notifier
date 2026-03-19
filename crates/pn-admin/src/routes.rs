@@ -12,7 +12,7 @@
 
 use axum::{
     middleware,
-    routing::{get, put},
+    routing::{get, post, put},
     Router,
 };
 
@@ -36,6 +36,14 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/admin/users", get(handlers::list_users))
         .route("/admin/feedback", get(handlers::list_feedback))
         .route("/admin/stats", get(handlers::get_stats))
+        .route("/admin/lp/health", get(handlers::lp_health))
+        .route("/admin/lp/state", get(handlers::lp_state))
+        .route("/admin/lp/pause", post(handlers::lp_pause))
+        .route("/admin/lp/resume", post(handlers::lp_resume))
+        .route("/admin/lp/cancel-all", post(handlers::lp_cancel_all))
+        .route("/admin/lp/flatten", post(handlers::lp_flatten))
+        .route("/admin/lp/split", post(handlers::lp_split))
+        .route("/admin/lp/merge", post(handlers::lp_merge))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

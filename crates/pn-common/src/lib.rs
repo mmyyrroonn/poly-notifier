@@ -22,6 +22,7 @@ pub use db::init_db;
 pub use error::{Error, Result};
 pub use events::{NotificationRequest, NotificationType, PriceUpdate};
 pub use models::{
-    Alert, AlertType, Market, NotificationLog, NotificationLogType, Subscription,
+    Alert, AlertType, LpControlAction, LpHeartbeat, LpOrder, LpPositionSnapshot, LpReport,
+    LpRiskEvent, LpTrade, Market, NotificationLog, NotificationLogType, Subscription,
     SubscriptionDetail, User, UserTier,
 };
