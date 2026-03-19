@@ -806,7 +806,10 @@ pub async fn get_recent_notifications(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_recent_lp_control_actions, init_db, insert_lp_control_action};
+    use super::{
+        get_recent_lp_control_actions, get_recent_lp_heartbeats, init_db, insert_lp_control_action,
+        insert_lp_heartbeat,
+    };
 
     #[tokio::test]
     async fn insert_lp_control_action_persists_actor() {
@@ -823,5 +826,24 @@ mod tests {
             .expect("control actions fetched");
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].actor, "admin_api");
+    }
+
+    #[tokio::test]
+    async fn insert_lp_heartbeat_allows_repeated_heartbeat_ids() {
+        let pool = init_db("sqlite::memory:", 1)
+            .await
+            .expect("in-memory sqlite pool");
+
+        insert_lp_heartbeat(&pool, "hb-1", "ok", None)
+            .await
+            .expect("first heartbeat inserted");
+        insert_lp_heartbeat(&pool, "hb-1", "ok", None)
+            .await
+            .expect("second heartbeat inserted");
+
+        let heartbeats = get_recent_lp_heartbeats(&pool, 10)
+            .await
+            .expect("heartbeats fetched");
+        assert_eq!(heartbeats.len(), 2);
     }
 }
