@@ -392,6 +392,7 @@ pub async fn handle_outcome_selection(
 
 /// Handles `"alert_type:{type}"` callback in the subscribe flow.
 #[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_subscribe_alert_type_selection(
     bot: Bot,
     dialogue: MyDialogue,
@@ -443,6 +444,7 @@ pub async fn handle_subscribe_alert_type_selection(
 
 /// Receives the threshold (0-100), creates both subscription and alert.
 #[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_subscribe_alert_threshold(
     bot: Bot,
     dialogue: MyDialogue,
@@ -785,6 +787,7 @@ pub async fn handle_alert_type_selection(
 /// otherwise INSERT (but only if the subscription has 0 alerts).
 /// For premium/unlimited users: always INSERT a new alert.
 #[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_alert_threshold(
     bot: Bot,
     dialogue: MyDialogue,
@@ -881,6 +884,7 @@ pub async fn handle_alert_threshold(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_alert(
     bot: &Bot,
     pool: &SqlitePool,

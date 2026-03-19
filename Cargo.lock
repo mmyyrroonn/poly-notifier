@@ -3461,6 +3461,7 @@ dependencies = [
  "chrono",
  "pn-common",
  "pn-lp",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sqlx",

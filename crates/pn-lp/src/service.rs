@@ -49,6 +49,7 @@ pub struct ReconciliationSnapshot {
 pub struct ServiceConfig {
     pub decision: DecisionConfig,
     pub risk: RiskConfig,
+    pub startup_split_amount: Option<Decimal>,
     pub heartbeat_interval: Duration,
     pub reconciliation_interval: Duration,
     pub report_interval: Duration,
@@ -151,6 +152,17 @@ impl LpService {
             bootstrap_positions = state.positions.len(),
             "LP runtime bootstrapped"
         );
+        if let Some(amount) = self.config.startup_split_amount.filter(|amount| *amount > Decimal::ZERO)
+        {
+            self.handle_control_command(
+                &mut state,
+                ControlCommand::Split {
+                    amount: amount.to_string(),
+                    reason: "startup auto split".to_string(),
+                },
+            )
+            .await?;
+        }
         self.recompute_quotes(&mut state).await?;
         self.publish_snapshot(&state);
 
@@ -160,34 +172,52 @@ impl LpService {
                 maybe_cmd = self.control_rx.recv() => {
                     match maybe_cmd {
                         Some(command) => {
-                            self.handle_control_command(&mut state, command).await?;
+                            if let Err(error) = self.handle_control_command(&mut state, command).await {
+                                error!(?error, "control command handler failed");
+                            }
                         }
                         None => break,
                     }
                 }
                 maybe_event = event_rx.recv() => {
                     match maybe_event {
-                        Some(event) => self.handle_exchange_event(&mut state, event).await?,
+                        Some(event) => {
+                            if let Err(error) = self.handle_exchange_event(&mut state, event).await {
+                                error!(?error, "exchange event handler failed");
+                            }
+                        }
                         None => break,
                     }
                 }
                 _ = heartbeat_tick.tick() => {
-                    self.handle_heartbeat_tick(&mut state).await?;
+                    if let Err(error) = self.handle_heartbeat_tick(&mut state).await {
+                        error!(?error, "heartbeat tick failed");
+                    }
                 }
                 _ = reconcile_tick.tick() => {
-                    self.handle_reconciliation_tick(&mut state).await?;
+                    if let Err(error) = self.handle_reconciliation_tick(&mut state).await {
+                        error!(?error, "reconciliation tick failed");
+                    }
                 }
                 _ = report_tick.tick() => {
-                    self.send_periodic_report(&state).await?;
+                    if let Err(error) = self.send_periodic_report(&state).await {
+                        error!(?error, "periodic report failed");
+                    }
                 }
                 _ = snapshot_tick.tick() => {
-                    self.persist_positions_snapshot(&state, "periodic").await?;
+                    if let Err(error) = self.persist_positions_snapshot(&state, "periodic").await {
+                        error!(?error, "positions snapshot failed");
+                    }
                 }
             }
 
             self.refresh_health_flags(&mut state);
-            self.apply_timer_risk(&mut state).await?;
-            self.recompute_quotes(&mut state).await?;
+            if let Err(error) = self.apply_timer_risk(&mut state).await {
+                error!(?error, "timer risk check failed");
+            }
+            if let Err(error) = self.recompute_quotes(&mut state).await {
+                error!(?error, "quote recomputation failed");
+            }
             self.publish_snapshot(&state);
         }
 
@@ -348,8 +378,7 @@ impl LpService {
                 );
                 state.last_user_event_at = Some(now);
                 self.persist_trade(state, &fill).await?;
-                state.fills.push(fill.clone());
-                let actions = self.risk.on_fill(&fill);
+                let actions = self.risk.on_fill(&fill, state);
                 self.apply_risk_actions(state, actions).await?;
             }
             ExchangeEvent::TickSize {
@@ -402,13 +431,24 @@ impl LpService {
     }
 
     async fn handle_reconciliation_tick(&self, state: &mut RuntimeState) -> Result<()> {
+        let previous_open_orders = state.open_orders.clone();
         let snapshot = self.exchange.reconcile().await?;
+        let reconciled_missing_orders =
+            missing_open_orders(&previous_open_orders, &snapshot.open_orders);
         state.account = snapshot.account;
         state.positions = snapshot
             .positions
             .into_iter()
             .map(|position| (position.asset_id.clone(), position))
             .collect::<HashMap<_, _>>();
+        if !reconciled_missing_orders.is_empty() {
+            self.mark_orders_status(
+                &state.market.condition_id,
+                &reconciled_missing_orders,
+                "RECONCILED_MISSING",
+            )
+            .await?;
+        }
         state.open_orders = snapshot.open_orders;
         state.last_user_event_at = Some(Utc::now());
         info!(
@@ -485,7 +525,6 @@ impl LpService {
         match self.exchange.flatten(intent).await {
             Ok(Some(fill)) => {
                 self.persist_trade(state, &fill).await?;
-                state.fills.push(fill.clone());
                 info!(
                     target: "lp.flatten",
                     reason = %reason,
@@ -511,6 +550,7 @@ impl LpService {
                 .await?;
             }
             Ok(None) => {
+                state.flags.flattening = false;
                 warn!(
                     target: "lp.flatten",
                     reason = %reason,
@@ -532,6 +572,7 @@ impl LpService {
                 .await?;
             }
             Err(error) => {
+                state.flags.flattening = false;
                 error!(
                     target: "lp.flatten",
                     reason = %reason,
@@ -855,6 +896,7 @@ impl LpService {
                 } else {
                     QuoteSide::Sell
                 },
+                price: flatten_reference_price(state, &position.asset_id, position.avg_price),
                 size: position.size.abs(),
                 use_fok: self.config.risk.flatten_use_fok,
             })
@@ -910,11 +952,280 @@ fn desired_quotes_match(
     true
 }
 
+fn missing_open_orders(
+    previous_open_orders: &[ManagedOrder],
+    current_open_orders: &[ManagedOrder],
+) -> Vec<ManagedOrder> {
+    previous_open_orders
+        .iter()
+        .filter(|previous| {
+            current_open_orders
+                .iter()
+                .all(|current| current.order_id != previous.order_id)
+        })
+        .cloned()
+        .collect()
+}
+
+fn flatten_reference_price(
+    state: &RuntimeState,
+    asset_id: &str,
+    fallback_price: Decimal,
+) -> Decimal {
+    match state.books.get(asset_id) {
+        Some(book) => match (book.best_bid(), book.best_ask()) {
+            (Some(best_bid), Some(best_ask)) => (best_bid.price + best_ask.price) / Decimal::from(2),
+            (Some(best_bid), None) => best_bid.price,
+            (None, Some(best_ask)) => best_ask.price,
+            (None, None) => fallback_price,
+        },
+        None => fallback_price,
+    }
+}
+
 impl std::fmt::Display for QuoteSide {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Buy => f.write_str("BUY"),
             Self::Sell => f.write_str("SELL"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use anyhow::{Result, anyhow};
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use rust_decimal_macros::dec;
+    use sqlx::SqlitePool;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        ExchangeAdapter, LpService, ReconciliationSnapshot, ServiceConfig, flatten_reference_price,
+        missing_open_orders,
+    };
+    use crate::control::ControlCommand;
+    use crate::decision::DecisionConfig;
+    use crate::risk::RiskConfig;
+    use crate::types::{
+        AccountSnapshot, BookLevel, BookSnapshot, ManagedOrder, MarketMetadata, QuoteIntent,
+        RuntimeFlags, RuntimeState, SignalState, TokenMetadata, TradeFill,
+    };
+
+    fn runtime_state_with_book() -> RuntimeState {
+        let now = Utc::now();
+        RuntimeState {
+            market: MarketMetadata {
+                condition_id: "condition-1".to_string(),
+                question: "Will X happen?".to_string(),
+                tokens: vec![TokenMetadata {
+                    asset_id: "asset-yes".to_string(),
+                    outcome: "Yes".to_string(),
+                    tick_size: dec!(0.01),
+                }],
+            },
+            books: HashMap::from([(
+                "asset-yes".to_string(),
+                BookSnapshot {
+                    asset_id: "asset-yes".to_string(),
+                    bids: vec![BookLevel {
+                        price: dec!(0.40),
+                        size: dec!(100),
+                    }],
+                    asks: vec![BookLevel {
+                        price: dec!(0.46),
+                        size: dec!(100),
+                    }],
+                    received_at: now,
+                },
+            )]),
+            open_orders: Vec::new(),
+            positions: HashMap::new(),
+            account: AccountSnapshot {
+                usdc_balance: dec!(500),
+                token_balances: HashMap::new(),
+                updated_at: now,
+            },
+            signals: HashMap::from([(
+                "external".to_string(),
+                SignalState {
+                    active: true,
+                    reason: "test".to_string(),
+                },
+            )]),
+            flags: RuntimeFlags::default(),
+            last_market_event_at: Some(now),
+            last_user_event_at: Some(now),
+            last_heartbeat_at: Some(now),
+            last_heartbeat_id: Some("hb-1".to_string()),
+            last_decision_reason: None,
+        }
+    }
+
+    #[test]
+    fn flatten_reference_price_prefers_mid_price_and_falls_back() {
+        let state = runtime_state_with_book();
+
+        assert_eq!(
+            flatten_reference_price(&state, "asset-yes", dec!(0.30)),
+            dec!(0.43)
+        );
+        assert_eq!(
+            flatten_reference_price(&state, "missing-asset", dec!(0.30)),
+            dec!(0.30)
+        );
+    }
+
+    #[test]
+    fn missing_open_orders_returns_only_orders_absent_from_snapshot() {
+        let now = Utc::now();
+        let previous = vec![
+            ManagedOrder {
+                order_id: "order-1".to_string(),
+                asset_id: "asset-yes".to_string(),
+                side: crate::types::QuoteSide::Buy,
+                price: dec!(0.40),
+                size: dec!(10),
+                created_at: now,
+                status: "LIVE".to_string(),
+            },
+            ManagedOrder {
+                order_id: "order-2".to_string(),
+                asset_id: "asset-yes".to_string(),
+                side: crate::types::QuoteSide::Sell,
+                price: dec!(0.46),
+                size: dec!(10),
+                created_at: now,
+                status: "LIVE".to_string(),
+            },
+        ];
+        let current = vec![previous[1].clone()];
+
+        let missing = missing_open_orders(&previous, &current);
+
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].order_id, "order-1");
+    }
+
+    #[derive(Default)]
+    struct ReconcileErrorExchange {
+        reconcile_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ExchangeAdapter for ReconcileErrorExchange {
+        fn start(
+            &self,
+            event_tx: mpsc::UnboundedSender<super::ExchangeEvent>,
+            cancel: CancellationToken,
+        ) {
+            tokio::spawn(async move {
+                let _event_tx = event_tx;
+                cancel.cancelled().await;
+            });
+        }
+
+        async fn reconcile(&self) -> Result<ReconciliationSnapshot> {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow!("transient reconcile error"))
+        }
+
+        async fn post_quotes(&self, _quotes: &[QuoteIntent]) -> Result<Vec<ManagedOrder>> {
+            Ok(Vec::new())
+        }
+
+        async fn cancel_orders(&self, _order_ids: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn cancel_all(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn flatten(&self, _intent: &crate::risk::FlattenIntent) -> Result<Option<TradeFill>> {
+            Ok(None)
+        }
+
+        async fn post_heartbeat(&self, _last_heartbeat_id: Option<&str>) -> Result<String> {
+            Ok("hb-test".to_string())
+        }
+
+        async fn split(&self, _amount: rust_decimal::Decimal) -> Result<String> {
+            Ok("tx-test".to_string())
+        }
+
+        async fn merge(&self, _amount: rust_decimal::Decimal) -> Result<String> {
+            Ok("tx-test".to_string())
+        }
+    }
+
+    fn service_config() -> ServiceConfig {
+        ServiceConfig {
+            decision: DecisionConfig {
+                quote_size: dec!(10),
+                min_spread: dec!(0.01),
+                min_depth: dec!(20),
+                quote_offset_ticks: 1,
+                min_usdc_balance: dec!(50),
+                min_token_balance: dec!(10),
+            },
+            risk: RiskConfig {
+                max_position: dec!(100),
+                flat_position_tolerance: dec!(1),
+                stale_feed_after: chrono::Duration::seconds(15),
+                auto_flatten_after_fill: true,
+                flatten_use_fok: false,
+            },
+            startup_split_amount: None,
+            heartbeat_interval: Duration::from_secs(3600),
+            reconciliation_interval: Duration::from_millis(10),
+            report_interval: Duration::from_secs(3600),
+            snapshot_interval: Duration::from_secs(3600),
+            max_quote_age: Duration::from_secs(10),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_keeps_loop_alive_after_transient_reconciliation_error() {
+        let exchange = Arc::new(ReconcileErrorExchange::default());
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        let mut initial_state = runtime_state_with_book();
+        initial_state.flags.paused = true;
+        let (service, control) = LpService::new(exchange.clone(), pool, service_config(), None, initial_state);
+        let cancel = CancellationToken::new();
+        let service_cancel = cancel.clone();
+
+        let handle = tokio::spawn(async move { service.run(service_cancel).await });
+
+        timeout(Duration::from_secs(1), async {
+            while exchange.reconcile_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reconciliation attempt");
+        assert!(exchange.reconcile_calls.load(Ordering::SeqCst) >= 1);
+        assert!(control
+            .send(ControlCommand::Pause {
+                reason: "test pause".to_string(),
+            })
+            .is_ok());
+
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("service task join")
+            .expect("service task panicked");
+        assert!(result.is_ok());
     }
 }

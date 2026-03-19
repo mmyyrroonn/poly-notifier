@@ -16,6 +16,7 @@ pub struct RiskConfig {
 pub struct FlattenIntent {
     pub asset_id: String,
     pub side: QuoteSide,
+    pub price: Decimal,
     pub size: Decimal,
     pub use_fok: bool,
 }
@@ -38,7 +39,7 @@ impl RiskEngine {
         Self { config }
     }
 
-    pub fn on_fill(&self, fill: &TradeFill) -> Vec<RiskAction> {
+    pub fn on_fill(&self, fill: &TradeFill, state: &RuntimeState) -> Vec<RiskAction> {
         let mut actions = vec![
             RiskAction::Pause {
                 reason: "fill detected".to_string(),
@@ -49,12 +50,20 @@ impl RiskEngine {
         ];
 
         if self.config.auto_flatten_after_fill {
-            actions.push(RiskAction::Flatten(FlattenIntent {
-                asset_id: fill.asset_id.clone(),
-                side: fill.side.opposite(),
-                size: fill.size,
-                use_fok: self.config.flatten_use_fok,
-            }));
+            let position_size = state
+                .positions
+                .get(&fill.asset_id)
+                .map(|position| position.size.abs())
+                .unwrap_or(fill.size);
+            if position_size > Decimal::ZERO {
+                actions.push(RiskAction::Flatten(FlattenIntent {
+                    asset_id: fill.asset_id.clone(),
+                    side: fill.side.opposite(),
+                    price: fill.price,
+                    size: position_size,
+                    use_fok: self.config.flatten_use_fok,
+                }));
+            }
         }
 
         actions
@@ -170,7 +179,6 @@ mod tests {
                 },
             )]),
             open_orders: Vec::new(),
-            fills: Vec::new(),
             positions: HashMap::from([(
                 "asset-yes".to_string(),
                 PositionSnapshot {
@@ -212,8 +220,17 @@ mod tests {
             status: "MATCHED".to_string(),
             received_at: Utc::now(),
         };
+        let mut state = state_with_old_market_feed();
+        state.positions.insert(
+            "asset-yes".to_string(),
+            PositionSnapshot {
+                asset_id: "asset-yes".to_string(),
+                size: dec!(25),
+                avg_price: dec!(0.42),
+            },
+        );
 
-        let actions = engine().on_fill(&fill);
+        let actions = engine().on_fill(&fill, &state);
 
         assert_eq!(
             actions,
@@ -227,7 +244,8 @@ mod tests {
                 RiskAction::Flatten(FlattenIntent {
                     asset_id: "asset-yes".to_string(),
                     side: QuoteSide::Sell,
-                    size: dec!(12),
+                    price: dec!(0.44),
+                    size: dec!(25),
                     use_fok: false,
                 }),
             ]
@@ -247,6 +265,35 @@ mod tests {
                 },
                 RiskAction::CancelAll {
                     reason: "market feed stale".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_does_not_emit_zero_size_flatten_for_flat_position() {
+        let fill = TradeFill {
+            trade_id: "trade-2".to_string(),
+            order_id: Some("order-2".to_string()),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Buy,
+            price: dec!(0.44),
+            size: dec!(12),
+            status: "MATCHED".to_string(),
+            received_at: Utc::now(),
+        };
+        let state = state_with_old_market_feed();
+
+        let actions = engine().on_fill(&fill, &state);
+
+        assert_eq!(
+            actions,
+            vec![
+                RiskAction::Pause {
+                    reason: "fill detected".to_string()
+                },
+                RiskAction::CancelAll {
+                    reason: "fill detected".to_string()
                 },
             ]
         );

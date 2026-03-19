@@ -146,6 +146,7 @@ pub struct QuoteRequest {
 pub struct FlattenRequest {
     pub asset_id: String,
     pub side: QuoteSide,
+    pub price: Decimal,
     pub size: Decimal,
     pub use_fok: bool,
 }
@@ -638,19 +639,7 @@ impl PolymarketExecutionClient {
             "flatten order accepted by CLOB"
         );
 
-        Ok(TradeFill {
-            trade_id: response
-                .trade_ids
-                .first()
-                .cloned()
-                .unwrap_or_else(|| response.order_id.clone()),
-            order_id: Some(response.order_id),
-            asset_id: request.asset_id.clone(),
-            side: request.side.clone(),
-            price: Decimal::ZERO,
-            size: request.size,
-            status: response.status.to_string(),
-        })
+        Ok(flatten_trade_fill(request, response))
     }
 
     pub async fn post_heartbeat(&self, heartbeat_id: Option<&str>) -> Result<String> {
@@ -781,16 +770,21 @@ impl PolymarketExecutionClient {
         let client = self.market_ws.clone();
         let asset_ids = (*self.asset_ids).clone();
         tokio::spawn(async move {
+            let mut backoff_secs = 1u64;
             loop {
                 if cancel.is_cancelled() {
                     break;
                 }
 
                 let stream = match client.subscribe_orderbook(asset_ids.clone()) {
-                    Ok(stream) => stream,
+                    Ok(stream) => {
+                        backoff_secs = 1;
+                        stream
+                    }
                     Err(error) => {
                         warn!(?error, "failed to subscribe to market orderbook stream");
-                        sleep(Duration::from_secs(1)).await;
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
                         continue;
                     }
                 };
@@ -836,7 +830,8 @@ impl PolymarketExecutionClient {
                     break;
                 }
 
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
         });
     }
@@ -849,16 +844,21 @@ impl PolymarketExecutionClient {
         let client = self.market_ws.clone();
         let asset_ids = (*self.asset_ids).clone();
         tokio::spawn(async move {
+            let mut backoff_secs = 1u64;
             loop {
                 if cancel.is_cancelled() {
                     break;
                 }
 
                 let stream = match client.subscribe_tick_size_change(asset_ids.clone()) {
-                    Ok(stream) => stream,
+                    Ok(stream) => {
+                        backoff_secs = 1;
+                        stream
+                    }
                     Err(error) => {
                         warn!(?error, "failed to subscribe to tick size stream");
-                        sleep(Duration::from_secs(1)).await;
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
                         continue;
                     }
                 };
@@ -896,7 +896,8 @@ impl PolymarketExecutionClient {
                     break;
                 }
 
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
         });
     }
@@ -909,16 +910,21 @@ impl PolymarketExecutionClient {
         let client = self.user_ws.clone();
         let markets = vec![self.condition_id];
         tokio::spawn(async move {
+            let mut backoff_secs = 1u64;
             loop {
                 if cancel.is_cancelled() {
                     break;
                 }
 
                 let stream = match client.subscribe_orders(markets.clone()) {
-                    Ok(stream) => stream,
+                    Ok(stream) => {
+                        backoff_secs = 1;
+                        stream
+                    }
                     Err(error) => {
                         warn!(?error, "failed to subscribe to user order stream");
-                        sleep(Duration::from_secs(1)).await;
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
                         continue;
                     }
                 };
@@ -961,7 +967,8 @@ impl PolymarketExecutionClient {
                     break;
                 }
 
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
         });
     }
@@ -974,16 +981,21 @@ impl PolymarketExecutionClient {
         let client = self.user_ws.clone();
         let markets = vec![self.condition_id];
         tokio::spawn(async move {
+            let mut backoff_secs = 1u64;
             loop {
                 if cancel.is_cancelled() {
                     break;
                 }
 
                 let stream = match client.subscribe_trades(markets.clone()) {
-                    Ok(stream) => stream,
+                    Ok(stream) => {
+                        backoff_secs = 1;
+                        stream
+                    }
                     Err(error) => {
                         warn!(?error, "failed to subscribe to user trade stream");
-                        sleep(Duration::from_secs(1)).await;
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
                         continue;
                     }
                 };
@@ -1027,7 +1039,8 @@ impl PolymarketExecutionClient {
                     break;
                 }
 
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
         });
     }
@@ -1053,8 +1066,35 @@ fn side_to_sdk(side: &QuoteSide) -> Side {
 
 fn side_from_sdk(side: Side) -> QuoteSide {
     match side {
+        Side::Buy => QuoteSide::Buy,
         Side::Sell => QuoteSide::Sell,
-        _ => QuoteSide::Buy,
+        other => {
+            warn!(received_side = ?other, "unexpected SDK side variant; defaulting to BUY");
+            QuoteSide::Buy
+        }
+    }
+}
+
+fn next_reconnect_backoff_secs(backoff_secs: u64) -> u64 {
+    (backoff_secs * 2).min(60)
+}
+
+fn flatten_trade_fill(
+    request: &FlattenRequest,
+    response: polymarket_client_sdk::clob::types::response::PostOrderResponse,
+) -> TradeFill {
+    TradeFill {
+        trade_id: response
+            .trade_ids
+            .first()
+            .cloned()
+            .unwrap_or_else(|| response.order_id.clone()),
+        order_id: Some(response.order_id),
+        asset_id: request.asset_id.clone(),
+        side: request.side.clone(),
+        price: request.price, // Best-effort acknowledgment; trade stream carries actual fill price.
+        size: request.size,   // Requested size only; partial fills arrive on the trade stream.
+        status: format!("{}:unconfirmed", response.status),
     }
 }
 
@@ -1199,9 +1239,15 @@ async fn set_ctf_approval<P: alloy::providers::Provider>(
 
 #[cfg(test)]
 mod tests {
+    use polymarket_client_sdk::clob::types::OrderStatusType;
+    use polymarket_client_sdk::clob::types::response::PostOrderResponse;
     use polymarket_client_sdk::types::address;
+    use rust_decimal_macros::dec;
 
-    use super::{ApprovalCheck, ApprovalStatus, build_approval_targets};
+    use super::{
+        ApprovalCheck, ApprovalStatus, FlattenRequest, QuoteSide, build_approval_targets,
+        flatten_trade_fill, next_reconnect_backoff_secs,
+    };
 
     #[test]
     fn build_approval_targets_for_standard_market_only_requires_exchange() {
@@ -1271,5 +1317,39 @@ mod tests {
                 "neg-risk adapter: CTF approval".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_and_caps_at_sixty_seconds() {
+        assert_eq!(next_reconnect_backoff_secs(1), 2);
+        assert_eq!(next_reconnect_backoff_secs(8), 16);
+        assert_eq!(next_reconnect_backoff_secs(60), 60);
+    }
+
+    #[test]
+    fn flatten_trade_fill_uses_requested_price_and_marks_ack_as_unconfirmed() {
+        let request = FlattenRequest {
+            asset_id: "123".to_string(),
+            side: QuoteSide::Sell,
+            price: dec!(0.41),
+            size: dec!(17),
+            use_fok: false,
+        };
+        let response = PostOrderResponse::builder()
+            .making_amount(dec!(0))
+            .taking_amount(dec!(0))
+            .order_id("order-1")
+            .status(OrderStatusType::Matched)
+            .success(true)
+            .trade_ids(vec!["trade-1".to_string()])
+            .build();
+
+        let fill = flatten_trade_fill(&request, response);
+
+        assert_eq!(fill.trade_id, "trade-1");
+        assert_eq!(fill.order_id.as_deref(), Some("order-1"));
+        assert_eq!(fill.price, dec!(0.41));
+        assert_eq!(fill.size, dec!(17));
+        assert_eq!(fill.status, "MATCHED:unconfirmed");
     }
 }

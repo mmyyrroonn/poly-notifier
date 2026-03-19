@@ -156,7 +156,6 @@ mod tests {
                 },
             )]),
             open_orders: Vec::new(),
-            fills: Vec::new(),
             positions: HashMap::from([(
                 "asset-yes".to_string(),
                 PositionSnapshot {

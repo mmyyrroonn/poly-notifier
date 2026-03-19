@@ -19,9 +19,9 @@ use pn_admin::create_router;
 use pn_common::config::AppConfig;
 use pn_common::db::init_db;
 use pn_lp::{
-    AccountSnapshot, ControlCommand, ExchangeAdapter, ExchangeEvent, FlattenIntent, LpService,
-    ManagedOrder, MarketMetadata, PositionSnapshot, QuoteIntent, QuoteSide, ReconciliationSnapshot,
-    Reporter, RuntimeFlags, RuntimeState, ServiceConfig, TokenMetadata, TradeFill,
+    AccountSnapshot, ExchangeAdapter, ExchangeEvent, FlattenIntent, LpService, ManagedOrder,
+    MarketMetadata, PositionSnapshot, QuoteIntent, QuoteSide, ReconciliationSnapshot, Reporter,
+    RuntimeFlags, RuntimeState, ServiceConfig, TokenMetadata, TradeFill,
 };
 use pn_notify::telegram::BotRegistry;
 use pn_polymarket::{
@@ -171,6 +171,7 @@ impl ExchangeAdapter for LiveExchangeAdapter {
             .flatten(&pn_polymarket::FlattenRequest {
                 asset_id: intent.asset_id.clone(),
                 side: map_lp_side(intent.side.clone()),
+                price: intent.price,
                 size: intent.size,
                 use_fok: intent.use_fok,
             })
@@ -290,13 +291,6 @@ async fn main() -> Result<()> {
         initial_state,
     );
 
-    if config.lp.inventory.auto_split_on_startup && config.lp.inventory.startup_split_amount > 0.0 {
-        let _ = control.send(ControlCommand::Split {
-            amount: config.lp.inventory.startup_split_amount.to_string(),
-            reason: "startup auto split".to_string(),
-        });
-    }
-
     let cancel = CancellationToken::new();
 
     let service_cancel = cancel.clone();
@@ -306,7 +300,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    let admin_password = std::env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "admin".to_string());
+    let admin_password = std::env::var("ADMIN_PASSWORD")
+        .expect("ADMIN_PASSWORD env var must be set - the admin API controls live trading");
     let router = create_router(pool.clone(), admin_password, Some(control.clone()));
     let admin_addr = format!("{}:{}", config.lp.control.bind_addr, config.admin.port);
     let admin_cancel = cancel.clone();
@@ -447,6 +442,13 @@ fn build_service_config(config: &AppConfig) -> Result<ServiceConfig> {
             auto_flatten_after_fill: config.lp.risk.auto_flatten_after_fill,
             flatten_use_fok: config.lp.risk.flatten_use_fok,
         },
+        startup_split_amount: if config.lp.inventory.auto_split_on_startup
+            && config.lp.inventory.startup_split_amount > 0.0
+        {
+            Some(decimal(config.lp.inventory.startup_split_amount)?)
+        } else {
+            None
+        },
         heartbeat_interval: Duration::from_secs(config.lp.control.heartbeat_interval_secs),
         reconciliation_interval: Duration::from_secs(
             config.lp.control.reconciliation_interval_secs,
@@ -521,7 +523,6 @@ fn build_initial_state(config: &AppConfig, bootstrap: BootstrapState) -> Runtime
                 status: order.status,
             })
             .collect(),
-        fills: Vec::new(),
         positions: bootstrap
             .positions
             .into_iter()
@@ -571,6 +572,8 @@ fn build_initial_state(config: &AppConfig, bootstrap: BootstrapState) -> Runtime
 }
 
 fn decimal(value: f64) -> Result<Decimal> {
+    // TOML numeric literals currently deserialize into f64 for this config surface.
+    // Keep the conversion explicit and covered by tests for the expected LP ranges.
     Decimal::from_str(&value.to_string()).with_context(|| format!("invalid decimal {value}"))
 }
 
@@ -593,4 +596,17 @@ fn html_escape(input: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decimal;
+
+    #[test]
+    fn decimal_round_trip_preserves_expected_lp_config_values() {
+        assert_eq!(decimal(50.0).unwrap(), "50.0".parse().unwrap());
+        assert_eq!(decimal(25.0).unwrap(), "25.0".parse().unwrap());
+        assert_eq!(decimal(0.01).unwrap(), "0.01".parse().unwrap());
+        assert_eq!(decimal(1.25).unwrap(), "1.25".parse().unwrap());
+    }
 }

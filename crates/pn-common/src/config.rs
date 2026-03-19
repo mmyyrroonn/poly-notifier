@@ -87,6 +87,10 @@ pub struct LpTradingConfig {
 }
 
 /// LP inventory watermarks and optional split sizing.
+///
+/// These numeric TOML fields currently deserialize as `f64` and are converted
+/// to `Decimal` at runtime via string round-tripping. The expected LP ranges
+/// are covered by unit tests in `poly-notifier/src/main.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LpInventoryConfig {
     /// Minimum USDC balance required to keep buy quotes live.
@@ -102,6 +106,10 @@ pub struct LpInventoryConfig {
 }
 
 /// Quote-generation parameters.
+///
+/// These numeric TOML fields currently deserialize as `f64` and are converted
+/// to `Decimal` at runtime via string round-tripping. The expected LP ranges
+/// are covered by unit tests in `poly-notifier/src/main.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LpStrategyConfig {
     /// Passive quote size per order.
@@ -120,6 +128,10 @@ pub struct LpStrategyConfig {
 }
 
 /// Runtime safety controls.
+///
+/// These numeric TOML fields currently deserialize as `f64` and are converted
+/// to `Decimal` at runtime via string round-tripping. The expected LP ranges
+/// are covered by unit tests in `poly-notifier/src/main.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LpRiskConfig {
     /// Max absolute position before quoting is paused.

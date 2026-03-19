@@ -16,7 +16,9 @@ use axum::{
 };
 use chrono::Utc;
 use pn_lp::{ControlCommand, RuntimeSnapshot};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use tracing::error;
 
 use crate::AdminState;
@@ -51,6 +53,7 @@ fn lp_command_error(error: String) -> Response {
         .into_response()
 }
 
+#[allow(clippy::result_large_err)]
 fn lp_handle(state: &AdminState) -> Result<pn_lp::LpControlHandle, Response> {
     state.lp_control.clone().ok_or_else(lp_unavailable)
 }
@@ -375,8 +378,7 @@ pub async fn lp_pause(
         Err(response) => return response,
     };
     let reason = body
-        .map(|body| body.reason.clone())
-        .flatten()
+        .and_then(|body| body.reason.clone())
         .unwrap_or_else(|| "admin pause".to_string());
     match handle.send(ControlCommand::Pause { reason }) {
         Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
@@ -393,8 +395,7 @@ pub async fn lp_resume(
         Err(response) => return response,
     };
     let reason = body
-        .map(|body| body.reason.clone())
-        .flatten()
+        .and_then(|body| body.reason.clone())
         .unwrap_or_else(|| "admin resume".to_string());
     match handle.send(ControlCommand::Resume { reason }) {
         Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
@@ -411,8 +412,7 @@ pub async fn lp_cancel_all(
         Err(response) => return response,
     };
     let reason = body
-        .map(|body| body.reason.clone())
-        .flatten()
+        .and_then(|body| body.reason.clone())
         .unwrap_or_else(|| "admin cancel-all".to_string());
     match handle.send(ControlCommand::CancelAll { reason }) {
         Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
@@ -429,8 +429,7 @@ pub async fn lp_flatten(
         Err(response) => return response,
     };
     let reason = body
-        .map(|body| body.reason.clone())
-        .flatten()
+        .and_then(|body| body.reason.clone())
         .unwrap_or_else(|| "admin flatten".to_string());
     match handle.send(ControlCommand::Flatten { reason }) {
         Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
@@ -453,8 +452,18 @@ pub async fn lp_split(
         )
             .into_response();
     };
+    let amount = match Decimal::from_str(&body.amount) {
+        Ok(amount) if amount > Decimal::ZERO => body.amount.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid or non-positive amount"})),
+            )
+                .into_response();
+        }
+    };
     match handle.send(ControlCommand::Split {
-        amount: body.amount.clone(),
+        amount,
         reason: body
             .reason
             .clone()
@@ -480,8 +489,18 @@ pub async fn lp_merge(
         )
             .into_response();
     };
+    let amount = match Decimal::from_str(&body.amount) {
+        Ok(amount) if amount > Decimal::ZERO => body.amount.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid or non-positive amount"})),
+            )
+                .into_response();
+        }
+    };
     match handle.send(ControlCommand::Merge {
-        amount: body.amount.clone(),
+        amount,
         reason: body
             .reason
             .clone()
@@ -542,4 +561,122 @@ async fn fetch_stats(state: &AdminState) -> Result<StatsResponse, sqlx::Error> {
         active_markets,
         notifications_today,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use axum::{
+        body::{Body, to_bytes},
+        extract::State,
+        http::StatusCode,
+    };
+    use chrono::Utc;
+    use pn_lp::{
+        AccountSnapshot, ControlCommand, LpControlHandle, MarketMetadata, RuntimeFlags,
+        RuntimeState, TokenMetadata,
+    };
+    use pn_lp::types::SignalState;
+    use sqlx::SqlitePool;
+    use tokio::sync::{mpsc, watch};
+
+    use super::{AmountBody, lp_merge, lp_split};
+    use crate::AdminState;
+
+    async fn test_admin_state() -> (AdminState, mpsc::UnboundedReceiver<ControlCommand>) {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (_snapshot_tx, snapshot_rx) = watch::channel(runtime_state());
+        let handle = LpControlHandle::new(cmd_tx, snapshot_rx);
+        (
+            AdminState::new(pool, "secret".to_string(), Some(handle)),
+            cmd_rx,
+        )
+    }
+
+    fn runtime_state() -> RuntimeState {
+        let now = Utc::now();
+        RuntimeState {
+            market: MarketMetadata {
+                condition_id: "condition-1".to_string(),
+                question: "Will X happen?".to_string(),
+                tokens: vec![TokenMetadata {
+                    asset_id: "asset-yes".to_string(),
+                    outcome: "Yes".to_string(),
+                    tick_size: "0.01".parse().unwrap(),
+                }],
+            },
+            books: HashMap::new(),
+            open_orders: Vec::new(),
+            positions: HashMap::new(),
+            account: AccountSnapshot {
+                usdc_balance: "100".parse().unwrap(),
+                token_balances: HashMap::new(),
+                updated_at: now,
+            },
+            signals: HashMap::from([(
+                "external".to_string(),
+                SignalState {
+                    active: true,
+                    reason: "test".to_string(),
+                },
+            )]),
+            flags: RuntimeFlags::default(),
+            last_market_event_at: Some(now),
+            last_user_event_at: Some(now),
+            last_heartbeat_at: Some(now),
+            last_heartbeat_id: Some("hb-1".to_string()),
+            last_decision_reason: None,
+        }
+    }
+
+    async fn response_body_json(body: Body) -> serde_json::Value {
+        let bytes = to_bytes(body, usize::MAX).await.expect("response body bytes");
+        serde_json::from_slice(&bytes).expect("json response body")
+    }
+
+    #[tokio::test]
+    async fn lp_split_rejects_non_positive_amounts() {
+        let (state, mut cmd_rx) = test_admin_state().await;
+
+        let response = lp_split(
+            State(state),
+            Some(axum::Json(AmountBody {
+                amount: "0".to_string(),
+                reason: None,
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_body_json(response.into_body()).await,
+            serde_json::json!({ "error": "invalid or non-positive amount" })
+        );
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn lp_merge_rejects_invalid_amounts() {
+        let (state, mut cmd_rx) = test_admin_state().await;
+
+        let response = lp_merge(
+            State(state),
+            Some(axum::Json(AmountBody {
+                amount: "nope".to_string(),
+                reason: None,
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_body_json(response.into_body()).await,
+            serde_json::json!({ "error": "invalid or non-positive amount" })
+        );
+        assert!(cmd_rx.try_recv().is_err());
+    }
 }

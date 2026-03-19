@@ -242,7 +242,7 @@ pub async fn prices(
             }
         };
 
-        let price = match clob_client.get_midpoints(&[token_id.clone()]).await {
+        let price = match clob_client.get_midpoints(std::slice::from_ref(token_id)).await {
             Ok(map) => map
                 .get(token_id)
                 .map(|p| {

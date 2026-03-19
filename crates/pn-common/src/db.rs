@@ -342,6 +342,7 @@ pub async fn update_market_prices(
 // ---------------------------------------------------------------------------
 
 /// Insert or update an LP-managed order by its exchange order ID.
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_lp_order(
     pool: &SqlitePool,
     order_id: &str,
@@ -402,6 +403,7 @@ pub async fn get_lp_orders_for_condition(
 }
 
 /// Insert or update an LP trade by exchange trade ID.
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_lp_trade(
     pool: &SqlitePool,
     trade_id: &str,

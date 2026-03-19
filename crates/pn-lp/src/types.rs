@@ -157,7 +157,6 @@ pub struct RuntimeState {
     pub market: MarketMetadata,
     pub books: HashMap<String, BookSnapshot>,
     pub open_orders: Vec<ManagedOrder>,
-    pub fills: Vec<TradeFill>,
     pub positions: HashMap<String, PositionSnapshot>,
     pub account: AccountSnapshot,
     pub signals: HashMap<String, SignalState>,
