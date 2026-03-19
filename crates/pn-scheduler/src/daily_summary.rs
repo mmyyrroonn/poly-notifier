@@ -113,7 +113,10 @@ impl DailySummaryJob {
                 .and_then(|next| (next - Utc::now()).to_std().ok())
                 .unwrap_or(Duration::from_secs(60));
 
-            tracing::debug!(sleep_secs = delay.as_secs(), "sleeping until next summary run");
+            tracing::debug!(
+                sleep_secs = delay.as_secs(),
+                "sleeping until next summary run"
+            );
 
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {
@@ -230,10 +233,9 @@ fn format_summary(subs: &[SummaryRow], now_str: &str) -> Result<String> {
         let outcomes: Vec<String> = serde_json::from_str(&row.outcomes)
             .with_context(|| format!("malformed outcomes JSON for question {:?}", row.question))?;
 
-        let last_prices: Vec<f64> = serde_json::from_str(&row.last_prices)
-            .with_context(|| {
-                format!("malformed last_prices JSON for question {:?}", row.question)
-            })?;
+        let last_prices: Vec<f64> = serde_json::from_str(&row.last_prices).with_context(|| {
+            format!("malformed last_prices JSON for question {:?}", row.question)
+        })?;
 
         // Determine the label and price for the subscribed outcome.
         let outcome_label = outcomes
@@ -277,7 +279,12 @@ fn format_summary(subs: &[SummaryRow], now_str: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn make_row(question: &str, outcome_index: i32, outcomes: &[&str], prices: &[f64]) -> SummaryRow {
+    fn make_row(
+        question: &str,
+        outcome_index: i32,
+        outcomes: &[&str],
+        prices: &[f64],
+    ) -> SummaryRow {
         SummaryRow {
             user_id: 1,
             telegram_id: 111,

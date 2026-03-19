@@ -114,10 +114,9 @@ impl SubscriptionAggregator {
         let mut mapping = HashMap::new();
 
         for (condition_id, token_ids_json) in rows {
-            let ids: Vec<String> = serde_json::from_str(&token_ids_json)
-                .with_context(|| {
-                    format!("parsing token_ids JSON for condition {condition_id}: {token_ids_json}")
-                })?;
+            let ids: Vec<String> = serde_json::from_str(&token_ids_json).with_context(|| {
+                format!("parsing token_ids JSON for condition {condition_id}: {token_ids_json}")
+            })?;
             for token_id in ids {
                 mapping.insert(token_id, condition_id.clone());
             }

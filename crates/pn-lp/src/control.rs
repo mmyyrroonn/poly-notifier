@@ -4,12 +4,26 @@ use crate::types::RuntimeState;
 
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
-    Pause { reason: String },
-    Resume { reason: String },
-    CancelAll { reason: String },
-    Flatten { reason: String },
-    Split { amount: String, reason: String },
-    Merge { amount: String, reason: String },
+    Pause {
+        reason: String,
+    },
+    Resume {
+        reason: String,
+    },
+    CancelAll {
+        reason: String,
+    },
+    Flatten {
+        reason: String,
+    },
+    Split {
+        amount: String,
+        reason: String,
+    },
+    Merge {
+        amount: String,
+        reason: String,
+    },
     ExternalSignal {
         name: String,
         active: bool,

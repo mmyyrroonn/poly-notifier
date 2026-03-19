@@ -134,10 +134,7 @@ impl NotifyService {
         let user_id_opt = resolve_user_id_by_telegram(&self.pool, req.user_telegram_id)
             .await
             .with_context(|| {
-                format!(
-                    "resolving user_id for telegram_id={}",
-                    req.user_telegram_id
-                )
+                format!("resolving user_id for telegram_id={}", req.user_telegram_id)
             })?;
 
         let Some(user_id) = user_id_opt else {

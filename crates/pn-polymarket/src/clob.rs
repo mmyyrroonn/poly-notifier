@@ -72,10 +72,7 @@ impl ClobClient {
     ///
     /// Returns an error only if the Tokio task machinery fails.
     #[instrument(skip(self, token_ids), fields(count = token_ids.len()))]
-    pub async fn get_midpoints(
-        &self,
-        token_ids: &[String],
-    ) -> Result<HashMap<String, Decimal>> {
+    pub async fn get_midpoints(&self, token_ids: &[String]) -> Result<HashMap<String, Decimal>> {
         let futures: Vec<_> = token_ids
             .iter()
             .map(|id| self.fetch_midpoint(id.clone()))
@@ -98,10 +95,7 @@ impl ClobClient {
     }
 
     #[instrument(skip(self, token_ids), fields(count = token_ids.len()))]
-    pub async fn get_prices(
-        &self,
-        token_ids: &[String],
-    ) -> Result<HashMap<String, Decimal>> {
+    pub async fn get_prices(&self, token_ids: &[String]) -> Result<HashMap<String, Decimal>> {
         let futures: Vec<_> = token_ids
             .iter()
             .map(|id| self.fetch_price(id.clone()))

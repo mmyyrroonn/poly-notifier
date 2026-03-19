@@ -10,10 +10,7 @@
 
 use std::collections::HashMap;
 
-use teloxide::{
-    prelude::*,
-    types::ParseMode,
-};
+use teloxide::{prelude::*, types::ParseMode};
 use tracing::{debug, warn};
 
 /// Registry that maps bot IDs to live [`Bot`] handles.
@@ -44,11 +41,7 @@ impl BotRegistry {
     /// first `':'`.  If the token contains no colon the whole token string is
     /// used as the ID.
     pub fn register(&mut self, token: &str) {
-        let bot_id = token
-            .split(':')
-            .next()
-            .unwrap_or(token)
-            .to_string();
+        let bot_id = token.split(':').next().unwrap_or(token).to_string();
         debug!(bot_id = %bot_id, "registering Telegram bot");
         let bot = Bot::new(token);
         self.bots.insert(bot_id, bot);
@@ -82,12 +75,7 @@ impl BotRegistry {
     /// Returns `Err(String)` when:
     /// - `bot_id` is not present in the registry.
     /// - The Telegram API returns an error.
-    pub async fn send_message(
-        &self,
-        bot_id: &str,
-        chat_id: i64,
-        text: &str,
-    ) -> Result<(), String> {
+    pub async fn send_message(&self, bot_id: &str, chat_id: i64, text: &str) -> Result<(), String> {
         let bot = self
             .bots
             .get(bot_id)

@@ -270,7 +270,10 @@ async fn fetch_token_ids_with_retry(
     loop {
         match aggregator.get_active_token_ids().await {
             Ok(ids) => {
-                info!(count = ids.len(), "MonitorService: fetched token set from DB");
+                info!(
+                    count = ids.len(),
+                    "MonitorService: fetched token set from DB"
+                );
                 return ids;
             }
             Err(e) => {

@@ -350,11 +350,7 @@ fn schema() -> UpdateHandler<anyhow::Error> {
 ///
 /// Handled prefixes:
 /// * `unsub:{id}` – delete a subscription (cascade deletes alerts).
-async fn dispatch_callback(
-    bot: Bot,
-    q: CallbackQuery,
-    pool: SqlitePool,
-) -> anyhow::Result<()> {
+async fn dispatch_callback(bot: Bot, q: CallbackQuery, pool: SqlitePool) -> anyhow::Result<()> {
     let data = match q.data.as_deref() {
         Some(d) => d.to_string(),
         None => {

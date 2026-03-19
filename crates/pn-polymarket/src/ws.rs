@@ -91,7 +91,11 @@ impl PolymarketWs {
         event_tx: mpsc::UnboundedSender<WsEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        info!(url = WS_URL, tokens = token_ids.len(), "PolymarketWs: connecting");
+        info!(
+            url = WS_URL,
+            tokens = token_ids.len(),
+            "PolymarketWs: connecting"
+        );
 
         let (ws_stream, _) = connect_async(WS_URL)
             .await
@@ -233,15 +237,13 @@ fn parse_single_event(value: &Value) -> WsEvent {
     };
 
     match raw.event_type.as_deref().unwrap_or("") {
-        "price_change" => {
-            match raw.price.as_deref().and_then(|p| Decimal::from_str(p).ok()) {
-                Some(price) => WsEvent::PriceChange { asset_id, price },
-                None => {
-                    warn!(%asset_id, "PolymarketWs: price_change has unparseable price");
-                    WsEvent::Unknown(value.to_string())
-                }
+        "price_change" => match raw.price.as_deref().and_then(|p| Decimal::from_str(p).ok()) {
+            Some(price) => WsEvent::PriceChange { asset_id, price },
+            None => {
+                warn!(%asset_id, "PolymarketWs: price_change has unparseable price");
+                WsEvent::Unknown(value.to_string())
             }
-        }
+        },
         "last_trade_price" => {
             let price_str = raw.last_trade_price.as_deref().or(raw.price.as_deref());
             match price_str.and_then(|p| Decimal::from_str(p).ok()) {
@@ -255,7 +257,11 @@ fn parse_single_event(value: &Value) -> WsEvent {
         "book" => {
             let bids = parse_book_levels(raw.bids.as_deref().unwrap_or(&[]));
             let asks = parse_book_levels(raw.asks.as_deref().unwrap_or(&[]));
-            WsEvent::Book { asset_id, bids, asks }
+            WsEvent::Book {
+                asset_id,
+                bids,
+                asks,
+            }
         }
         _ => WsEvent::Unknown(value.to_string()),
     }

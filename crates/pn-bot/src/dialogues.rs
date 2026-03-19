@@ -25,8 +25,7 @@ use pn_common::db::{count_active_subscriptions, get_or_create_user, get_user_sub
 use pn_polymarket::GammaClient;
 
 use crate::keyboards::{
-    alert_type_keyboard, market_list_keyboard, outcome_keyboard,
-    subscription_list_keyboard,
+    alert_type_keyboard, market_list_keyboard, outcome_keyboard, subscription_list_keyboard,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,9 +69,7 @@ pub enum DialogueState {
     AwaitingUrl,
 
     /// Multiple markets found; waiting for the user to tap one.
-    AwaitingMarketSelection {
-        markets: Vec<MarketOption>,
-    },
+    AwaitingMarketSelection { markets: Vec<MarketOption> },
 
     /// Market chosen; waiting for the user to select an outcome.
     AwaitingOutcomeSelection {
@@ -139,9 +136,7 @@ pub fn extract_slug_from_url(text: &str) -> Option<String> {
     let idx = text.find("/event/")?;
     let after = &text[idx + "/event/".len()..];
     // Take the first path segment (up to '/' or '?' or end)
-    let slug = after
-        .split(&['/', '?', '#'][..])
-        .next()?;
+    let slug = after.split(&['/', '?', '#'][..]).next()?;
     if slug.is_empty() {
         return None;
     }
@@ -301,8 +296,11 @@ pub async fn handle_market_selection(
         Some(m) => m.clone(),
         None => {
             if let Some(msg) = q.message {
-                bot.send_message(msg.chat().id, "Invalid selection. Please try /subscribe again.")
-                    .await?;
+                bot.send_message(
+                    msg.chat().id,
+                    "Invalid selection. Please try /subscribe again.",
+                )
+                .await?;
             }
             dialogue.update(DialogueState::Idle).await?;
             return Ok(());
@@ -371,9 +369,7 @@ pub async fn handle_outcome_selection(
     let kb = alert_type_keyboard();
     bot.send_message(
         chat_id,
-        format!(
-            "Market: {question}\nOutcome: {outcome_label}\n\nSelect alert type:"
-        ),
+        format!("Market: {question}\nOutcome: {outcome_label}\n\nSelect alert type:"),
     )
     .reply_markup(kb)
     .await?;
@@ -470,8 +466,11 @@ pub async fn handle_subscribe_alert_threshold(
     let pct: f64 = match text.parse() {
         Ok(v) if (0.0..=100.0).contains(&v) => v,
         Ok(_) => {
-            bot.send_message(msg.chat.id, "Threshold must be between 0 and 100. Try again:")
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                "Threshold must be between 0 and 100. Try again:",
+            )
+            .await?;
             return Ok(());
         }
         Err(_) => {
@@ -550,8 +549,11 @@ pub async fn handle_subscribe_alert_threshold(
         Ok(_) => {}
         Err(e) => {
             warn!(error=%e, "failed to insert subscription");
-            bot.send_message(msg.chat.id, "Failed to create subscription. Please try again.")
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                "Failed to create subscription. Please try again.",
+            )
+            .await?;
             dialogue.update(DialogueState::Idle).await?;
             return Ok(());
         }
@@ -570,22 +572,24 @@ pub async fn handle_subscribe_alert_threshold(
     let subscription_id = match sub_row {
         Some((id,)) => id,
         None => {
-            bot.send_message(msg.chat.id, "Failed to find subscription. Please try again.")
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                "Failed to find subscription. Please try again.",
+            )
+            .await?;
             dialogue.update(DialogueState::Idle).await?;
             return Ok(());
         }
     };
 
     // Insert alert.
-    let alert_result = sqlx::query(
-        "INSERT INTO alerts (subscription_id, alert_type, threshold) VALUES (?, ?, ?)",
-    )
-    .bind(subscription_id)
-    .bind(&alert_type)
-    .bind(threshold)
-    .execute(&pool)
-    .await;
+    let alert_result =
+        sqlx::query("INSERT INTO alerts (subscription_id, alert_type, threshold) VALUES (?, ?, ?)")
+            .bind(subscription_id)
+            .bind(&alert_type)
+            .bind(threshold)
+            .execute(&pool)
+            .await;
 
     match alert_result {
         Ok(_) => {
@@ -635,8 +639,7 @@ pub async fn handle_alert_start(
         None => return Ok(()),
     };
 
-    let user =
-        get_or_create_user(&pool, telegram_id, &bot_id, None).await?;
+    let user = get_or_create_user(&pool, telegram_id, &bot_id, None).await?;
     let subs = get_user_subscriptions(&pool, user.id).await?;
 
     if subs.is_empty() {
@@ -720,12 +723,9 @@ pub async fn handle_alert_subscription_selection(
     };
 
     let kb = alert_type_keyboard();
-    bot.send_message(
-        chat_id,
-        format!("Market: {question}\n\nSelect alert type:"),
-    )
-    .reply_markup(kb)
-    .await?;
+    bot.send_message(chat_id, format!("Market: {question}\n\nSelect alert type:"))
+        .reply_markup(kb)
+        .await?;
 
     dialogue
         .update(DialogueState::AwaitingAlertType {
@@ -810,8 +810,11 @@ pub async fn handle_alert_threshold(
     let pct: f64 = match text.parse() {
         Ok(v) if (0.0..=100.0).contains(&v) => v,
         Ok(_) => {
-            bot.send_message(msg.chat.id, "Threshold must be between 0 and 100. Try again:")
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                "Threshold must be between 0 and 100. Try again:",
+            )
+            .await?;
             return Ok(());
         }
         Err(_) => {
@@ -831,12 +834,11 @@ pub async fn handle_alert_threshold(
     let user = get_or_create_user(&pool, telegram_id, &bot_id, None).await?;
 
     // Count existing alerts for this subscription.
-    let alert_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM alerts WHERE subscription_id = ?",
-    )
-    .bind(subscription_id)
-    .fetch_one(&pool)
-    .await?;
+    let alert_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM alerts WHERE subscription_id = ?")
+            .bind(subscription_id)
+            .fetch_one(&pool)
+            .await?;
 
     let is_free = user.tier == "free";
 
@@ -874,10 +876,30 @@ pub async fn handle_alert_threshold(
         }
     } else if is_free && alert_count.0 == 0 {
         // Free user, no existing alert – INSERT one.
-        insert_alert(&bot, &pool, msg.chat.id, subscription_id, &alert_type, threshold, &question, pct).await?;
+        insert_alert(
+            &bot,
+            &pool,
+            msg.chat.id,
+            subscription_id,
+            &alert_type,
+            threshold,
+            &question,
+            pct,
+        )
+        .await?;
     } else {
         // Premium/unlimited – always INSERT.
-        insert_alert(&bot, &pool, msg.chat.id, subscription_id, &alert_type, threshold, &question, pct).await?;
+        insert_alert(
+            &bot,
+            &pool,
+            msg.chat.id,
+            subscription_id,
+            &alert_type,
+            threshold,
+            &question,
+            pct,
+        )
+        .await?;
     }
 
     dialogue.update(DialogueState::Idle).await?;
@@ -895,14 +917,13 @@ async fn insert_alert(
     question: &str,
     pct: f64,
 ) -> anyhow::Result<()> {
-    let result = sqlx::query(
-        "INSERT INTO alerts (subscription_id, alert_type, threshold) VALUES (?, ?, ?)",
-    )
-    .bind(subscription_id)
-    .bind(alert_type)
-    .bind(threshold)
-    .execute(pool)
-    .await;
+    let result =
+        sqlx::query("INSERT INTO alerts (subscription_id, alert_type, threshold) VALUES (?, ?, ?)")
+            .bind(subscription_id)
+            .bind(alert_type)
+            .bind(threshold)
+            .execute(pool)
+            .await;
 
     match result {
         Ok(_) => {

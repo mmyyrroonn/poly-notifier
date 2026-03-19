@@ -4,25 +4,25 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::sol;
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::sol;
 use anyhow::{Context, Result};
-use futures_util::{StreamExt, future::try_join_all};
+use futures_util::{future::try_join_all, StreamExt};
 use polymarket_client_sdk::auth::{LocalSigner, Signer, Uuid};
 use polymarket_client_sdk::clob;
-use polymarket_client_sdk::clob::types::{
-    Amount, AssetType, OrderStatusType, OrderType, Side, SignatureType, TraderSide,
-};
 use polymarket_client_sdk::clob::types::request::{
     BalanceAllowanceRequest, CancelMarketOrderRequest, OrderBookSummaryRequest, OrdersRequest,
 };
+use polymarket_client_sdk::clob::types::{
+    Amount, AssetType, OrderStatusType, OrderType, Side, SignatureType, TraderSide,
+};
 use polymarket_client_sdk::ctf;
 use polymarket_client_sdk::data;
-use polymarket_client_sdk::data::types::MarketFilter;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
-use polymarket_client_sdk::types::{Address, B256, Decimal, U256};
-use polymarket_client_sdk::{PRIVATE_KEY_VAR, contract_config};
+use polymarket_client_sdk::data::types::MarketFilter;
+use polymarket_client_sdk::types::{Address, Decimal, B256, U256};
+use polymarket_client_sdk::{contract_config, PRIVATE_KEY_VAR};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -190,9 +190,13 @@ pub enum StreamEvent {
 pub struct PolymarketExecutionClient {
     config: ExecutionConfig,
     signer: PrivateKeySigner,
-    clob: clob::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    clob: clob::Client<
+        polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+    >,
     market_ws: clob::ws::Client,
-    user_ws: clob::ws::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    user_ws: clob::ws::Client<
+        polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+    >,
     data: data::Client,
     condition_id: B256,
     market: Arc<MarketMetadata>,
@@ -216,8 +220,7 @@ impl PolymarketExecutionClient {
         );
         let private_key = env::var(PRIVATE_KEY_VAR)
             .with_context(|| format!("{PRIVATE_KEY_VAR} environment variable is required"))?;
-        let signer =
-            LocalSigner::from_str(&private_key)?.with_chain_id(Some(config.chain_id));
+        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(config.chain_id));
 
         let clob_config = clob::Config::builder()
             .heartbeat_interval(Duration::from_secs(5))
@@ -240,7 +243,11 @@ impl PolymarketExecutionClient {
         let mut tokens = Vec::with_capacity(token_records.len());
         let mut asset_ids = Vec::with_capacity(token_records.len());
         for token in token_records {
-            let tick_size = clob.tick_size(token.token_id).await?.minimum_tick_size.as_decimal();
+            let tick_size = clob
+                .tick_size(token.token_id)
+                .await?
+                .minimum_tick_size
+                .as_decimal();
             tokens.push(TokenMetadata {
                 asset_id: token.token_id.to_string(),
                 outcome: token.outcome,
@@ -370,7 +377,9 @@ impl PolymarketExecutionClient {
 
         for target in self.approval_targets(include_inventory) {
             let usdc_allowance_ready = if target.require_usdc_allowance {
-                allowance_is_ready(check_allowance(&usdc, self.wallet_address, target.address).await?)
+                allowance_is_ready(
+                    check_allowance(&usdc, self.wallet_address, target.address).await?,
+                )
             } else {
                 true
             };
@@ -765,20 +774,21 @@ impl PolymarketExecutionClient {
             )
             .await?;
         let clob = &self.clob;
-        let token_balances = try_join_all(self.asset_ids.iter().copied().map(|asset_id| async move {
-            let response = clob
-                .balance_allowance(
-                    BalanceAllowanceRequest::builder()
-                        .asset_type(AssetType::Conditional)
-                        .token_id(asset_id)
-                        .build(),
-                )
-                .await?;
-            Ok::<_, anyhow::Error>((asset_id.to_string(), response.balance))
-        }))
-        .await?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        let token_balances =
+            try_join_all(self.asset_ids.iter().copied().map(|asset_id| async move {
+                let response = clob
+                    .balance_allowance(
+                        BalanceAllowanceRequest::builder()
+                            .asset_type(AssetType::Conditional)
+                            .token_id(asset_id)
+                            .build(),
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>((asset_id.to_string(), response.balance))
+            }))
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
 
         Ok(AccountSnapshot {
             usdc_balance: usdc.balance,
@@ -1145,11 +1155,7 @@ fn flatten_trade_fill(
         } else {
             Decimal::ZERO
         },
-        size: if matched {
-            request.size
-        } else {
-            Decimal::ZERO
-        },
+        size: if matched { request.size } else { Decimal::ZERO },
         status: format!("{}:unconfirmed", response.status),
     }
 }
@@ -1180,7 +1186,10 @@ fn trade_order_id(
     select_trade_order_id(
         trade.trader_side.clone(),
         trade.taker_order_id.clone(),
-        trade.maker_orders.first().map(|maker_order| maker_order.order_id.clone()),
+        trade
+            .maker_orders
+            .first()
+            .map(|maker_order| maker_order.order_id.clone()),
     )
 }
 
@@ -1260,9 +1269,7 @@ fn build_approval_targets(
 
 fn decimal_to_u256(value: Decimal, scale: u32) -> Result<U256> {
     let scaled = value.round_dp(scale) * Decimal::from(10u64.pow(scale));
-    let integer = scaled
-        .trunc()
-        .to_string();
+    let integer = scaled.trunc().to_string();
     U256::from_str(&integer).with_context(|| format!("unable to convert {value} into base units"))
 }
 
@@ -1338,7 +1345,13 @@ async fn approve_usdc<P: alloy::providers::Provider>(
     spender: Address,
     amount: U256,
 ) -> Result<String> {
-    Ok(usdc.approve(spender, amount).send().await?.watch().await?.to_string())
+    Ok(usdc
+        .approve(spender, amount)
+        .send()
+        .await?
+        .watch()
+        .await?
+        .to_string())
 }
 
 async fn set_ctf_approval<P: alloy::providers::Provider>(
@@ -1358,15 +1371,15 @@ async fn set_ctf_approval<P: alloy::providers::Provider>(
 #[cfg(test)]
 mod tests {
     use polymarket_client_sdk::auth::Uuid;
-    use polymarket_client_sdk::clob::types::{OrderStatusType, Side, TraderSide};
     use polymarket_client_sdk::clob::types::response::{OpenOrderResponse, PostOrderResponse};
-    use polymarket_client_sdk::types::{B256, U256, address};
+    use polymarket_client_sdk::clob::types::{OrderStatusType, Side, TraderSide};
+    use polymarket_client_sdk::types::{address, B256, U256};
     use rust_decimal_macros::dec;
 
     use super::{
-        ApprovalCheck, ApprovalStatus, FlattenRequest, QuoteSide, build_approval_targets,
-        allowance_is_ready, flatten_trade_fill, map_open_order, mark_stream_message_received,
-        next_reconnect_backoff_secs, select_trade_order_id, side_from_sdk,
+        allowance_is_ready, build_approval_targets, flatten_trade_fill, map_open_order,
+        mark_stream_message_received, next_reconnect_backoff_secs, select_trade_order_id,
+        side_from_sdk, ApprovalCheck, ApprovalStatus, FlattenRequest, QuoteSide,
     };
 
     #[test]
@@ -1389,8 +1402,7 @@ mod tests {
         let conditional_tokens = address!("0x2000000000000000000000000000000000000002");
         let adapter = address!("0x3000000000000000000000000000000000000003");
 
-        let targets =
-            build_approval_targets(exchange, conditional_tokens, Some(adapter), true);
+        let targets = build_approval_targets(exchange, conditional_tokens, Some(adapter), true);
 
         assert_eq!(targets.len(), 3);
         assert_eq!(targets[1].label, "neg-risk adapter");
@@ -1549,9 +1561,7 @@ mod tests {
     fn side_from_sdk_rejects_unknown_variant() {
         let error = side_from_sdk(Side::Unknown).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("unexpected SDK side variant"));
+        assert!(error.to_string().contains("unexpected SDK side variant"));
     }
 
     #[test]

@@ -313,10 +313,7 @@ impl AlertEngine {
                 last_triggered_at: row.last_triggered_at,
             };
 
-            by_token
-                .entry(token_id)
-                .or_default()
-                .push(rule.clone());
+            by_token.entry(token_id).or_default().push(rule.clone());
             all_rules.push(rule);
         }
 
@@ -431,10 +428,7 @@ impl AlertEngine {
     /// those that pass evaluation and are not in cooldown.
     async fn handle_price_update(&self, update: PriceUpdate) -> anyhow::Result<()> {
         let current_price = update.price;
-        let previous_price = self
-            .prev_prices
-            .get(&update.token_id)
-            .map(|p| *p);
+        let previous_price = self.prev_prices.get(&update.token_id).map(|p| *p);
 
         // Store current price as previous for the next tick before evaluating,
         // so a crash mid-evaluation does not lose the price history.
@@ -458,10 +452,7 @@ impl AlertEngine {
             };
 
             if !self.dedup.can_fire(rule.alert_id, cooldown) {
-                debug!(
-                    alert_id = rule.alert_id,
-                    "alert suppressed by cooldown"
-                );
+                debug!(alert_id = rule.alert_id, "alert suppressed by cooldown");
                 continue;
             }
 
@@ -479,10 +470,7 @@ impl AlertEngine {
             };
 
             if let Err(e) = self.notify_tx.send(notification).await {
-                error!(
-                    alert_id = rule.alert_id,
-                    "notification channel closed: {e}"
-                );
+                error!(alert_id = rule.alert_id, "notification channel closed: {e}");
             }
 
             // Persist the trigger to the database.

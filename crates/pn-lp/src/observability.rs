@@ -18,14 +18,13 @@ pub fn signal_transitions(
     let mut names = after.keys().cloned().collect::<Vec<_>>();
     names.sort();
 
-    names.into_iter()
+    names
+        .into_iter()
         .filter_map(|name| {
             let next = after.get(&name)?;
             let previous = before.get(&name);
             let changed = match previous {
-                Some(previous) => {
-                    previous.active != next.active || previous.reason != next.reason
-                }
+                Some(previous) => previous.active != next.active || previous.reason != next.reason,
                 None => true,
             };
 
@@ -61,7 +60,7 @@ pub fn summarize_quotes(quotes: &[QuoteIntent]) -> String {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{SignalTransition, signal_transitions};
+    use super::{signal_transitions, SignalTransition};
     use crate::types::SignalState;
 
     #[test]

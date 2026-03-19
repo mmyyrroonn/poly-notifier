@@ -64,9 +64,8 @@ impl ConnectionManager {
             let token_ids_clone = token_ids.clone();
 
             // Spawn the WS task
-            let ws_handle = tokio::spawn(async move {
-                ws.run(&token_ids_clone, event_tx, ws_cancel).await
-            });
+            let ws_handle =
+                tokio::spawn(async move { ws.run(&token_ids_clone, event_tx, ws_cancel).await });
 
             let mut received_any = false;
 

@@ -75,11 +75,7 @@ impl GammaClient {
         let response = self
             .http
             .get(&url)
-            .query(&[
-                ("closed", "false"),
-                ("limit", "10"),
-                ("title", query),
-            ])
+            .query(&[("closed", "false"), ("limit", "10"), ("title", query)])
             .send()
             .await
             .with_context(|| format!("GET {url} failed"))?;
@@ -97,10 +93,7 @@ impl GammaClient {
         let events: Vec<GammaEvent> =
             serde_json::from_str(&body).with_context(|| "parsing Gamma events JSON")?;
 
-        let markets = events
-            .into_iter()
-            .flat_map(flatten_event)
-            .collect();
+        let markets = events.into_iter().flat_map(flatten_event).collect();
 
         Ok(markets)
     }
@@ -136,10 +129,7 @@ impl GammaClient {
         let events: Vec<GammaEvent> =
             serde_json::from_str(&body).with_context(|| "parsing Gamma events JSON")?;
 
-        let markets: Vec<GammaMarket> = events
-            .into_iter()
-            .flat_map(flatten_event)
-            .collect();
+        let markets: Vec<GammaMarket> = events.into_iter().flat_map(flatten_event).collect();
 
         if markets.is_empty() {
             debug!(%slug, "slug lookup returned no markets, falling back to title search");
@@ -178,9 +168,7 @@ impl GammaClient {
             .with_context(|| "reading Gamma get_market response body")?;
 
         if !status.is_success() {
-            anyhow::bail!(
-                "Gamma API returned {status} for condition_id '{condition_id}': {body}"
-            );
+            anyhow::bail!("Gamma API returned {status} for condition_id '{condition_id}': {body}");
         }
 
         let events: Vec<GammaEvent> =

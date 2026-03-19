@@ -10,8 +10,8 @@ use teloxide::prelude::*;
 use tracing::{instrument, warn};
 
 use pn_common::db::{
-    count_active_subscriptions, get_last_feedback_time, get_or_create_user,
-    get_user_subscriptions, insert_feedback,
+    count_active_subscriptions, get_last_feedback_time, get_or_create_user, get_user_subscriptions,
+    insert_feedback,
 };
 use pn_polymarket::ClobClient;
 
@@ -111,22 +111,16 @@ pub async fn list(
 
     let used = subs.len();
     let max = user.max_subscriptions as usize;
-    let mut lines = vec![
-        format!("Your Subscriptions ({used}/{max}):"),
-        String::new(),
-    ];
+    let mut lines = vec![format!("Your Subscriptions ({used}/{max}):"), String::new()];
 
     for (i, s) in subs.iter().enumerate() {
-        let last_prices: Vec<f64> =
-            serde_json::from_str(&s.last_prices).unwrap_or_default();
+        let last_prices: Vec<f64> = serde_json::from_str(&s.last_prices).unwrap_or_default();
 
         let outcome_label = {
-            let row = sqlx::query(
-                "SELECT outcomes FROM markets WHERE condition_id = ?",
-            )
-            .bind(&s.condition_id)
-            .fetch_optional(&pool)
-            .await?;
+            let row = sqlx::query("SELECT outcomes FROM markets WHERE condition_id = ?")
+                .bind(&s.condition_id)
+                .fetch_optional(&pool)
+                .await?;
             let outcome_names: Vec<String> = row
                 .and_then(|r: sqlx::sqlite::SqliteRow| {
                     let outcomes: String = r.get("outcomes");
@@ -207,20 +201,18 @@ pub async fn prices(
         return Ok(());
     }
 
-    bot.send_message(msg.chat.id, "Fetching current prices…").await?;
+    bot.send_message(msg.chat.id, "Fetching current prices…")
+        .await?;
 
     let mut lines = vec!["Current Prices:".to_string(), String::new()];
 
     for (i, s) in subs.iter().enumerate() {
-        let token_ids: Vec<String> =
-            serde_json::from_str(&s.token_ids).unwrap_or_default();
+        let token_ids: Vec<String> = serde_json::from_str(&s.token_ids).unwrap_or_default();
         let outcome_names: Vec<String> = {
-            let row = sqlx::query(
-                "SELECT outcomes FROM markets WHERE condition_id = ?",
-            )
-            .bind(&s.condition_id)
-            .fetch_optional(&pool)
-            .await?;
+            let row = sqlx::query("SELECT outcomes FROM markets WHERE condition_id = ?")
+                .bind(&s.condition_id)
+                .fetch_optional(&pool)
+                .await?;
             row.and_then(|r: sqlx::sqlite::SqliteRow| {
                 let outcomes: String = r.get("outcomes");
                 serde_json::from_str(&outcomes).ok()
@@ -242,7 +234,10 @@ pub async fn prices(
             }
         };
 
-        let price = match clob_client.get_midpoints(std::slice::from_ref(token_id)).await {
+        let price = match clob_client
+            .get_midpoints(std::slice::from_ref(token_id))
+            .await
+        {
             Ok(map) => map
                 .get(token_id)
                 .map(|p| {
@@ -341,7 +336,8 @@ pub async fn timezone(
     let tz_str = tz_str.trim().to_string();
 
     if tz_str.contains([';', '\'', '"', '\\']) {
-        bot.send_message(msg.chat.id, "Invalid timezone string.").await?;
+        bot.send_message(msg.chat.id, "Invalid timezone string.")
+            .await?;
         return Ok(());
     }
 
@@ -355,11 +351,8 @@ pub async fn timezone(
         .execute(&pool)
         .await?;
 
-    bot.send_message(
-        msg.chat.id,
-        format!("Timezone updated to: {tz_str}"),
-    )
-    .await?;
+    bot.send_message(msg.chat.id, format!("Timezone updated to: {tz_str}"))
+        .await?;
 
     Ok(())
 }
@@ -400,7 +393,8 @@ pub async fn callback_unsubscribe(
         }
         Err(e) => {
             warn!(error=%e, sub_id, "failed to delete subscription");
-            bot.send_message(chat_id, "Failed to remove subscription.").await?;
+            bot.send_message(chat_id, "Failed to remove subscription.")
+                .await?;
         }
     }
 
@@ -442,8 +436,11 @@ pub async fn feedback(
     }
 
     if body.len() > 1000 {
-        bot.send_message(msg.chat.id, "Feedback is too long. Please keep it under 1000 characters.")
-            .await?;
+        bot.send_message(
+            msg.chat.id,
+            "Feedback is too long. Please keep it under 1000 characters.",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -477,11 +474,7 @@ pub async fn feedback(
 // ---------------------------------------------------------------------------
 
 /// Wrapper that starts the subscribe dialogue flow.
-pub async fn subscribe(
-    bot: Bot,
-    dialogue: MyDialogue,
-    msg: Message,
-) -> anyhow::Result<()> {
+pub async fn subscribe(bot: Bot, dialogue: MyDialogue, msg: Message) -> anyhow::Result<()> {
     handle_subscribe_start(bot, dialogue, msg).await
 }
 

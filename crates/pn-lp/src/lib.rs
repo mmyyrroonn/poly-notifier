@@ -8,7 +8,7 @@ pub mod types;
 
 pub use control::{ControlCommand, LpControlHandle, RuntimeSnapshot};
 pub use decision::{DecisionConfig, DecisionEngine, DecisionOutcome};
-pub use observability::{SignalTransition, signal_transitions, summarize_quotes};
+pub use observability::{signal_transitions, summarize_quotes, SignalTransition};
 pub use risk::{FlattenIntent, RiskAction, RiskConfig, RiskEngine};
 pub use service::{
     ExchangeAdapter, ExchangeEvent, LpService, ReconciliationSnapshot, Reporter, ServiceConfig,

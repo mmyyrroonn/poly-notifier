@@ -101,13 +101,12 @@ pub async fn update_tier(
 
     let now = Utc::now().naive_utc();
 
-    let result =
-        sqlx::query("UPDATE users SET tier = ?, updated_at = ? WHERE telegram_id = ?")
-            .bind(&tier)
-            .bind(now)
-            .bind(telegram_id)
-            .execute(&state.pool)
-            .await;
+    let result = sqlx::query("UPDATE users SET tier = ?, updated_at = ? WHERE telegram_id = ?")
+        .bind(&tier)
+        .bind(now)
+        .bind(telegram_id)
+        .execute(&state.pool)
+        .await;
 
     match result {
         Err(e) => db_error(e),
@@ -161,14 +160,13 @@ pub async fn update_limit(
 
     let now = Utc::now().naive_utc();
 
-    let result = sqlx::query(
-        "UPDATE users SET max_subscriptions = ?, updated_at = ? WHERE telegram_id = ?",
-    )
-    .bind(body.max_subscriptions)
-    .bind(now)
-    .bind(telegram_id)
-    .execute(&state.pool)
-    .await;
+    let result =
+        sqlx::query("UPDATE users SET max_subscriptions = ?, updated_at = ? WHERE telegram_id = ?")
+            .bind(body.max_subscriptions)
+            .bind(now)
+            .bind(telegram_id)
+            .execute(&state.pool)
+            .await;
 
     match result {
         Err(e) => db_error(e),
@@ -376,10 +374,7 @@ pub async fn lp_state(State(state): State<AdminState>) -> Response {
     Json(snapshot).into_response()
 }
 
-pub async fn lp_pause(
-    State(state): State<AdminState>,
-    body: Option<Json<ReasonBody>>,
-) -> Response {
+pub async fn lp_pause(State(state): State<AdminState>, body: Option<Json<ReasonBody>>) -> Response {
     let handle = match lp_handle(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
@@ -427,10 +422,7 @@ pub async fn lp_cancel_all(
     }
 }
 
-pub async fn lp_signal(
-    State(state): State<AdminState>,
-    Json(body): Json<SignalBody>,
-) -> Response {
+pub async fn lp_signal(State(state): State<AdminState>, Json(body): Json<SignalBody>) -> Response {
     let handle = match lp_handle(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
@@ -465,10 +457,7 @@ pub async fn lp_flatten(
     }
 }
 
-pub async fn lp_split(
-    State(state): State<AdminState>,
-    body: Option<Json<AmountBody>>,
-) -> Response {
+pub async fn lp_split(State(state): State<AdminState>, body: Option<Json<AmountBody>>) -> Response {
     let handle = match lp_handle(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
@@ -502,10 +491,7 @@ pub async fn lp_split(
     }
 }
 
-pub async fn lp_merge(
-    State(state): State<AdminState>,
-    body: Option<Json<AmountBody>>,
-) -> Response {
+pub async fn lp_merge(State(state): State<AdminState>, body: Option<Json<AmountBody>>) -> Response {
     let handle = match lp_handle(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
@@ -544,11 +530,10 @@ pub async fn lp_merge(
 /// Separated from the handler so each `?` propagates a plain
 /// [`sqlx::Error`] that `db_error` can log and convert.
 async fn fetch_stats(state: &AdminState) -> Result<StatsResponse, sqlx::Error> {
-    let total_users =
-        sqlx::query_as::<_, CountRow>("SELECT COUNT(*) AS cnt FROM users")
-            .fetch_one(&state.pool)
-            .await?
-            .cnt;
+    let total_users = sqlx::query_as::<_, CountRow>("SELECT COUNT(*) AS cnt FROM users")
+        .fetch_one(&state.pool)
+        .await?
+        .cnt;
 
     let active_subscriptions = sqlx::query_as::<_, CountRow>(
         "SELECT COUNT(*) AS cnt FROM subscriptions WHERE is_active = 1",
@@ -567,12 +552,11 @@ async fn fetch_stats(state: &AdminState) -> Result<StatsResponse, sqlx::Error> {
     .await?
     .cnt;
 
-    let active_markets = sqlx::query_as::<_, CountRow>(
-        "SELECT COUNT(*) AS cnt FROM markets WHERE is_active = 1",
-    )
-    .fetch_one(&state.pool)
-    .await?
-    .cnt;
+    let active_markets =
+        sqlx::query_as::<_, CountRow>("SELECT COUNT(*) AS cnt FROM markets WHERE is_active = 1")
+            .fetch_one(&state.pool)
+            .await?
+            .cnt;
 
     // Notifications recorded since midnight UTC today.
     let notifications_today = sqlx::query_as::<_, CountRow>(
@@ -596,20 +580,20 @@ mod tests {
     use std::collections::HashMap;
 
     use axum::{
-        body::{Body, to_bytes},
+        body::{to_bytes, Body},
         extract::State,
         http::StatusCode,
     };
     use chrono::Utc;
+    use pn_lp::types::SignalState;
     use pn_lp::{
         AccountSnapshot, ControlCommand, LpControlHandle, MarketMetadata, RuntimeFlags,
         RuntimeState, TokenMetadata,
     };
-    use pn_lp::types::SignalState;
     use sqlx::SqlitePool;
     use tokio::sync::{mpsc, watch};
 
-    use super::{AmountBody, SignalBody, lp_merge, lp_signal, lp_split};
+    use super::{lp_merge, lp_signal, lp_split, AmountBody, SignalBody};
     use crate::AdminState;
 
     async fn test_admin_state() -> (AdminState, mpsc::UnboundedReceiver<ControlCommand>) {
@@ -662,7 +646,9 @@ mod tests {
     }
 
     async fn response_body_json(body: Body) -> serde_json::Value {
-        let bytes = to_bytes(body, usize::MAX).await.expect("response body bytes");
+        let bytes = to_bytes(body, usize::MAX)
+            .await
+            .expect("response body bytes");
         serde_json::from_slice(&bytes).expect("json response body")
     }
 
