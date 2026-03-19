@@ -3528,7 +3528,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "pn-common",
- "pn-polymarket",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

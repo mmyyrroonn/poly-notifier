@@ -125,25 +125,13 @@ pub struct QuoteIntent {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RuntimeFlags {
     pub paused: bool,
     pub flattening: bool,
     pub heartbeat_healthy: bool,
     pub market_feed_healthy: bool,
     pub user_feed_healthy: bool,
-}
-
-impl Default for RuntimeFlags {
-    fn default() -> Self {
-        Self {
-            paused: false,
-            flattening: false,
-            heartbeat_healthy: true,
-            market_feed_healthy: true,
-            user_feed_healthy: true,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

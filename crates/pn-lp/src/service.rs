@@ -551,7 +551,12 @@ impl LpService {
                     self.emit_risk("cancel_all", "warn", json!({ "reason": reason }))
                         .await?;
                 }
-                RiskAction::Flatten(intent) => {
+                RiskAction::Flatten(mut intent) => {
+                    intent.price = flatten_reference_price(
+                        state,
+                        &intent.asset_id,
+                        intent.price,
+                    );
                     insert_lp_control_action(
                         &self.pool,
                         "flatten",
@@ -1187,7 +1192,12 @@ mod tests {
                     reason: "test".to_string(),
                 },
             )]),
-            flags: RuntimeFlags::default(),
+            flags: RuntimeFlags {
+                heartbeat_healthy: true,
+                market_feed_healthy: true,
+                user_feed_healthy: true,
+                ..RuntimeFlags::default()
+            },
             last_market_event_at: Some(now),
             last_user_event_at: Some(now),
             last_heartbeat_at: Some(now),

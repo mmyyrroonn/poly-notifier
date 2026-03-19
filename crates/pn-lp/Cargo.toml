@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 pn-common = { workspace = true }
-pn-polymarket = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 sqlx = { workspace = true }

@@ -199,7 +199,12 @@ mod tests {
                     reason: "book healthy".to_string(),
                 },
             )]),
-            flags: RuntimeFlags::default(),
+            flags: RuntimeFlags {
+                heartbeat_healthy: true,
+                market_feed_healthy: true,
+                user_feed_healthy: true,
+                ..RuntimeFlags::default()
+            },
             last_market_event_at: Some(now - Duration::seconds(30)),
             last_user_event_at: Some(now),
             last_heartbeat_at: Some(now),

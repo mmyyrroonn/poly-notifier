@@ -1268,8 +1268,8 @@ fn build_approval_targets(
 }
 
 fn decimal_to_u256(value: Decimal, scale: u32) -> Result<U256> {
-    let scaled = value.round_dp(scale) * Decimal::from(10u64.pow(scale));
-    let integer = scaled.trunc().to_string();
+    let scaled = (value * Decimal::from(10u64.pow(scale))).trunc();
+    let integer = scaled.to_string();
     U256::from_str(&integer).with_context(|| format!("unable to convert {value} into base units"))
 }
 
@@ -1582,5 +1582,22 @@ mod tests {
     fn allowance_is_ready_requires_large_allowance() {
         assert!(!allowance_is_ready(U256::from(1u64)));
         assert!(allowance_is_ready(U256::MAX));
+    }
+
+    #[test]
+    fn decimal_to_u256_truncates_not_rounds() {
+        use super::decimal_to_u256;
+
+        // 1.999999 with scale 6 should give 1999999, not 2000000
+        let result = decimal_to_u256(dec!(1.999999), 6).unwrap();
+        assert_eq!(result, U256::from(1_999_999u64));
+
+        // 0.5 at the rounding boundary: 1.5000005 with scale 6 should truncate
+        let result = decimal_to_u256(dec!(1.5000005), 6).unwrap();
+        assert_eq!(result, U256::from(1_500_000u64));
+
+        // exact value should be unchanged
+        let result = decimal_to_u256(dec!(1.5), 6).unwrap();
+        assert_eq!(result, U256::from(1_500_000u64));
     }
 }
