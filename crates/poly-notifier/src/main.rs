@@ -372,6 +372,7 @@ fn init_tracing(config: &AppConfig) -> Result<(WorkerGuard, WorkerGuard)> {
     })?;
 
     let env_filter = EnvFilter::from_default_env()
+        .add_directive("lp=info".parse()?)
         .add_directive("poly_lp=info".parse()?)
         .add_directive("pn_lp=info".parse()?)
         .add_directive("pn_polymarket=info".parse()?)

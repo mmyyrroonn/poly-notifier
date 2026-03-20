@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use pn_common::db::{
     insert_lp_control_action, insert_lp_heartbeat, insert_lp_position_snapshot, insert_lp_report,
     insert_lp_risk_event, upsert_lp_order, upsert_lp_trade,
@@ -58,6 +58,127 @@ pub struct ServiceConfig {
     pub max_quote_age: Duration,
 }
 
+const BOOK_ACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, PartialEq)]
+struct BookActivitySnapshot {
+    asset_id: String,
+    updates: u64,
+    avg_gap_ms: Option<i64>,
+    max_gap_ms: Option<i64>,
+    processing_lag_ms: i64,
+    min_top_depth: Decimal,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+}
+
+#[derive(Debug, Clone)]
+struct BookActivityWindow {
+    started_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+    updates: u64,
+    total_gap_ms: i64,
+    gap_samples: u64,
+    max_gap_ms: i64,
+}
+
+impl BookActivityWindow {
+    fn new(started_at: DateTime<Utc>) -> Self {
+        Self {
+            started_at,
+            last_seen_at: started_at,
+            updates: 0,
+            total_gap_ms: 0,
+            gap_samples: 0,
+            max_gap_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BookActivityTracker {
+    windows: HashMap<String, BookActivityWindow>,
+}
+
+impl BookActivityTracker {
+    fn record(
+        &mut self,
+        book: &BookSnapshot,
+        now: DateTime<Utc>,
+        log_interval: Duration,
+    ) -> Option<BookActivitySnapshot> {
+        let window = self
+            .windows
+            .entry(book.asset_id.clone())
+            .or_insert_with(|| BookActivityWindow::new(book.received_at));
+
+        if window.updates > 0 {
+            let gap_ms = (book.received_at - window.last_seen_at).num_milliseconds().max(0);
+            window.total_gap_ms += gap_ms;
+            window.gap_samples += 1;
+            window.max_gap_ms = window.max_gap_ms.max(gap_ms);
+        }
+
+        window.updates += 1;
+        window.last_seen_at = book.received_at;
+
+        let elapsed = now
+            .signed_duration_since(window.started_at)
+            .to_std()
+            .unwrap_or_default();
+        if elapsed < log_interval {
+            return None;
+        }
+
+        let snapshot = BookActivitySnapshot {
+            asset_id: book.asset_id.clone(),
+            updates: window.updates,
+            avg_gap_ms: (window.gap_samples > 0)
+                .then_some(window.total_gap_ms / window.gap_samples as i64),
+            max_gap_ms: (window.gap_samples > 0).then_some(window.max_gap_ms),
+            processing_lag_ms: now
+                .signed_duration_since(book.received_at)
+                .num_milliseconds()
+                .max(0),
+            min_top_depth: book.min_top_depth(),
+            best_bid: book.best_bid().map(|level| level.price),
+            best_ask: book.best_ask().map(|level| level.price),
+        };
+
+        *window = BookActivityWindow::new(book.received_at);
+
+        Some(snapshot)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LoopPostActions {
+    refresh_health_flags: bool,
+    apply_timer_risk: bool,
+    recompute_quotes: bool,
+    publish_snapshot: bool,
+}
+
+impl LoopPostActions {
+    fn quote_path() -> Self {
+        Self {
+            refresh_health_flags: true,
+            apply_timer_risk: false,
+            recompute_quotes: true,
+            publish_snapshot: true,
+        }
+    }
+
+    fn timer_quote_path() -> Self {
+        Self {
+            refresh_health_flags: true,
+            apply_timer_risk: true,
+            recompute_quotes: true,
+            publish_snapshot: true,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ExchangeAdapter: Send + Sync {
     fn start(&self, event_tx: mpsc::UnboundedSender<ExchangeEvent>, cancel: CancellationToken);
@@ -93,6 +214,8 @@ pub struct LpService {
     reporter: Option<Arc<dyn Reporter>>,
     control_rx: mpsc::UnboundedReceiver<ControlCommand>,
     snapshot_tx: watch::Sender<RuntimeState>,
+    book_activity: Mutex<BookActivityTracker>,
+    book_activity_log_interval: Duration,
 }
 
 impl LpService {
@@ -116,6 +239,8 @@ impl LpService {
                 reporter,
                 control_rx,
                 snapshot_tx,
+                book_activity: Mutex::new(BookActivityTracker::default()),
+                book_activity_log_interval: BOOK_ACTIVITY_LOG_INTERVAL,
             },
             LpControlHandle::new(control_tx, snapshot_rx),
         )
@@ -174,9 +299,11 @@ impl LpService {
         self.publish_snapshot(&state);
 
         loop {
+            let mut post_actions = LoopPostActions::default();
             tokio::select! {
                 () = cancel.cancelled() => break,
                 maybe_cmd = self.control_rx.recv() => {
+                    post_actions = LoopPostActions::quote_path();
                     match maybe_cmd {
                         Some(command) => {
                             if let Err(error) = self
@@ -190,6 +317,7 @@ impl LpService {
                     }
                 }
                 maybe_event = event_rx.recv() => {
+                    post_actions = LoopPostActions::quote_path();
                     match maybe_event {
                         Some(event) => {
                             if let Err(error) = self.handle_exchange_event(&mut state, event).await {
@@ -200,11 +328,13 @@ impl LpService {
                     }
                 }
                 _ = heartbeat_tick.tick() => {
+                    post_actions = LoopPostActions::timer_quote_path();
                     if let Err(error) = self.handle_heartbeat_tick(&mut state).await {
                         error!(?error, "heartbeat tick failed");
                     }
                 }
                 _ = reconcile_tick.tick() => {
+                    post_actions = LoopPostActions::timer_quote_path();
                     if let Err(error) = self.handle_reconciliation_tick(&mut state).await {
                         error!(?error, "reconciliation tick failed");
                     }
@@ -221,14 +351,22 @@ impl LpService {
                 }
             }
 
-            self.refresh_health_flags(&mut state);
-            if let Err(error) = self.apply_timer_risk(&mut state).await {
-                error!(?error, "timer risk check failed");
+            if post_actions.refresh_health_flags {
+                self.refresh_health_flags(&mut state);
             }
-            if let Err(error) = self.recompute_quotes(&mut state).await {
-                error!(?error, "quote recomputation failed");
+            if post_actions.apply_timer_risk {
+                if let Err(error) = self.apply_timer_risk(&mut state).await {
+                    error!(?error, "timer risk check failed");
+                }
             }
-            self.publish_snapshot(&state);
+            if post_actions.recompute_quotes {
+                if let Err(error) = self.recompute_quotes(&mut state).await {
+                    error!(?error, "quote recomputation failed");
+                }
+            }
+            if post_actions.publish_snapshot {
+                self.publish_snapshot(&state);
+            }
         }
 
         info!("LP service stopping");
@@ -387,6 +525,7 @@ impl LpService {
                 SignalAggregator.apply(state, signal_state);
                 self.log_signal_transitions(&before, &state.signals);
                 state.last_market_event_at = Some(now);
+                self.observe_book_activity(&book, now);
                 state.books.insert(book.asset_id.clone(), book);
             }
             ExchangeEvent::Order(order) => {
@@ -934,6 +1073,29 @@ impl LpService {
         }
     }
 
+    fn observe_book_activity(&self, book: &BookSnapshot, now: DateTime<Utc>) {
+        let snapshot = self
+            .book_activity
+            .lock()
+            .expect("book activity mutex")
+            .record(book, now, self.book_activity_log_interval);
+
+        if let Some(snapshot) = snapshot {
+            info!(
+                target: "lp.book",
+                asset_id = %snapshot.asset_id,
+                updates = snapshot.updates,
+                avg_gap_ms = snapshot.avg_gap_ms.unwrap_or_default(),
+                max_gap_ms = snapshot.max_gap_ms.unwrap_or_default(),
+                processing_lag_ms = snapshot.processing_lag_ms,
+                min_top_depth = %snapshot.min_top_depth,
+                best_bid = ?snapshot.best_bid,
+                best_ask = ?snapshot.best_ask,
+                "aggregated book activity"
+            );
+        }
+    }
+
     fn log_signal_transitions(
         &self,
         before: &HashMap<String, SignalState>,
@@ -1137,8 +1299,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        desired_quotes_match, flatten_reference_price, missing_open_orders, ExchangeAdapter,
-        ExchangeEvent, LpService, ReconciliationSnapshot, ServiceConfig,
+        desired_quotes_match, flatten_reference_price, missing_open_orders, BookActivityTracker,
+        ExchangeAdapter, ExchangeEvent, LpService, ReconciliationSnapshot, ServiceConfig,
     };
     use crate::control::ControlCommand;
     use crate::decision::DecisionConfig;
@@ -1249,6 +1411,59 @@ mod tests {
         assert_eq!(missing[0].order_id, "order-1");
     }
 
+    #[test]
+    fn book_activity_tracker_emits_aggregated_frequency_snapshot() {
+        let received_at = Utc::now();
+        let mut tracker = BookActivityTracker::default();
+        let mut book = BookSnapshot {
+            asset_id: "asset-yes".to_string(),
+            bids: vec![BookLevel {
+                price: dec!(0.40),
+                size: dec!(30),
+            }],
+            asks: vec![BookLevel {
+                price: dec!(0.46),
+                size: dec!(40),
+            }],
+            received_at,
+        };
+
+        assert!(tracker
+            .record(
+                &book,
+                received_at,
+                Duration::from_secs(1),
+            )
+            .is_none());
+
+        book.received_at = received_at + chrono::Duration::milliseconds(200);
+        assert!(tracker
+            .record(
+                &book,
+                received_at + chrono::Duration::milliseconds(200),
+                Duration::from_secs(1),
+            )
+            .is_none());
+
+        book.received_at = received_at + chrono::Duration::milliseconds(1200);
+        let snapshot = tracker
+            .record(
+                &book,
+                received_at + chrono::Duration::milliseconds(1210),
+                Duration::from_secs(1),
+            )
+            .expect("window snapshot");
+
+        assert_eq!(snapshot.asset_id, "asset-yes");
+        assert_eq!(snapshot.updates, 3);
+        assert_eq!(snapshot.avg_gap_ms, Some(600));
+        assert_eq!(snapshot.max_gap_ms, Some(1000));
+        assert_eq!(snapshot.processing_lag_ms, 10);
+        assert_eq!(snapshot.min_top_depth, dec!(30));
+        assert_eq!(snapshot.best_bid, Some(dec!(0.40)));
+        assert_eq!(snapshot.best_ask, Some(dec!(0.46)));
+    }
+
     #[derive(Default)]
     struct ReconcileErrorExchange {
         reconcile_calls: AtomicUsize,
@@ -1260,6 +1475,7 @@ mod tests {
         flatten_calls: Mutex<Vec<FlattenIntent>>,
         flatten_result: Option<TradeFill>,
         reconcile_snapshot: Mutex<Option<ReconciliationSnapshot>>,
+        start_events: Mutex<Vec<ExchangeEvent>>,
     }
 
     impl RecordingExchange {
@@ -1273,6 +1489,13 @@ mod tests {
         fn with_reconcile_snapshot(reconcile_snapshot: ReconciliationSnapshot) -> Self {
             Self {
                 reconcile_snapshot: Mutex::new(Some(reconcile_snapshot)),
+                ..Self::default()
+            }
+        }
+
+        fn with_start_events(start_events: Vec<ExchangeEvent>) -> Self {
+            Self {
+                start_events: Mutex::new(start_events),
                 ..Self::default()
             }
         }
@@ -1292,8 +1515,17 @@ mod tests {
             event_tx: mpsc::UnboundedSender<super::ExchangeEvent>,
             cancel: CancellationToken,
         ) {
+            let start_events = self
+                .start_events
+                .lock()
+                .expect("start events mutex")
+                .clone();
             tokio::spawn(async move {
-                let _event_tx = event_tx;
+                for event in start_events {
+                    if event_tx.send(event).is_err() {
+                        return;
+                    }
+                }
                 cancel.cancelled().await;
             });
         }
@@ -1554,6 +1786,65 @@ mod tests {
             .expect("flatten succeeded");
 
         assert!(!state.flags.flattening);
+    }
+
+    #[tokio::test]
+    async fn run_cancels_open_orders_immediately_after_shallow_book_event() {
+        let now = Utc::now();
+        let exchange = Arc::new(RecordingExchange::with_start_events(vec![ExchangeEvent::Book(
+            BookSnapshot {
+                asset_id: "asset-yes".to_string(),
+                bids: vec![BookLevel {
+                    price: dec!(0.40),
+                    size: dec!(5),
+                }],
+                asks: vec![BookLevel {
+                    price: dec!(0.46),
+                    size: dec!(100),
+                }],
+                received_at: now,
+            },
+        )]));
+        let pool = migrated_pool().await;
+        let mut initial_state = runtime_state_with_book();
+        initial_state.open_orders = vec![ManagedOrder {
+            order_id: "buy-1".to_string(),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Buy,
+            price: dec!(0.41),
+            size: dec!(10),
+            created_at: now,
+            status: "LIVE".to_string(),
+        }];
+        let mut config = service_config();
+        config.heartbeat_interval = Duration::from_secs(3600);
+        config.reconciliation_interval = Duration::from_secs(3600);
+        config.report_interval = Duration::from_secs(3600);
+        config.snapshot_interval = Duration::from_secs(3600);
+
+        let (service, control) = LpService::new(exchange.clone(), pool, config, None, initial_state);
+        let cancel = CancellationToken::new();
+        let service_cancel = cancel.clone();
+        let handle = tokio::spawn(async move { service.run(service_cancel).await });
+
+        timeout(Duration::from_secs(1), async {
+            while exchange.cancel_all_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancel-all triggered from book event");
+
+        let snapshot = control.snapshot();
+        assert!(snapshot.open_orders.is_empty());
+        assert_eq!(exchange.cancel_all_calls.load(Ordering::SeqCst), 1);
+
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("service task join")
+            .expect("service task panicked");
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
