@@ -72,27 +72,13 @@ impl RiskEngine {
     pub fn on_timer(&self, state: &RuntimeState, now: DateTime<Utc>) -> Vec<RiskAction> {
         if let Some(last_market_event_at) = state.last_market_event_at {
             if now - last_market_event_at > self.config.stale_feed_after {
-                return vec![
-                    RiskAction::Pause {
-                        reason: "market feed stale".to_string(),
-                    },
-                    RiskAction::CancelAll {
-                        reason: "market feed stale".to_string(),
-                    },
-                ];
+                return self.pause_and_cancel_if_needed(state, "market feed stale");
             }
         }
 
         if let Some(last_user_event_at) = state.last_user_event_at {
             if now - last_user_event_at > self.config.stale_feed_after {
-                return vec![
-                    RiskAction::Pause {
-                        reason: "user feed stale".to_string(),
-                    },
-                    RiskAction::CancelAll {
-                        reason: "user feed stale".to_string(),
-                    },
-                ];
+                return self.pause_and_cancel_if_needed(state, "user feed stale");
             }
         }
 
@@ -101,14 +87,7 @@ impl RiskEngine {
             .values()
             .any(|position| position.size.abs() > self.config.max_position);
         if out_of_bounds {
-            return vec![
-                RiskAction::Pause {
-                    reason: "position limit breached".to_string(),
-                },
-                RiskAction::CancelAll {
-                    reason: "position limit breached".to_string(),
-                },
-            ];
+            return self.pause_and_cancel_if_needed(state, "position limit breached");
         }
 
         if state.flags.paused
@@ -125,6 +104,26 @@ impl RiskEngine {
         }
 
         vec![RiskAction::None]
+    }
+
+    fn pause_and_cancel_if_needed(&self, state: &RuntimeState, reason: &str) -> Vec<RiskAction> {
+        let mut actions = Vec::new();
+        if !state.flags.paused {
+            actions.push(RiskAction::Pause {
+                reason: reason.to_string(),
+            });
+        }
+        if !state.open_orders.is_empty() {
+            actions.push(RiskAction::CancelAll {
+                reason: reason.to_string(),
+            });
+        }
+
+        if actions.is_empty() {
+            vec![RiskAction::None]
+        } else {
+            actions
+        }
     }
 }
 
@@ -260,7 +259,17 @@ mod tests {
     #[test]
     fn stale_market_feed_forces_pause_and_cancel() {
         let now = Utc::now();
-        let actions = engine().on_timer(&state_with_old_market_feed(), now);
+        let mut state = state_with_old_market_feed();
+        state.open_orders.push(crate::types::ManagedOrder {
+            order_id: "order-1".to_string(),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Buy,
+            price: dec!(0.40),
+            size: dec!(10),
+            created_at: now,
+            status: "LIVE".to_string(),
+        });
+        let actions = engine().on_timer(&state, now);
 
         assert_eq!(
             actions,
@@ -273,6 +282,17 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn stale_market_feed_is_noop_once_runtime_is_already_paused_and_cleared() {
+        let now = Utc::now();
+        let mut state = state_with_old_market_feed();
+        state.flags.paused = true;
+
+        let actions = engine().on_timer(&state, now);
+
+        assert_eq!(actions, vec![RiskAction::None]);
     }
 
     #[test]

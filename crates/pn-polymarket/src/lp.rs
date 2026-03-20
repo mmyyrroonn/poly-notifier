@@ -212,6 +212,7 @@ pub struct BootstrapState {
 
 #[derive(Debug, Clone)]
 pub struct ReconciliationState {
+    pub books: Vec<BookSnapshot>,
     pub open_orders: Vec<ManagedOrder>,
     pub positions: Vec<PositionSnapshot>,
     pub account: AccountSnapshot,
@@ -364,39 +365,7 @@ impl PolymarketExecutionClient {
             assets = self.asset_ids.len(),
             "bootstrapping market state"
         );
-        let mut requests = Vec::with_capacity(self.asset_ids.len());
-        for asset_id in self.asset_ids.iter() {
-            requests.push(
-                OrderBookSummaryRequest::builder()
-                    .token_id(*asset_id)
-                    .build(),
-            );
-        }
-        let books: Vec<BookSnapshot> = self
-            .clob
-            .order_books(&requests)
-            .await?
-            .into_iter()
-            .map(|book| BookSnapshot {
-                asset_id: book.asset_id.to_string(),
-                bids: book
-                    .bids
-                    .into_iter()
-                    .map(|level| BookLevel {
-                        price: level.price,
-                        size: level.size,
-                    })
-                    .collect(),
-                asks: book
-                    .asks
-                    .into_iter()
-                    .map(|level| BookLevel {
-                        price: level.price,
-                        size: level.size,
-                    })
-                    .collect(),
-            })
-            .collect();
+        let books = self.fetch_books().await?;
         let reconcile = self.reconcile().await?;
 
         info!(
@@ -554,6 +523,7 @@ impl PolymarketExecutionClient {
     }
 
     pub async fn reconcile(&self) -> Result<ReconciliationState> {
+        let books = self.fetch_books().await?;
         let open_orders = self.fetch_open_orders().await?;
         let positions = self.fetch_positions().await?;
         let account = self.fetch_account_snapshot().await?;
@@ -561,6 +531,7 @@ impl PolymarketExecutionClient {
         info!(
             target: "pn_polymarket::execution",
             condition_id = %self.market.condition_id,
+            books = books.len(),
             open_orders = open_orders.len(),
             positions = positions.len(),
             usdc_balance = %account.usdc_balance,
@@ -568,6 +539,7 @@ impl PolymarketExecutionClient {
         );
 
         Ok(ReconciliationState {
+            books,
             open_orders,
             positions,
             account,
@@ -835,6 +807,43 @@ impl PolymarketExecutionClient {
         }
 
         Ok(orders)
+    }
+
+    async fn fetch_books(&self) -> Result<Vec<BookSnapshot>> {
+        let mut requests = Vec::with_capacity(self.asset_ids.len());
+        for asset_id in self.asset_ids.iter() {
+            requests.push(
+                OrderBookSummaryRequest::builder()
+                    .token_id(*asset_id)
+                    .build(),
+            );
+        }
+
+        Ok(self
+            .clob
+            .order_books(&requests)
+            .await?
+            .into_iter()
+            .map(|book| BookSnapshot {
+                asset_id: book.asset_id.to_string(),
+                bids: book
+                    .bids
+                    .into_iter()
+                    .map(|level| BookLevel {
+                        price: level.price,
+                        size: level.size,
+                    })
+                    .collect(),
+                asks: book
+                    .asks
+                    .into_iter()
+                    .map(|level| BookLevel {
+                        price: level.price,
+                        size: level.size,
+                    })
+                    .collect(),
+            })
+            .collect())
     }
 
     async fn fetch_positions(&self) -> Result<Vec<PositionSnapshot>> {

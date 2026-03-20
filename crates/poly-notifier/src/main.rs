@@ -103,6 +103,30 @@ impl ExchangeAdapter for LiveExchangeAdapter {
     async fn reconcile(&self) -> Result<ReconciliationSnapshot> {
         let snapshot = self.client.reconcile().await?;
         Ok(ReconciliationSnapshot {
+            books: snapshot
+                .books
+                .into_iter()
+                .map(|book| pn_lp::BookSnapshot {
+                    asset_id: book.asset_id,
+                    bids: book
+                        .bids
+                        .into_iter()
+                        .map(|level| pn_lp::types::BookLevel {
+                            price: level.price,
+                            size: level.size,
+                        })
+                        .collect(),
+                    asks: book
+                        .asks
+                        .into_iter()
+                        .map(|level| pn_lp::types::BookLevel {
+                            price: level.price,
+                            size: level.size,
+                        })
+                        .collect(),
+                    received_at: Utc::now(),
+                })
+                .collect(),
             open_orders: snapshot
                 .open_orders
                 .into_iter()

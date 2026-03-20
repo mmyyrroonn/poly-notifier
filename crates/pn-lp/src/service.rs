@@ -40,6 +40,7 @@ pub enum ExchangeEvent {
 
 #[derive(Debug, Clone)]
 pub struct ReconciliationSnapshot {
+    pub books: Vec<BookSnapshot>,
     pub open_orders: Vec<ManagedOrder>,
     pub positions: Vec<PositionSnapshot>,
     pub account: AccountSnapshot,
@@ -475,6 +476,12 @@ impl LpService {
         let snapshot = self.exchange.reconcile().await?;
         let reconciled_missing_orders =
             missing_open_orders(&previous_open_orders, &snapshot.open_orders);
+        if !snapshot.books.is_empty() {
+            for book in snapshot.books {
+                state.books.insert(book.asset_id.clone(), book);
+            }
+            state.last_market_event_at = Some(Utc::now());
+        }
         state.account = snapshot.account;
         state.positions = snapshot
             .positions
@@ -552,11 +559,7 @@ impl LpService {
                         .await?;
                 }
                 RiskAction::Flatten(mut intent) => {
-                    intent.price = flatten_reference_price(
-                        state,
-                        &intent.asset_id,
-                        intent.price,
-                    );
+                    intent.price = flatten_reference_price(state, &intent.asset_id, intent.price);
                     insert_lp_control_action(
                         &self.pool,
                         "flatten",
@@ -1261,12 +1264,20 @@ mod tests {
         cancel_all_calls: AtomicUsize,
         flatten_calls: Mutex<Vec<FlattenIntent>>,
         flatten_result: Option<TradeFill>,
+        reconcile_snapshot: Mutex<Option<ReconciliationSnapshot>>,
     }
 
     impl RecordingExchange {
         fn with_flatten_result(flatten_result: Option<TradeFill>) -> Self {
             Self {
                 flatten_result,
+                ..Self::default()
+            }
+        }
+
+        fn with_reconcile_snapshot(reconcile_snapshot: ReconciliationSnapshot) -> Self {
+            Self {
+                reconcile_snapshot: Mutex::new(Some(reconcile_snapshot)),
                 ..Self::default()
             }
         }
@@ -1293,15 +1304,21 @@ mod tests {
         }
 
         async fn reconcile(&self) -> Result<ReconciliationSnapshot> {
-            Ok(ReconciliationSnapshot {
-                open_orders: Vec::new(),
-                positions: Vec::new(),
-                account: AccountSnapshot {
-                    usdc_balance: dec!(0),
-                    token_balances: HashMap::new(),
-                    updated_at: Utc::now(),
-                },
-            })
+            Ok(self
+                .reconcile_snapshot
+                .lock()
+                .expect("reconcile snapshot mutex")
+                .clone()
+                .unwrap_or_else(|| ReconciliationSnapshot {
+                    books: Vec::new(),
+                    open_orders: Vec::new(),
+                    positions: Vec::new(),
+                    account: AccountSnapshot {
+                        usdc_balance: dec!(0),
+                        token_balances: HashMap::new(),
+                        updated_at: Utc::now(),
+                    },
+                }))
         }
 
         async fn post_quotes(&self, _quotes: &[QuoteIntent]) -> Result<Vec<ManagedOrder>> {
@@ -1461,6 +1478,52 @@ mod tests {
         assert_eq!(position.avg_price, dec!(0.4264864864864864864864864865));
         assert_eq!(exchange.flatten_calls().len(), 1);
         assert_eq!(exchange.flatten_calls()[0].size, dec!(37));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_refreshes_market_books_and_timestamp() {
+        let now = Utc::now();
+        let exchange = Arc::new(RecordingExchange::with_reconcile_snapshot(
+            ReconciliationSnapshot {
+                books: vec![BookSnapshot {
+                    asset_id: "asset-yes".to_string(),
+                    bids: vec![BookLevel {
+                        price: dec!(0.41),
+                        size: dec!(120),
+                    }],
+                    asks: vec![BookLevel {
+                        price: dec!(0.47),
+                        size: dec!(130),
+                    }],
+                    received_at: now,
+                }],
+                open_orders: Vec::new(),
+                positions: Vec::new(),
+                account: AccountSnapshot {
+                    usdc_balance: dec!(250),
+                    token_balances: HashMap::new(),
+                    updated_at: now,
+                },
+            },
+        ));
+        let pool = migrated_pool().await;
+        let mut state = runtime_state_with_book();
+        let stale_at = now - chrono::Duration::seconds(30);
+        state.last_market_event_at = Some(stale_at);
+        let (service, _) = LpService::new(exchange, pool, service_config(), None, state.clone());
+
+        service
+            .handle_reconciliation_tick(&mut state)
+            .await
+            .expect("reconciliation handled");
+
+        let refreshed_book = state.books.get("asset-yes").expect("book refreshed");
+        assert_eq!(refreshed_book.bids[0].price, dec!(0.41));
+        assert_eq!(refreshed_book.asks[0].price, dec!(0.47));
+        assert!(state
+            .last_market_event_at
+            .is_some_and(|timestamp| timestamp > stale_at));
+        assert_eq!(state.account.usdc_balance, dec!(250));
     }
 
     #[tokio::test]
