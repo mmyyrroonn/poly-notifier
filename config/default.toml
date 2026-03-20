@@ -38,6 +38,7 @@ auto_split_on_startup = false
 startup_split_amount = 0.0
 
 [lp.strategy]
+quote_mode = "inside"
 quote_size = 25
 min_spread = 0.01
 min_depth = 25.0

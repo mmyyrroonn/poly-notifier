@@ -55,11 +55,15 @@ pub struct BookSnapshot {
 
 impl BookSnapshot {
     pub fn best_bid(&self) -> Option<&BookLevel> {
-        self.bids.first()
+        self.bids
+            .iter()
+            .max_by(|left, right| left.price.cmp(&right.price))
     }
 
     pub fn best_ask(&self) -> Option<&BookLevel> {
-        self.asks.first()
+        self.asks
+            .iter()
+            .min_by(|left, right| left.price.cmp(&right.price))
     }
 
     pub fn min_top_depth(&self) -> Decimal {

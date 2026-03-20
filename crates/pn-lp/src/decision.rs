@@ -1,9 +1,34 @@
+use std::str::FromStr;
+
 use rust_decimal::Decimal;
 
 use crate::types::{QuoteIntent, RuntimeState};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteMode {
+    Join,
+    Inside,
+    Outside,
+}
+
+impl FromStr for QuoteMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "join" => Ok(Self::Join),
+            "inside" => Ok(Self::Inside),
+            "outside" => Ok(Self::Outside),
+            other => Err(format!(
+                "unsupported quote mode '{other}'; expected one of: join, inside, outside"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DecisionConfig {
+    pub quote_mode: QuoteMode,
     pub quote_size: Decimal,
     pub min_spread: Decimal,
     pub min_depth: Decimal,
@@ -71,9 +96,8 @@ impl DecisionEngine {
                 continue;
             }
 
-            let tick_offset = token.tick_size * Decimal::from(self.config.quote_offset_ticks);
-            let buy_price = (best_bid.price + tick_offset).min(best_ask.price - token.tick_size);
-            let sell_price = (best_ask.price - tick_offset).max(best_bid.price + token.tick_size);
+            let (buy_price, sell_price) =
+                self.quote_prices(best_bid.price, best_ask.price, token.tick_size);
 
             if buy_price >= sell_price {
                 continue;
@@ -113,6 +137,27 @@ impl DecisionEngine {
             reason,
         }
     }
+
+    fn quote_prices(
+        &self,
+        best_bid_price: Decimal,
+        best_ask_price: Decimal,
+        tick_size: Decimal,
+    ) -> (Decimal, Decimal) {
+        let tick_offset = tick_size * Decimal::from(self.config.quote_offset_ticks);
+
+        match self.config.quote_mode {
+            QuoteMode::Join => (best_bid_price, best_ask_price),
+            QuoteMode::Inside => (
+                (best_bid_price + tick_offset).min(best_ask_price - tick_size),
+                (best_ask_price - tick_offset).max(best_bid_price + tick_size),
+            ),
+            QuoteMode::Outside => (
+                (best_bid_price - tick_offset).max(tick_size),
+                (best_ask_price + tick_offset).min(Decimal::ONE - tick_size),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -123,11 +168,23 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    use super::{DecisionConfig, DecisionEngine};
+    use super::{DecisionConfig, DecisionEngine, QuoteMode};
     use crate::types::{
         AccountSnapshot, BookLevel, BookSnapshot, MarketMetadata, PositionSnapshot, RuntimeFlags,
         RuntimeState, SignalState, TokenMetadata,
     };
+
+    fn decision_config(quote_mode: QuoteMode, quote_offset_ticks: u32) -> DecisionConfig {
+        DecisionConfig {
+            quote_mode,
+            quote_size: dec!(10),
+            min_spread: dec!(0.01),
+            min_depth: dec!(20),
+            quote_offset_ticks,
+            min_usdc_balance: dec!(50),
+            min_token_balance: dec!(10),
+        }
+    }
 
     fn test_state() -> RuntimeState {
         let now = Utc::now();
@@ -202,14 +259,7 @@ mod tests {
 
     #[test]
     fn generates_bid_and_ask_when_market_is_quoteable() {
-        let engine = DecisionEngine::new(DecisionConfig {
-            quote_size: dec!(10),
-            min_spread: dec!(0.01),
-            min_depth: dec!(20),
-            quote_offset_ticks: 1,
-            min_usdc_balance: dec!(50),
-            min_token_balance: dec!(10),
-        });
+        let engine = DecisionEngine::new(decision_config(QuoteMode::Inside, 1));
 
         let outcome = engine.evaluate(&test_state());
 
@@ -221,14 +271,7 @@ mod tests {
 
     #[test]
     fn generated_quotes_remain_tick_aligned() {
-        let engine = DecisionEngine::new(DecisionConfig {
-            quote_size: dec!(10),
-            min_spread: dec!(0.01),
-            min_depth: dec!(20),
-            quote_offset_ticks: 1,
-            min_usdc_balance: dec!(50),
-            min_token_balance: dec!(10),
-        });
+        let engine = DecisionEngine::new(decision_config(QuoteMode::Inside, 1));
         let state = test_state();
         let tick_size = state.market.tokens[0].tick_size;
 
@@ -241,15 +284,62 @@ mod tests {
     }
 
     #[test]
+    fn generated_quotes_use_true_top_of_book_when_levels_are_unsorted() {
+        let engine = DecisionEngine::new(decision_config(QuoteMode::Inside, 2));
+        let mut state = test_state();
+        state.books.get_mut("asset-yes").unwrap().bids = vec![
+            BookLevel {
+                price: dec!(0.01),
+                size: dec!(100),
+            },
+            BookLevel {
+                price: dec!(0.26),
+                size: dec!(100),
+            },
+        ];
+        state.books.get_mut("asset-yes").unwrap().asks = vec![
+            BookLevel {
+                price: dec!(0.99),
+                size: dec!(120),
+            },
+            BookLevel {
+                price: dec!(0.27),
+                size: dec!(120),
+            },
+        ];
+
+        let outcome = engine.evaluate(&state);
+
+        assert_eq!(outcome.desired_quotes.len(), 2);
+        assert_eq!(outcome.desired_quotes[0].price, dec!(0.26));
+        assert_eq!(outcome.desired_quotes[1].price, dec!(0.27));
+    }
+
+    #[test]
+    fn join_mode_quotes_at_top_of_book() {
+        let engine = DecisionEngine::new(decision_config(QuoteMode::Join, 2));
+
+        let outcome = engine.evaluate(&test_state());
+
+        assert_eq!(outcome.desired_quotes.len(), 2);
+        assert_eq!(outcome.desired_quotes[0].price, dec!(0.40));
+        assert_eq!(outcome.desired_quotes[1].price, dec!(0.45));
+    }
+
+    #[test]
+    fn outside_mode_quotes_away_from_top_of_book() {
+        let engine = DecisionEngine::new(decision_config(QuoteMode::Outside, 2));
+
+        let outcome = engine.evaluate(&test_state());
+
+        assert_eq!(outcome.desired_quotes.len(), 2);
+        assert_eq!(outcome.desired_quotes[0].price, dec!(0.38));
+        assert_eq!(outcome.desired_quotes[1].price, dec!(0.47));
+    }
+
+    #[test]
     fn cancels_everything_when_manual_pause_or_signal_block_is_active() {
-        let engine = DecisionEngine::new(DecisionConfig {
-            quote_size: dec!(10),
-            min_spread: dec!(0.01),
-            min_depth: dec!(20),
-            quote_offset_ticks: 1,
-            min_usdc_balance: dec!(50),
-            min_token_balance: dec!(10),
-        });
+        let engine = DecisionEngine::new(decision_config(QuoteMode::Inside, 1));
         let mut state = test_state();
         state.flags.paused = true;
         state.open_orders = vec![];

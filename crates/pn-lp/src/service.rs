@@ -1405,6 +1405,7 @@ mod tests {
     fn service_config() -> ServiceConfig {
         ServiceConfig {
             decision: DecisionConfig {
+                quote_mode: crate::decision::QuoteMode::Inside,
                 quote_size: dec!(10),
                 min_spread: dec!(0.01),
                 min_depth: dec!(20),

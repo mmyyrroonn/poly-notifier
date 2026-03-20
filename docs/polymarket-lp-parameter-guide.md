@@ -171,16 +171,26 @@ LP service 主要接三类输入：
 1. 必须有双边盘口
 2. `spread >= min_spread`
 3. 顶档深度 `>= min_depth`
-4. 根据 tick size 和 `quote_offset_ticks` 计算买卖价
+4. 根据 `quote_mode`、tick size 和 `quote_offset_ticks` 计算买卖价
 5. 如果 USDC 足够，则生成该 token 的买单
 6. 如果该 token 库存足够，则生成该 token 的卖单
 
-当前报价公式：
+当前支持三种报价模式：
 
-- `buy_price = best_bid + quote_offset_ticks * tick_size`
-- `sell_price = best_ask - quote_offset_ticks * tick_size`
+- `join`
+  - `buy_price = best_bid`
+  - `sell_price = best_ask`
+- `inside`
+  - `buy_price = best_bid + quote_offset_ticks * tick_size`
+  - `sell_price = best_ask - quote_offset_ticks * tick_size`
+- `outside`
+  - `buy_price = best_bid - quote_offset_ticks * tick_size`
+  - `sell_price = best_ask + quote_offset_ticks * tick_size`
 
-同时还会做价格钳制，避免穿价。
+同时会做价格钳制：
+
+- `inside` 模式避免穿价，保持 `post_only`
+- `outside` 模式避免跑到小于最小 tick 或大于 `1 - tick`
 
 ### 3.6 执行层怎么下单
 
@@ -333,6 +343,10 @@ flatten 用的是：
 
 ### 4.9 `[lp.strategy]`
 
+- `quote_mode`
+  - `join`：挂在 `best_bid / best_ask`
+  - `inside`：往中间收，更积极的 maker quote
+  - `outside`：往外放，更保守、更不容易成交
 - `quote_size`
   - 每张报价单的 size
   - 当前买卖两边共用一个值
@@ -342,8 +356,9 @@ flatten 用的是：
   - 只有当顶档深度足够厚才报价
   - 代码里用的是 `min(top_bid_size, top_ask_size)`
 - `quote_offset_ticks`
-  - 报价离 best bid / best ask 内缩多少个 tick
-  - 越大越保守，越不容易被立刻打到
+  - 报价偏移多少个 tick
+  - 在 `inside` 模式下，值越大越靠近中间价
+  - 在 `outside` 模式下，值越大越远离盘口
 - `max_quote_age_secs`
   - 挂单超过这个年龄，即使目标报价没变，也会刷新
 - `default_external_signal`
@@ -420,6 +435,7 @@ flatten 用的是：
 
 并且参数是：
 
+- `quote_mode = "inside"`
 - `quote_size = 25`
 - `min_spread = 0.01`
 - `min_depth = 25`

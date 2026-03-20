@@ -22,8 +22,8 @@ use pn_common::db::init_db;
 use pn_lp::types::SignalState;
 use pn_lp::{
     AccountSnapshot, ExchangeAdapter, ExchangeEvent, FlattenIntent, LpService, ManagedOrder,
-    MarketMetadata, PositionSnapshot, QuoteIntent, QuoteSide, ReconciliationSnapshot, Reporter,
-    RuntimeFlags, RuntimeState, ServiceConfig, TokenMetadata, TradeFill,
+    MarketMetadata, PositionSnapshot, QuoteIntent, QuoteMode, QuoteSide, ReconciliationSnapshot,
+    Reporter, RuntimeFlags, RuntimeState, ServiceConfig, TokenMetadata, TradeFill,
 };
 use pn_notify::telegram::BotRegistry;
 use pn_polymarket::{
@@ -460,8 +460,16 @@ fn build_reporter(config: &AppConfig, bot_registry: Arc<BotRegistry>) -> Option<
 }
 
 fn build_service_config(config: &AppConfig) -> Result<ServiceConfig> {
+    let quote_mode = QuoteMode::from_str(&config.lp.strategy.quote_mode).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid lp.strategy.quote_mode '{}': {error}",
+            config.lp.strategy.quote_mode
+        )
+    })?;
+
     Ok(ServiceConfig {
         decision: pn_lp::DecisionConfig {
+            quote_mode,
             quote_size: decimal(config.lp.strategy.quote_size)?,
             min_spread: decimal(config.lp.strategy.min_spread)?,
             min_depth: decimal(config.lp.strategy.min_depth)?,
@@ -684,8 +692,8 @@ mod tests {
     };
 
     use super::{
-        build_initial_state, decimal, ensure_rustls_crypto_provider, map_flatten_fill,
-        validate_condition_id,
+        build_initial_state, build_service_config, decimal, ensure_rustls_crypto_provider,
+        map_flatten_fill, validate_condition_id, QuoteMode,
     };
 
     #[test]
@@ -762,6 +770,7 @@ mod tests {
                     startup_split_amount: 0.0,
                 },
                 strategy: LpStrategyConfig {
+                    quote_mode: "inside".to_string(),
                     quote_size: 10.0,
                     min_spread: 0.01,
                     min_depth: 50.0,
@@ -849,5 +858,175 @@ mod tests {
         assert!(state.flags.user_feed_healthy);
         assert!(state.last_market_event_at.is_none());
         assert!(state.last_user_event_at.is_some());
+    }
+
+    #[test]
+    fn build_service_config_maps_quote_mode_from_config() {
+        let config = AppConfig {
+            database: DatabaseConfig {
+                url: "sqlite::memory:".to_string(),
+                max_connections: 1,
+            },
+            telegram: TelegramConfig {
+                rate_limit_per_user: 60,
+            },
+            monitor: MonitorConfig {
+                subscription_refresh_interval_secs: 60,
+                ws_ping_interval_secs: 30,
+                reconnect_base_delay_secs: 1,
+                reconnect_max_delay_secs: 60,
+            },
+            alert: AlertConfig {
+                cache_refresh_interval_secs: 60,
+                default_cooldown_minutes: 5,
+                price_flush_interval_secs: 30,
+            },
+            scheduler: SchedulerConfig {
+                daily_summary_cron: "0 0 9 * * *".to_string(),
+            },
+            admin: AdminConfig { port: 3000 },
+            lp: LpConfig {
+                trading: LpTradingConfig {
+                    condition_id: "0xabc".to_string(),
+                    clob_base_url: "https://clob.example".to_string(),
+                    gamma_base_url: "https://gamma.example".to_string(),
+                    data_api_base_url: "https://data.example".to_string(),
+                    chain_id: 137,
+                },
+                inventory: LpInventoryConfig {
+                    min_usdc_balance: 100.0,
+                    min_token_balance: 10.0,
+                    auto_split_on_startup: false,
+                    startup_split_amount: 0.0,
+                },
+                strategy: LpStrategyConfig {
+                    quote_mode: "outside".to_string(),
+                    quote_size: 10.0,
+                    min_spread: 0.01,
+                    min_depth: 50.0,
+                    quote_offset_ticks: 1,
+                    max_quote_age_secs: 10,
+                    default_external_signal: true,
+                },
+                risk: LpRiskConfig {
+                    max_position: 100.0,
+                    flat_position_tolerance: 1.0,
+                    auto_flatten_after_fill: true,
+                    flatten_use_fok: false,
+                    stale_feed_after_secs: 15,
+                },
+                approvals: LpApprovalConfig {
+                    require_on_startup: true,
+                    auto_approve_on_startup: false,
+                },
+                reporting: LpReportingConfig {
+                    operator_bot_id: None,
+                    operator_chat_ids: Vec::new(),
+                    summary_interval_secs: 60,
+                },
+                control: LpControlConfig {
+                    bind_addr: "127.0.0.1".to_string(),
+                    heartbeat_interval_secs: 30,
+                    reconciliation_interval_secs: 30,
+                },
+                logging: LpLoggingConfig {
+                    snapshot_interval_secs: 60,
+                    directory: "logs".to_string(),
+                    file_prefix: "lp".to_string(),
+                    max_files: 3,
+                    json: true,
+                },
+            },
+        };
+
+        let service_config = build_service_config(&config).expect("service config");
+
+        assert_eq!(service_config.decision.quote_mode, QuoteMode::Outside);
+    }
+
+    #[test]
+    fn build_service_config_rejects_unknown_quote_mode() {
+        let config = AppConfig {
+            database: DatabaseConfig {
+                url: "sqlite::memory:".to_string(),
+                max_connections: 1,
+            },
+            telegram: TelegramConfig {
+                rate_limit_per_user: 60,
+            },
+            monitor: MonitorConfig {
+                subscription_refresh_interval_secs: 60,
+                ws_ping_interval_secs: 30,
+                reconnect_base_delay_secs: 1,
+                reconnect_max_delay_secs: 60,
+            },
+            alert: AlertConfig {
+                cache_refresh_interval_secs: 60,
+                default_cooldown_minutes: 5,
+                price_flush_interval_secs: 30,
+            },
+            scheduler: SchedulerConfig {
+                daily_summary_cron: "0 0 9 * * *".to_string(),
+            },
+            admin: AdminConfig { port: 3000 },
+            lp: LpConfig {
+                trading: LpTradingConfig {
+                    condition_id: "0xabc".to_string(),
+                    clob_base_url: "https://clob.example".to_string(),
+                    gamma_base_url: "https://gamma.example".to_string(),
+                    data_api_base_url: "https://data.example".to_string(),
+                    chain_id: 137,
+                },
+                inventory: LpInventoryConfig {
+                    min_usdc_balance: 100.0,
+                    min_token_balance: 10.0,
+                    auto_split_on_startup: false,
+                    startup_split_amount: 0.0,
+                },
+                strategy: LpStrategyConfig {
+                    quote_mode: "far_away".to_string(),
+                    quote_size: 10.0,
+                    min_spread: 0.01,
+                    min_depth: 50.0,
+                    quote_offset_ticks: 1,
+                    max_quote_age_secs: 10,
+                    default_external_signal: true,
+                },
+                risk: LpRiskConfig {
+                    max_position: 100.0,
+                    flat_position_tolerance: 1.0,
+                    auto_flatten_after_fill: true,
+                    flatten_use_fok: false,
+                    stale_feed_after_secs: 15,
+                },
+                approvals: LpApprovalConfig {
+                    require_on_startup: true,
+                    auto_approve_on_startup: false,
+                },
+                reporting: LpReportingConfig {
+                    operator_bot_id: None,
+                    operator_chat_ids: Vec::new(),
+                    summary_interval_secs: 60,
+                },
+                control: LpControlConfig {
+                    bind_addr: "127.0.0.1".to_string(),
+                    heartbeat_interval_secs: 30,
+                    reconciliation_interval_secs: 30,
+                },
+                logging: LpLoggingConfig {
+                    snapshot_interval_secs: 60,
+                    directory: "logs".to_string(),
+                    file_prefix: "lp".to_string(),
+                    max_files: 3,
+                    json: true,
+                },
+            },
+        };
+
+        let error = build_service_config(&config).expect_err("invalid quote mode should fail");
+
+        assert!(error
+            .to_string()
+            .contains("invalid lp.strategy.quote_mode 'far_away'"));
     }
 }

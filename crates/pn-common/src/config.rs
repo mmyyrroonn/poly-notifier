@@ -112,6 +112,9 @@ pub struct LpInventoryConfig {
 /// are covered by unit tests in `poly-notifier/src/main.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LpStrategyConfig {
+    /// Quote placement mode: join, inside, or outside.
+    #[serde(default = "default_quote_mode")]
+    pub quote_mode: String,
     /// Passive quote size per order.
     pub quote_size: f64,
     /// Minimum top-of-book spread required before quoting.
@@ -125,6 +128,10 @@ pub struct LpStrategyConfig {
     /// Keep the external signal gate on by default until a real feed is added.
     #[serde(default = "default_true")]
     pub default_external_signal: bool,
+}
+
+fn default_quote_mode() -> String {
+    "inside".to_string()
 }
 
 /// Runtime safety controls.
