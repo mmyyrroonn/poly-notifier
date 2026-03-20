@@ -1022,14 +1022,9 @@ fn desired_quotes_match(
         }
 
         let matched = outcome.desired_quotes.iter().any(|quote| {
-            let tick_tolerance = state
-                .market
-                .token(&order.asset_id)
-                .map(|token| token.tick_size)
-                .unwrap_or(Decimal::ZERO);
             quote.asset_id == order.asset_id
                 && quote.side == order.side
-                && (quote.price - order.price).abs() <= tick_tolerance
+                && quote.price == order.price
                 && quote.size == order.size
         });
         if !matched {
@@ -1653,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn desired_quotes_match_tolerates_one_tick_price_difference() {
+    fn desired_quotes_match_rejects_one_tick_price_difference() {
         let mut state = runtime_state_with_book();
         let now = Utc::now();
         state.open_orders = vec![ManagedOrder {
@@ -1677,7 +1672,7 @@ mod tests {
             reason: "test".to_string(),
         };
 
-        assert!(desired_quotes_match(
+        assert!(!desired_quotes_match(
             &state,
             &outcome,
             Duration::from_secs(10),
