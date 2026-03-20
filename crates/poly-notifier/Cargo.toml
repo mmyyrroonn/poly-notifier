@@ -27,3 +27,4 @@ rust_decimal = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 teloxide = { workspace = true }
+rustls = "0.23"

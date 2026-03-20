@@ -22,13 +22,61 @@ use polymarket_client_sdk::data;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_client_sdk::data::types::MarketFilter;
 use polymarket_client_sdk::types::{Address, Decimal, B256, U256};
-use polymarket_client_sdk::{contract_config, PRIVATE_KEY_VAR};
+use polymarket_client_sdk::{
+    contract_config, derive_proxy_wallet, derive_safe_wallet, PRIVATE_KEY_VAR,
+};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 const DEFAULT_POLYGON_RPC_URL: &str = "https://polygon-rpc.com";
+const INITIAL_OPEN_ORDERS_CURSOR: &str = "MA==";
+const TERMINAL_OPEN_ORDERS_CURSOR: &str = "LTE=";
+const FUNDER_ADDRESS_VAR: &str = "POLYMARKET_FUNDER_ADDRESS";
+const SIGNATURE_TYPE_VAR: &str = "POLYMARKET_SIGNATURE_TYPE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TradingAccountKind {
+    Eoa,
+    Proxy,
+    GnosisSafe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TradingAccount {
+    signer: Address,
+    funder: Option<Address>,
+    kind: TradingAccountKind,
+}
+
+impl TradingAccountKind {
+    fn signature_type(self) -> SignatureType {
+        match self {
+            Self::Eoa => SignatureType::Eoa,
+            Self::Proxy => SignatureType::Proxy,
+            Self::GnosisSafe => SignatureType::GnosisSafe,
+        }
+    }
+
+    fn requires_onchain_approvals(self) -> bool {
+        matches!(self, Self::Eoa)
+    }
+}
+
+impl TradingAccount {
+    fn trading_address(self) -> Address {
+        self.funder.unwrap_or(self.signer)
+    }
+
+    fn signature_type(self) -> SignatureType {
+        self.kind.signature_type()
+    }
+
+    fn requires_onchain_approvals(self) -> bool {
+        self.kind.requires_onchain_approvals()
+    }
+}
 
 sol! {
     #[sol(rpc)]
@@ -190,6 +238,7 @@ pub enum StreamEvent {
 pub struct PolymarketExecutionClient {
     config: ExecutionConfig,
     signer: PrivateKeySigner,
+    account: TradingAccount,
     clob: clob::Client<
         polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
     >,
@@ -201,7 +250,6 @@ pub struct PolymarketExecutionClient {
     condition_id: B256,
     market: Arc<MarketMetadata>,
     asset_ids: Arc<Vec<U256>>,
-    wallet_address: Address,
     exchange_contract: Address,
     collateral_token: Address,
     conditional_tokens: Address,
@@ -221,15 +269,25 @@ impl PolymarketExecutionClient {
         let private_key = env::var(PRIVATE_KEY_VAR)
             .with_context(|| format!("{PRIVATE_KEY_VAR} environment variable is required"))?;
         let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(config.chain_id));
+        let funder_address = env::var(FUNDER_ADDRESS_VAR).ok();
+        let signature_type = env::var(SIGNATURE_TYPE_VAR).ok();
+        let account = resolve_trading_account(
+            signer.address(),
+            config.chain_id,
+            funder_address.as_deref(),
+            signature_type.as_deref(),
+        )?;
 
         let clob_config = clob::Config::builder()
             .heartbeat_interval(Duration::from_secs(5))
             .build();
-        let mut clob = clob::Client::new(&config.clob_base_url, clob_config)?
+        let mut auth = clob::Client::new(&config.clob_base_url, clob_config)?
             .authentication_builder(&signer)
-            .signature_type(SignatureType::Eoa)
-            .authenticate()
-            .await?;
+            .signature_type(account.signature_type());
+        if let Some(funder) = account.funder {
+            auth = auth.funder(funder);
+        }
+        let mut clob = auth.authenticate().await?;
 
         if clob.heartbeats_active() {
             clob.stop_heartbeats().await?;
@@ -275,12 +333,16 @@ impl PolymarketExecutionClient {
             condition_id = %config.condition_id,
             question = %market.question,
             tokens = market.tokens.len(),
+            signer = %account.signer,
+            trading_address = %account.trading_address(),
+            signature_type = ?account.signature_type(),
             "Polymarket execution client connected"
         );
 
         Ok(Self {
             config,
             signer,
+            account,
             clob,
             market_ws,
             user_ws,
@@ -288,7 +350,6 @@ impl PolymarketExecutionClient {
             condition_id,
             market,
             asset_ids: Arc::new(asset_ids),
-            wallet_address: address,
             exchange_contract: contracts.exchange,
             collateral_token: contracts.collateral,
             conditional_tokens: contracts.conditional_tokens,
@@ -358,10 +419,22 @@ impl PolymarketExecutionClient {
     }
 
     pub async fn check_approvals(&self, include_inventory: bool) -> Result<ApprovalStatus> {
+        if !self.account.requires_onchain_approvals() {
+            info!(
+                target: "pn_polymarket::execution",
+                trading_address = %self.account.trading_address(),
+                signature_type = ?self.account.signature_type(),
+                "skipping on-chain approval checks for proxy or safe trading account"
+            );
+            return Ok(ApprovalStatus {
+                targets: Vec::new(),
+            });
+        }
+
         let rpc_url = rpc_url();
         info!(
             target: "pn_polymarket::execution",
-            wallet = %self.wallet_address,
+            wallet = %self.account.trading_address(),
             rpc_url = %rpc_url,
             include_inventory,
             "checking on-chain approvals"
@@ -378,13 +451,13 @@ impl PolymarketExecutionClient {
         for target in self.approval_targets(include_inventory) {
             let usdc_allowance_ready = if target.require_usdc_allowance {
                 allowance_is_ready(
-                    check_allowance(&usdc, self.wallet_address, target.address).await?,
+                    check_allowance(&usdc, self.account.trading_address(), target.address).await?,
                 )
             } else {
                 true
             };
             let ctf_approval_ready = if target.require_ctf_approval {
-                check_approval_for_all(&ctf, self.wallet_address, target.address).await?
+                check_approval_for_all(&ctf, self.account.trading_address(), target.address).await?
             } else {
                 true
             };
@@ -412,6 +485,10 @@ impl PolymarketExecutionClient {
     }
 
     pub async fn ensure_approvals(&self, include_inventory: bool) -> Result<ApprovalStatus> {
+        if !self.account.requires_onchain_approvals() {
+            return self.check_approvals(include_inventory).await;
+        }
+
         let status = self.check_approvals(include_inventory).await?;
         if status.is_ready() {
             return Ok(status);
@@ -674,7 +751,21 @@ impl PolymarketExecutionClient {
             Some(id) if !id.is_empty() => Some(Uuid::parse_str(id)?),
             _ => None,
         };
-        let response = self.clob.post_heartbeat(parsed).await?;
+        let response = match self.clob.post_heartbeat(parsed).await {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(recovery_id) = heartbeat_recovery_id_from_error(&error.to_string()) {
+                    warn!(
+                        target: "pn_polymarket::execution",
+                        heartbeat_id = %recovery_id,
+                        "heartbeat rejected; retrying with server-provided heartbeat id"
+                    );
+                    self.clob.post_heartbeat(Some(recovery_id)).await?
+                } else {
+                    return Err(error.into());
+                }
+            }
+        };
         info!(
             target: "pn_polymarket::execution",
             heartbeat_id = %response.heartbeat_id,
@@ -726,23 +817,21 @@ impl PolymarketExecutionClient {
     }
 
     async fn fetch_open_orders(&self) -> Result<Vec<ManagedOrder>> {
-        let request = OrdersRequest::builder().market(self.condition_id).build();
+        let request = open_orders_request();
         let mut orders = Vec::new();
-        let mut cursor = None;
+        let mut cursor = next_open_orders_cursor(None);
 
-        loop {
-            let page = self.clob.orders(&request, cursor.clone()).await?;
+        while let Some(next_cursor) = cursor.clone() {
+            let page = self.clob.orders(&request, Some(next_cursor)).await?;
             orders.extend(
                 page.data
                     .into_iter()
+                    .filter(|order| order_belongs_to_market(order, self.condition_id))
                     .map(map_open_order)
                     .collect::<Result<Vec<_>>>()?,
             );
 
-            if page.next_cursor.is_empty() {
-                break;
-            }
-            cursor = Some(page.next_cursor);
+            cursor = next_open_orders_cursor(Some(page.next_cursor));
         }
 
         Ok(orders)
@@ -750,7 +839,7 @@ impl PolymarketExecutionClient {
 
     async fn fetch_positions(&self) -> Result<Vec<PositionSnapshot>> {
         let request = PositionsRequest::builder()
-            .user(self.clob.address())
+            .user(self.account.trading_address())
             .filter(MarketFilter::markets([self.condition_id]))
             .build();
         let positions = self.data.positions(&request).await?;
@@ -1117,6 +1206,40 @@ fn map_open_order(
     })
 }
 
+fn open_orders_request() -> OrdersRequest {
+    OrdersRequest::builder().build()
+}
+
+fn next_open_orders_cursor(cursor: Option<String>) -> Option<String> {
+    match cursor {
+        None => Some(INITIAL_OPEN_ORDERS_CURSOR.to_string()),
+        Some(cursor) if should_continue_open_orders_pagination(&cursor) => Some(cursor),
+        Some(_) => None,
+    }
+}
+
+fn should_continue_open_orders_pagination(cursor: &str) -> bool {
+    !cursor.is_empty() && cursor != TERMINAL_OPEN_ORDERS_CURSOR
+}
+
+fn heartbeat_recovery_id_from_error(message: &str) -> Option<Uuid> {
+    if !message.contains("Invalid Heartbeat ID") {
+        return None;
+    }
+
+    let payload_start = message.rfind('{')?;
+    let payload: serde_json::Value = serde_json::from_str(&message[payload_start..]).ok()?;
+    let heartbeat_id = payload.get("heartbeat_id")?.as_str()?;
+    Uuid::parse_str(heartbeat_id).ok()
+}
+
+fn order_belongs_to_market(
+    order: &polymarket_client_sdk::clob::types::response::OpenOrderResponse,
+    condition_id: B256,
+) -> bool {
+    order.market == condition_id
+}
+
 fn side_to_sdk(side: &QuoteSide) -> Side {
     match side {
         QuoteSide::Buy => Side::Buy,
@@ -1162,6 +1285,114 @@ fn flatten_trade_fill(
 
 fn allowance_is_ready(allowance: U256) -> bool {
     allowance > U256::MAX / U256::from(2u8)
+}
+
+fn resolve_trading_account(
+    signer: Address,
+    chain_id: u64,
+    funder_address: Option<&str>,
+    signature_type: Option<&str>,
+) -> Result<TradingAccount> {
+    let funder = funder_address.map(parse_trading_address).transpose()?;
+    let kind = signature_type.map(parse_trading_account_kind).transpose()?;
+
+    match (funder, kind) {
+        (None, None) | (None, Some(TradingAccountKind::Eoa)) => Ok(TradingAccount {
+            signer,
+            funder: None,
+            kind: TradingAccountKind::Eoa,
+        }),
+        (Some(_), Some(TradingAccountKind::Eoa)) => {
+            anyhow::bail!("{FUNDER_ADDRESS_VAR} cannot be combined with {SIGNATURE_TYPE_VAR}=EOA")
+        }
+        (Some(funder), None) => Ok(TradingAccount {
+            signer,
+            funder: Some(funder),
+            kind: infer_trading_account_kind(signer, chain_id, funder)?,
+        }),
+        (None, Some(kind)) => Ok(TradingAccount {
+            signer,
+            funder: derive_trading_funder(signer, chain_id, kind)?,
+            kind,
+        }),
+        (Some(funder), Some(kind)) => {
+            let expected = derive_trading_funder(signer, chain_id, kind)?.with_context(|| {
+                format!(
+                    "{SIGNATURE_TYPE_VAR}={signature} requires a derived trading address on chain {chain_id}",
+                    signature = signature_type_name(kind)
+                )
+            })?;
+            if funder != expected {
+                anyhow::bail!(
+                    "{FUNDER_ADDRESS_VAR}={funder} does not match derived {kind} address {expected} for signer {signer}",
+                    kind = signature_type_name(kind),
+                );
+            }
+            Ok(TradingAccount {
+                signer,
+                funder: Some(funder),
+                kind,
+            })
+        }
+    }
+}
+
+fn parse_trading_address(value: &str) -> Result<Address> {
+    Address::from_str(value).with_context(|| format!("invalid {FUNDER_ADDRESS_VAR} value: {value}"))
+}
+
+fn parse_trading_account_kind(value: &str) -> Result<TradingAccountKind> {
+    let normalized = value.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "0" | "EOA" => Ok(TradingAccountKind::Eoa),
+        "1" | "PROXY" | "POLY_PROXY" => Ok(TradingAccountKind::Proxy),
+        "2" | "SAFE" | "GNOSIS_SAFE" | "GNOSISSAFE" | "GNOSIS-SAFE" => {
+            Ok(TradingAccountKind::GnosisSafe)
+        }
+        _ => anyhow::bail!(
+            "unsupported {SIGNATURE_TYPE_VAR} value: {value}. Expected one of EOA/0, POLY_PROXY/PROXY/1, or GNOSIS_SAFE/SAFE/2"
+        ),
+    }
+}
+
+fn infer_trading_account_kind(
+    signer: Address,
+    chain_id: u64,
+    funder: Address,
+) -> Result<TradingAccountKind> {
+    let proxy = derive_trading_funder(signer, chain_id, TradingAccountKind::Proxy)?;
+    let safe = derive_trading_funder(signer, chain_id, TradingAccountKind::GnosisSafe)?;
+
+    match (proxy == Some(funder), safe == Some(funder)) {
+        (true, false) => Ok(TradingAccountKind::Proxy),
+        (false, true) => Ok(TradingAccountKind::GnosisSafe),
+        (false, false) => anyhow::bail!(
+            "{FUNDER_ADDRESS_VAR}={funder} does not match derived proxy or safe address for signer {signer} on chain {chain_id}"
+        ),
+        (true, true) => anyhow::bail!(
+            "{FUNDER_ADDRESS_VAR}={funder} is ambiguous because it matches both proxy and safe derivations for signer {signer}"
+        ),
+    }
+}
+
+fn derive_trading_funder(
+    signer: Address,
+    chain_id: u64,
+    kind: TradingAccountKind,
+) -> Result<Option<Address>> {
+    match kind {
+        TradingAccountKind::Eoa => Ok(None),
+        TradingAccountKind::Proxy => Ok(derive_proxy_wallet(signer, chain_id)),
+        TradingAccountKind::GnosisSafe => Ok(derive_safe_wallet(signer, chain_id)),
+    }
+}
+
+fn signature_type_name(kind: TradingAccountKind) -> &'static str {
+    match kind {
+        TradingAccountKind::Eoa => "EOA",
+        TradingAccountKind::Proxy => "POLY_PROXY",
+        TradingAccountKind::GnosisSafe => "GNOSIS_SAFE",
+    }
 }
 
 fn remaining_order_size(original_size: Decimal, size_matched: Decimal) -> Decimal {
@@ -1370,16 +1601,23 @@ async fn set_ctf_approval<P: alloy::providers::Provider>(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use polymarket_client_sdk::auth::Uuid;
     use polymarket_client_sdk::clob::types::response::{OpenOrderResponse, PostOrderResponse};
     use polymarket_client_sdk::clob::types::{OrderStatusType, Side, TraderSide};
     use polymarket_client_sdk::types::{address, B256, U256};
+    use polymarket_client_sdk::ToQueryParams as _;
+    use polymarket_client_sdk::{derive_proxy_wallet, derive_safe_wallet, POLYGON};
     use rust_decimal_macros::dec;
 
     use super::{
-        allowance_is_ready, build_approval_targets, flatten_trade_fill, map_open_order,
-        mark_stream_message_received, next_reconnect_backoff_secs, select_trade_order_id,
-        side_from_sdk, ApprovalCheck, ApprovalStatus, FlattenRequest, QuoteSide,
+        allowance_is_ready, build_approval_targets, flatten_trade_fill,
+        heartbeat_recovery_id_from_error, map_open_order, mark_stream_message_received,
+        next_open_orders_cursor, next_reconnect_backoff_secs, open_orders_request,
+        order_belongs_to_market, resolve_trading_account, select_trade_order_id,
+        should_continue_open_orders_pagination, side_from_sdk, ApprovalCheck, ApprovalStatus,
+        FlattenRequest, QuoteSide, TradingAccountKind,
     };
 
     #[test]
@@ -1536,6 +1774,81 @@ mod tests {
     }
 
     #[test]
+    fn open_orders_request_does_not_send_market_filter() {
+        let request = open_orders_request();
+
+        assert_eq!(request.query_params(None), "");
+    }
+
+    #[test]
+    fn next_open_orders_cursor_starts_with_initial_cursor() {
+        assert_eq!(next_open_orders_cursor(None), Some("MA==".to_string()));
+    }
+
+    #[test]
+    fn next_open_orders_cursor_stops_at_terminal_cursor() {
+        assert_eq!(next_open_orders_cursor(Some("LTE=".to_string())), None);
+        assert_eq!(next_open_orders_cursor(Some(String::new())), None);
+    }
+
+    #[test]
+    fn should_continue_open_orders_pagination_matches_cursor_contract() {
+        assert!(should_continue_open_orders_pagination("MTE="));
+        assert!(!should_continue_open_orders_pagination("LTE="));
+        assert!(!should_continue_open_orders_pagination(""));
+    }
+
+    #[test]
+    fn heartbeat_recovery_id_from_error_extracts_uuid() {
+        let message = "Status: error(400 Bad Request) making POST call to /v1/heartbeats with {\"heartbeat_id\":\"40727c3a-473d-43ec-8560-ba9dd202b0b3\",\"error_msg\":\"Invalid Heartbeat ID\"}";
+
+        let heartbeat_id = heartbeat_recovery_id_from_error(message).unwrap();
+
+        assert_eq!(
+            heartbeat_id.to_string(),
+            "40727c3a-473d-43ec-8560-ba9dd202b0b3"
+        );
+    }
+
+    #[test]
+    fn heartbeat_recovery_id_from_error_ignores_other_errors() {
+        let message =
+            "Status: error(400 Bad Request) making POST call to /v1/heartbeats with {\"error\":\"other\"}";
+
+        assert!(heartbeat_recovery_id_from_error(message).is_none());
+    }
+
+    #[test]
+    fn order_belongs_to_market_matches_condition_id() {
+        let matching_market =
+            B256::from_str("0x04c109837e9c83aa410e4a1bfa32d5574b05fafd0a432514965c03a20e2511a6")
+                .unwrap();
+        let other_market =
+            B256::from_str("0x1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+        let order = OpenOrderResponse::builder()
+            .id("order-1")
+            .status(OrderStatusType::Live)
+            .owner(Uuid::parse_str("9180014b-33c8-9240-a14b-bdca11c0a465").unwrap())
+            .maker_address(address!("0x1000000000000000000000000000000000000001"))
+            .market(matching_market)
+            .asset_id(U256::from(123u64))
+            .side(Side::Buy)
+            .original_size(dec!(10))
+            .size_matched(dec!(0))
+            .price(dec!(0.41))
+            .associate_trades(Vec::<String>::new())
+            .outcome("YES")
+            .created_at(chrono::Utc::now())
+            .expiration(chrono::Utc::now())
+            .order_type(polymarket_client_sdk::clob::types::OrderType::GTC)
+            .build();
+
+        assert!(order_belongs_to_market(&order, matching_market));
+        assert!(!order_belongs_to_market(&order, other_market));
+    }
+
+    #[test]
     fn select_trade_order_id_uses_maker_order_for_maker_trades() {
         let order_id = select_trade_order_id(
             Some(TraderSide::Maker),
@@ -1582,6 +1895,90 @@ mod tests {
     fn allowance_is_ready_requires_large_allowance() {
         assert!(!allowance_is_ready(U256::from(1u64)));
         assert!(allowance_is_ready(U256::MAX));
+    }
+
+    #[test]
+    fn resolve_trading_account_defaults_to_eoa() {
+        let signer = address!("0x1111111111111111111111111111111111111111");
+
+        let account = resolve_trading_account(signer, POLYGON, None, None).unwrap();
+
+        assert_eq!(account.kind, TradingAccountKind::Eoa);
+        assert_eq!(account.signer, signer);
+        assert_eq!(account.funder, None);
+        assert_eq!(account.trading_address(), signer);
+        assert!(account.requires_onchain_approvals());
+    }
+
+    #[test]
+    fn resolve_trading_account_infers_proxy_from_funder_address() {
+        let signer = address!("0x1111111111111111111111111111111111111111");
+        let funder = derive_proxy_wallet(signer, POLYGON).unwrap();
+
+        let account =
+            resolve_trading_account(signer, POLYGON, Some(&funder.to_string()), None).unwrap();
+
+        assert_eq!(account.kind, TradingAccountKind::Proxy);
+        assert_eq!(account.signer, signer);
+        assert_eq!(account.funder, Some(funder));
+        assert_eq!(account.trading_address(), funder);
+        assert!(!account.requires_onchain_approvals());
+    }
+
+    #[test]
+    fn resolve_trading_account_infers_safe_from_funder_address() {
+        let signer = address!("0x1111111111111111111111111111111111111111");
+        let funder = derive_safe_wallet(signer, POLYGON).unwrap();
+
+        let account =
+            resolve_trading_account(signer, POLYGON, Some(&funder.to_string()), None).unwrap();
+
+        assert_eq!(account.kind, TradingAccountKind::GnosisSafe);
+        assert_eq!(account.funder, Some(funder));
+        assert_eq!(account.trading_address(), funder);
+        assert!(!account.requires_onchain_approvals());
+    }
+
+    #[test]
+    fn resolve_trading_account_derives_proxy_funder_from_signature_type() {
+        let signer = address!("0x1111111111111111111111111111111111111111");
+        let expected_funder = derive_proxy_wallet(signer, POLYGON).unwrap();
+
+        let account = resolve_trading_account(signer, POLYGON, None, Some("POLY_PROXY")).unwrap();
+
+        assert_eq!(account.kind, TradingAccountKind::Proxy);
+        assert_eq!(account.funder, Some(expected_funder));
+        assert_eq!(account.trading_address(), expected_funder);
+    }
+
+    #[test]
+    fn resolve_trading_account_rejects_funder_with_eoa_signature_type() {
+        let signer = address!("0x1111111111111111111111111111111111111111");
+        let funder = derive_proxy_wallet(signer, POLYGON).unwrap();
+
+        let error =
+            resolve_trading_account(signer, POLYGON, Some(&funder.to_string()), Some("eoa"))
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot be combined with POLYMARKET_SIGNATURE_TYPE=EOA"));
+    }
+
+    #[test]
+    fn resolve_trading_account_rejects_mismatched_funder_and_signature_type() {
+        let signer = address!("0x1111111111111111111111111111111111111111");
+        let proxy_funder = derive_proxy_wallet(signer, POLYGON).unwrap();
+
+        let error = resolve_trading_account(
+            signer,
+            POLYGON,
+            Some(&proxy_funder.to_string()),
+            Some("GNOSIS_SAFE"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not match derived"));
     }
 
     #[test]

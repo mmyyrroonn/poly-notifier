@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -223,8 +224,26 @@ impl Reporter for TelegramReporter {
     }
 }
 
+static RUSTLS_PROVIDER_READY: OnceLock<()> = OnceLock::new();
+
+fn ensure_rustls_crypto_provider() -> Result<()> {
+    if RUSTLS_PROVIDER_READY.get().is_some() {
+        return Ok(());
+    }
+
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .map_err(|_| anyhow::anyhow!("failed to install rustls ring crypto provider"))?;
+    }
+
+    let _ = RUSTLS_PROVIDER_READY.set(());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    ensure_rustls_crypto_provider()?;
     let _ = dotenv();
     let config = AppConfig::load()?;
     validate_condition_id(&config.lp.trading.condition_id)?;
@@ -640,7 +659,10 @@ mod tests {
         QuoteSide as SdkQuoteSide, TokenMetadata as SdkTokenMetadata,
     };
 
-    use super::{build_initial_state, decimal, map_flatten_fill, validate_condition_id};
+    use super::{
+        build_initial_state, decimal, ensure_rustls_crypto_provider, map_flatten_fill,
+        validate_condition_id,
+    };
 
     #[test]
     fn decimal_round_trip_preserves_expected_lp_config_values() {
@@ -668,6 +690,12 @@ mod tests {
     fn validate_condition_id_rejects_placeholder_value() {
         assert!(validate_condition_id("replace-me").is_err());
         assert!(validate_condition_id("0xabc").is_ok());
+    }
+
+    #[test]
+    fn ensure_rustls_crypto_provider_is_idempotent() {
+        ensure_rustls_crypto_provider().unwrap();
+        ensure_rustls_crypto_provider().unwrap();
     }
 
     #[test]
