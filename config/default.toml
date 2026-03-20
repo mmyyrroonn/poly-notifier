@@ -25,7 +25,7 @@ port = 36363
 # Password set via ADMIN_PASSWORD env var
 
 [lp.trading]
-condition_id = "replace-me"
+condition_id = "0x04c109837e9c83aa410e4a1bfa32d5574b05fafd0a432514965c03a20e2511a6"
 clob_base_url = "https://clob.polymarket.com"
 gamma_base_url = "https://gamma-api.polymarket.com"
 data_api_base_url = "https://data-api.polymarket.com"
@@ -38,11 +38,11 @@ auto_split_on_startup = false
 startup_split_amount = 0.0
 
 [lp.strategy]
-quote_size = 25.0
+quote_size = 25
 min_spread = 0.01
 min_depth = 25.0
-quote_offset_ticks = 1
-max_quote_age_secs = 10
+quote_offset_ticks = 2
+max_quote_age_secs = 30
 default_external_signal = true
 
 [lp.risk]
@@ -54,7 +54,7 @@ stale_feed_after_secs = 15
 
 [lp.approvals]
 require_on_startup = true
-auto_approve_on_startup = false
+auto_approve_on_startup = true
 
 [lp.reporting]
 operator_bot_id = ""

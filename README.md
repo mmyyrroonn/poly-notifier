@@ -10,6 +10,8 @@
 
 更详细的运行逻辑见 [lp-architecture.md](docs/lp-architecture.md)。
 
+如果你想看一份把认证、YES/NO token 挂单方式、完整运行链路、以及配置参数逐项解释整理在一起的说明，见 [polymarket-lp-parameter-guide.md](docs/polymarket-lp-parameter-guide.md)。
+
 ## 快速启动
 
 1. 复制 [.env.example](.env.example) 为 `.env`
