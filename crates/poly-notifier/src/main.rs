@@ -31,6 +31,7 @@ use pn_polymarket::{
     BootstrapState, ExecutionConfig, PolymarketExecutionClient, QuoteRequest,
     QuoteSide as SdkQuoteSide, RewardSnapshot as SdkRewardSnapshot, StreamEvent as SdkStreamEvent,
 };
+use poly_lp::guard::{guard_heartbeat_url, spawn_guard_heartbeat_loop};
 
 #[derive(Clone)]
 struct LiveExchangeAdapter {
@@ -368,11 +369,27 @@ async fn main() -> Result<()> {
             .expect("admin API server error");
     });
 
+    let guard_heartbeat_handle = guard_heartbeat_url(&config).map(|heartbeat_url| {
+        info!(
+            %heartbeat_url,
+            interval_secs = config.guard.heartbeat_interval_secs,
+            "guard heartbeat sender enabled"
+        );
+        spawn_guard_heartbeat_loop(
+            heartbeat_url,
+            Duration::from_secs(config.guard.heartbeat_interval_secs.max(1)),
+            cancel.clone(),
+        )
+    });
+
     info!("LP daemon started; waiting for Ctrl+C");
     tokio::signal::ctrl_c().await?;
     cancel.cancel();
 
     let _ = tokio::join!(service_handle, admin_handle);
+    if let Some(guard_heartbeat_handle) = guard_heartbeat_handle {
+        let _ = guard_heartbeat_handle.await;
+    }
     Ok(())
 }
 
@@ -719,9 +736,10 @@ mod tests {
     use std::time::Duration;
 
     use pn_common::config::{
-        AdminConfig, AlertConfig, AppConfig, DatabaseConfig, LpApprovalConfig, LpConfig,
-        LpControlConfig, LpInventoryConfig, LpLoggingConfig, LpReportingConfig, LpRiskConfig,
-        LpStrategyConfig, LpTradingConfig, MonitorConfig, SchedulerConfig, TelegramConfig,
+        AdminConfig, AlertConfig, AppConfig, DatabaseConfig, GuardConfig, LpApprovalConfig,
+        LpConfig, LpControlConfig, LpInventoryConfig, LpLoggingConfig, LpReportingConfig,
+        LpRiskConfig, LpStrategyConfig, LpTradingConfig, MonitorConfig, SchedulerConfig,
+        TelegramConfig,
     };
     use pn_polymarket::{
         AccountSnapshot as SdkAccountSnapshot, BookLevel as SdkBookLevel,
@@ -794,6 +812,7 @@ mod tests {
                 daily_summary_cron: "0 0 9 * * *".to_string(),
             },
             admin: AdminConfig { port: 3000 },
+            guard: GuardConfig::default(),
             lp: LpConfig {
                 trading: LpTradingConfig {
                     condition_id: "0xabc".to_string(),
@@ -930,6 +949,7 @@ mod tests {
                 daily_summary_cron: "0 0 9 * * *".to_string(),
             },
             admin: AdminConfig { port: 3000 },
+            guard: GuardConfig::default(),
             lp: LpConfig {
                 trading: LpTradingConfig {
                     condition_id: "0xabc".to_string(),
@@ -1029,6 +1049,7 @@ mod tests {
                 daily_summary_cron: "0 0 9 * * *".to_string(),
             },
             admin: AdminConfig { port: 3000 },
+            guard: GuardConfig::default(),
             lp: LpConfig {
                 trading: LpTradingConfig {
                     condition_id: "0xabc".to_string(),

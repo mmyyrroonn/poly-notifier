@@ -24,8 +24,18 @@ daily_summary_cron = "0 0 9 * * *"  # 9:00 UTC daily
 port = 36363
 # Password set via ADMIN_PASSWORD env var
 
+[guard]
+enabled = false
+bind_addr = "127.0.0.1"
+port = 37373
+heartbeat_interval_secs = 5
+heartbeat_timeout_secs = 15
+check_interval_secs = 1
+admin_base_url = ""
+request_timeout_secs = 5
+
 [lp.trading]
-condition_id = "0x04c109837e9c83aa410e4a1bfa32d5574b05fafd0a432514965c03a20e2511a6"
+condition_id = "0x306d10d4a4d51b41910dbc779ca00908bd917c131541c5c42bbbc736258d2d56"
 clob_base_url = "https://clob.polymarket.com"
 gamma_base_url = "https://gamma-api.polymarket.com"
 data_api_base_url = "https://data-api.polymarket.com"

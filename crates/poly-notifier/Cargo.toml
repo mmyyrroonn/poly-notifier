@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "poly-target"
 path = "src/bin/poly-target.rs"
 
+[[bin]]
+name = "poly-guard"
+path = "src/bin/poly-guard.rs"
+
 [dependencies]
 pn-common = { workspace = true }
 pn-polymarket = { workspace = true }
@@ -27,6 +31,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 dotenvy = { workspace = true }
 axum = { workspace = true }
+reqwest = { workspace = true }
 rust_decimal = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }

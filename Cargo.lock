@@ -3622,6 +3622,7 @@ dependencies = [
  "pn-lp",
  "pn-notify",
  "pn-polymarket",
+ "reqwest 0.12.28",
  "rust_decimal",
  "rustls",
  "serde_json",

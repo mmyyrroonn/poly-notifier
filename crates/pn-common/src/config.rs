@@ -67,6 +67,35 @@ pub struct AdminConfig {
     pub port: u16,
 }
 
+/// External heartbeat guard settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardConfig {
+    /// Enable main-process heartbeats and allow the dedicated guard binary to run.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Hostname/interface for the guard HTTP listener.
+    #[serde(default = "default_guard_bind_addr")]
+    pub bind_addr: String,
+    /// TCP port the guard listener uses.
+    #[serde(default = "default_guard_port")]
+    pub port: u16,
+    /// How often the main process posts a heartbeat to the guard.
+    #[serde(default = "default_guard_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
+    /// Cancel all orders when no heartbeat arrives within this window.
+    #[serde(default = "default_guard_heartbeat_timeout")]
+    pub heartbeat_timeout_secs: u64,
+    /// How often the guard checks for missed heartbeats.
+    #[serde(default = "default_guard_check_interval")]
+    pub check_interval_secs: u64,
+    /// Optional override for the admin API base URL.
+    #[serde(default)]
+    pub admin_base_url: Option<String>,
+    /// HTTP timeout used when the guard calls cancel-all.
+    #[serde(default = "default_guard_request_timeout")]
+    pub request_timeout_secs: u64,
+}
+
 /// LP daemon trading/client settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LpTradingConfig {
@@ -281,6 +310,8 @@ pub struct AppConfig {
     pub alert: AlertConfig,
     pub scheduler: SchedulerConfig,
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub guard: GuardConfig,
     pub lp: LpConfig,
 }
 
@@ -348,6 +379,30 @@ fn default_control_bind_addr() -> String {
     "127.0.0.1".to_string()
 }
 
+fn default_guard_bind_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_guard_port() -> u16 {
+    37373
+}
+
+fn default_guard_heartbeat_interval() -> u64 {
+    5
+}
+
+fn default_guard_heartbeat_timeout() -> u64 {
+    15
+}
+
+fn default_guard_check_interval() -> u64 {
+    1
+}
+
+fn default_guard_request_timeout() -> u64 {
+    5
+}
+
 fn default_log_directory() -> String {
     "logs".to_string()
 }
@@ -369,6 +424,21 @@ impl Default for LpApprovalConfig {
         Self {
             require_on_startup: true,
             auto_approve_on_startup: false,
+        }
+    }
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_guard_bind_addr(),
+            port: default_guard_port(),
+            heartbeat_interval_secs: default_guard_heartbeat_interval(),
+            heartbeat_timeout_secs: default_guard_heartbeat_timeout(),
+            check_interval_secs: default_guard_check_interval(),
+            admin_base_url: None,
+            request_timeout_secs: default_guard_request_timeout(),
         }
     }
 }
