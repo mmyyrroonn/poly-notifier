@@ -623,6 +623,7 @@ mod tests {
             },
             books: HashMap::new(),
             open_orders: Vec::new(),
+            terminal_order_ids: std::collections::HashSet::new(),
             positions: HashMap::new(),
             account: AccountSnapshot {
                 usdc_balance: "100".parse().unwrap(),

@@ -178,6 +178,7 @@ mod tests {
                 },
             )]),
             open_orders: Vec::new(),
+            terminal_order_ids: std::collections::HashSet::new(),
             positions: HashMap::from([(
                 "asset-yes".to_string(),
                 PositionSnapshot {

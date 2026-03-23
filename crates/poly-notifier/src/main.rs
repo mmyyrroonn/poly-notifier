@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -606,6 +606,7 @@ fn build_initial_state(config: &AppConfig, bootstrap: BootstrapState) -> Runtime
                 status: order.status,
             })
             .collect(),
+        terminal_order_ids: HashSet::new(),
         positions: bootstrap
             .positions
             .into_iter()

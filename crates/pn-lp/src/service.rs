@@ -393,12 +393,10 @@ impl LpService {
         if !state.open_orders.is_empty() {
             match self.exchange.cancel_all().await {
                 Ok(()) => {
+                    let canceled_orders = state.open_orders.clone();
+                    remember_terminal_orders(&mut state, &canceled_orders);
                     if let Err(error) = self
-                        .mark_orders_status(
-                            &state.market.condition_id,
-                            &state.open_orders,
-                            "CANCELED",
-                        )
+                        .mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
                         .await
                     {
                         error!(?error, "failed to persist shutdown cancel status");
@@ -469,7 +467,9 @@ impl LpService {
                 warn!(target: "lp.control", reason = %reason, open_orders = state.open_orders.len(), "cancel-all requested");
                 insert_lp_control_action(&self.pool, "cancel_all", Some(&reason), actor).await?;
                 self.exchange.cancel_all().await?;
-                self.mark_orders_status(&state.market.condition_id, &state.open_orders, "CANCELED")
+                let canceled_orders = state.open_orders.clone();
+                remember_terminal_orders(state, &canceled_orders);
+                self.mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
                     .await?;
                 state.open_orders.clear();
                 self.emit_risk("control_cancel_all", "info", json!({ "reason": reason }))
@@ -481,7 +481,9 @@ impl LpService {
                 state.flags.paused = true;
                 state.flags.flattening = true;
                 self.exchange.cancel_all().await?;
-                self.mark_orders_status(&state.market.condition_id, &state.open_orders, "CANCELED")
+                let canceled_orders = state.open_orders.clone();
+                remember_terminal_orders(state, &canceled_orders);
+                self.mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
                     .await?;
                 state.open_orders.clear();
 
@@ -675,6 +677,7 @@ impl LpService {
             .map(|position| (position.asset_id.clone(), position))
             .collect::<HashMap<_, _>>();
         if !reconciled_missing_orders.is_empty() {
+            remember_terminal_orders(state, &reconciled_missing_orders);
             self.mark_orders_status(
                 &state.market.condition_id,
                 &reconciled_missing_orders,
@@ -682,7 +685,7 @@ impl LpService {
             )
             .await?;
         }
-        state.open_orders = snapshot.open_orders;
+        replace_open_orders(state, snapshot.open_orders);
         state.last_user_event_at = Some(Utc::now());
         info!(
             target: "lp.reconcile",
@@ -734,11 +737,9 @@ impl LpService {
                     )
                     .await?;
                     self.exchange.cancel_all().await?;
-                    self.mark_orders_status(
-                        &state.market.condition_id,
-                        &state.open_orders,
-                        "CANCELED",
-                    )
+                    let canceled_orders = state.open_orders.clone();
+                    remember_terminal_orders(state, &canceled_orders);
+                    self.mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
                     .await?;
                     state.open_orders.clear();
                     self.emit_risk("cancel_all", "warn", json!({ "reason": reason }))
@@ -903,7 +904,9 @@ impl LpService {
                     "decision requested quote cancellation"
                 );
                 self.exchange.cancel_all().await?;
-                self.mark_orders_status(&state.market.condition_id, &state.open_orders, "CANCELED")
+                let canceled_orders = state.open_orders.clone();
+                remember_terminal_orders(state, &canceled_orders);
+                self.mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
                     .await?;
                 state.open_orders.clear();
             }
@@ -921,7 +924,9 @@ impl LpService {
                 "refreshing existing quotes before reposting"
             );
             self.exchange.cancel_all().await?;
-            self.mark_orders_status(&state.market.condition_id, &state.open_orders, "CANCELED")
+            let canceled_orders = state.open_orders.clone();
+            remember_terminal_orders(state, &canceled_orders);
+            self.mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
                 .await?;
             state.open_orders.clear();
         }
@@ -967,7 +972,7 @@ impl LpService {
                 "passive quote acknowledged"
             );
         }
-        state.open_orders = posted;
+        replace_open_orders(state, posted);
 
         Ok(())
     }
@@ -1217,11 +1222,13 @@ impl LpService {
 }
 
 fn upsert_order_state(state: &mut RuntimeState, order: ManagedOrder) {
-    let terminal = matches!(order.status.as_str(), "CANCELED" | "MATCHED");
-    if terminal {
+    if is_terminal_order_status(&order.status) {
+        state.terminal_order_ids.insert(order.order_id.clone());
         state
             .open_orders
             .retain(|existing| existing.order_id != order.order_id);
+    } else if state.terminal_order_ids.contains(&order.order_id) {
+        return;
     } else if let Some(existing) = state
         .open_orders
         .iter_mut()
@@ -1231,6 +1238,23 @@ fn upsert_order_state(state: &mut RuntimeState, order: ManagedOrder) {
     } else {
         state.open_orders.push(order);
     }
+}
+
+fn is_terminal_order_status(status: &str) -> bool {
+    matches!(status, "CANCELED" | "MATCHED")
+}
+
+fn remember_terminal_orders(state: &mut RuntimeState, orders: &[ManagedOrder]) {
+    for order in orders {
+        state.terminal_order_ids.insert(order.order_id.clone());
+    }
+}
+
+fn replace_open_orders(state: &mut RuntimeState, orders: Vec<ManagedOrder>) {
+    for order in &orders {
+        state.terminal_order_ids.remove(&order.order_id);
+    }
+    state.open_orders = orders;
 }
 
 fn desired_quotes_match(
@@ -1368,8 +1392,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        desired_quotes_match, flatten_reference_price, missing_open_orders, BookActivityTracker,
-        ExchangeAdapter, ExchangeEvent, LpService, ReconciliationSnapshot, ServiceConfig,
+        desired_quotes_match, flatten_reference_price, missing_open_orders, upsert_order_state,
+        BookActivityTracker, ExchangeAdapter, ExchangeEvent, LpService, ReconciliationSnapshot,
+        ServiceConfig,
     };
     use crate::control::ControlCommand;
     use crate::decision::{DecisionConfig, DecisionEngine, DecisionOutcome};
@@ -1408,6 +1433,7 @@ mod tests {
                 },
             )]),
             open_orders: Vec::new(),
+            terminal_order_ids: std::collections::HashSet::new(),
             positions: HashMap::new(),
             account: AccountSnapshot {
                 usdc_balance: dec!(500),
@@ -1497,6 +1523,49 @@ mod tests {
 
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].order_id, "order-1");
+    }
+
+    #[test]
+    fn upsert_order_state_ignores_late_live_update_after_cancel() {
+        let now = Utc::now();
+        let mut state = runtime_state_with_book();
+        state.open_orders = vec![ManagedOrder {
+            order_id: "order-2".to_string(),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Buy,
+            price: dec!(0.08),
+            size: dec!(25),
+            created_at: now,
+            status: "LIVE".to_string(),
+        }];
+
+        upsert_order_state(
+            &mut state,
+            ManagedOrder {
+                order_id: "order-1".to_string(),
+                asset_id: "asset-yes".to_string(),
+                side: QuoteSide::Buy,
+                price: dec!(0.09),
+                size: dec!(25),
+                created_at: now,
+                status: "CANCELED".to_string(),
+            },
+        );
+        upsert_order_state(
+            &mut state,
+            ManagedOrder {
+                order_id: "order-1".to_string(),
+                asset_id: "asset-yes".to_string(),
+                side: QuoteSide::Buy,
+                price: dec!(0.09),
+                size: dec!(25),
+                created_at: now,
+                status: "LIVE".to_string(),
+            },
+        );
+
+        assert_eq!(state.open_orders.len(), 1);
+        assert_eq!(state.open_orders[0].order_id, "order-2");
     }
 
     #[test]

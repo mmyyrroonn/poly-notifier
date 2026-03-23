@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
@@ -192,6 +192,7 @@ pub struct RuntimeState {
     pub market: MarketMetadata,
     pub books: HashMap<String, BookSnapshot>,
     pub open_orders: Vec<ManagedOrder>,
+    pub terminal_order_ids: HashSet<String>,
     pub positions: HashMap<String, PositionSnapshot>,
     pub account: AccountSnapshot,
     pub signals: HashMap<String, SignalState>,
