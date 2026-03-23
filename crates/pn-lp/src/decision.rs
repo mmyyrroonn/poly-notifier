@@ -295,15 +295,19 @@ fn qualifying_ask_price(
 
 fn round_up_to_tick(price: Decimal, tick_size: Decimal) -> Decimal {
     let remainder = price % tick_size;
-    if remainder.is_zero() {
+    let mut aligned = if remainder.is_zero() {
         price
     } else {
         price + (tick_size - remainder)
-    }
+    };
+    aligned.rescale(tick_size.scale());
+    aligned
 }
 
 fn round_down_to_tick(price: Decimal, tick_size: Decimal) -> Decimal {
-    price - (price % tick_size)
+    let mut aligned = price - (price % tick_size);
+    aligned.rescale(tick_size.scale());
+    aligned
 }
 
 fn inside_ticks(book: &BookSnapshot, side: QuoteSide, price: Decimal, tick_size: Decimal) -> u32 {
@@ -487,6 +491,28 @@ mod tests {
         for quote in outcome.desired_quotes {
             assert_eq!(quote.price % tick_size, Decimal::ZERO);
         }
+    }
+
+    #[test]
+    fn generated_quotes_do_not_leak_extra_decimal_scale_from_reward_spread() {
+        let engine = DecisionEngine::new(decision_config(QuoteMode::Inside, 1));
+        let mut state = test_state();
+        state.account.token_balances.clear();
+        state.reward = active_reward_state(Utc::now(), dec!(0.055));
+        state.books.get_mut("asset-yes").unwrap().bids = vec![BookLevel {
+            price: dec!(0.76),
+            size: dec!(100),
+        }];
+        state.books.get_mut("asset-yes").unwrap().asks = vec![BookLevel {
+            price: dec!(0.77),
+            size: dec!(100),
+        }];
+
+        let outcome = engine.evaluate(&state);
+
+        assert_eq!(outcome.desired_quotes.len(), 1);
+        assert_eq!(outcome.desired_quotes[0].side, crate::types::QuoteSide::Buy);
+        assert_eq!(outcome.desired_quotes[0].price.to_string(), "0.71");
     }
 
     #[test]
