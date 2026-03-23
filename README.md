@@ -124,6 +124,27 @@ curl "https://gamma-api.polymarket.com/events?slug=<event-slug>"
 
 如果你把具体的 event 链接、market 链接、slug，或者完整 question 发我，我可以帮你确认该填哪个 `condition_id`。
 
+如果你想直接在本地交互式修改目标 market，可以用独立 CLI：
+
+```bash
+cargo run -p poly-lp --bin poly-target -- "https://polymarket.com/event/..."
+```
+
+它支持 4 种输入：
+
+1. `event URL`
+2. `market URL`
+3. `slug`
+4. `condition_id`
+
+如果解析出多个候选市场，会在终端里让你选；确认后会把选择结果写回 `config/default.toml` 里的 `lp.trading.condition_id`。改完后重启 `poly-lp` 才会生效。
+
+如果你只想先演练，不想动默认配置，可以显式指定另一个 TOML 文件：
+
+```bash
+cargo run -p poly-lp --bin poly-target -- --config /tmp/next-target.toml "https://polymarket.com/event/..."
+```
+
 ## 启动后检查
 
 健康检查：

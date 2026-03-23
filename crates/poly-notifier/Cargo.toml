@@ -7,6 +7,10 @@ edition = "2021"
 name = "poly-lp"
 path = "src/main.rs"
 
+[[bin]]
+name = "poly-target"
+path = "src/bin/poly-target.rs"
+
 [dependencies]
 pn-common = { workspace = true }
 pn-polymarket = { workspace = true }
