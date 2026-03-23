@@ -44,6 +44,12 @@ min_spread = 0.01
 min_depth = 25.0
 quote_offset_ticks = 2
 max_quote_age_secs = 30
+reward_refresh_interval_secs = 30
+reward_stale_after_secs = 90
+reward_fetch_retries = 3
+reward_fetch_backoff_ms = 250
+min_inside_ticks = 1
+min_inside_depth_multiple = 1.5
 default_external_signal = true
 
 [lp.risk]

@@ -24,6 +24,7 @@
 pub mod clob;
 pub mod gamma;
 pub mod lp;
+pub mod rewards;
 pub mod types;
 pub mod ws;
 
@@ -35,5 +36,6 @@ pub use lp::{
     PolymarketExecutionClient, PositionSnapshot, QuoteRequest, QuoteSide, ReconciliationState,
     StreamEvent, TokenMetadata, TradeFill,
 };
+pub use rewards::{RewardClient, RewardSnapshot};
 pub use types::{GammaMarket, GammaToken, WsEvent};
 pub use ws::PolymarketWs;

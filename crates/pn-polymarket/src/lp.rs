@@ -30,6 +30,8 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::rewards::{RewardClient, RewardSnapshot};
+
 const DEFAULT_POLYGON_RPC_URL: &str = "https://polygon-rpc.com";
 const INITIAL_OPEN_ORDERS_CURSOR: &str = "MA==";
 const TERMINAL_OPEN_ORDERS_CURSOR: &str = "LTE=";
@@ -385,6 +387,22 @@ impl PolymarketExecutionClient {
             positions: reconcile.positions,
             account: reconcile.account,
         })
+    }
+
+    pub async fn fetch_reward_snapshot(
+        &self,
+        attempts: usize,
+        backoff: Duration,
+    ) -> Result<Option<RewardSnapshot>> {
+        RewardClient::with_base_url(self.config.clob_base_url.clone())
+            .fetch_market_snapshot(
+                &self.market.condition_id,
+                true,
+                attempts,
+                backoff,
+                chrono::Utc::now().date_naive(),
+            )
+            .await
     }
 
     pub async fn check_approvals(&self, include_inventory: bool) -> Result<ApprovalStatus> {

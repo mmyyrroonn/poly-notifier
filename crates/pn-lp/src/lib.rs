@@ -16,5 +16,5 @@ pub use service::{
 pub use signals::{SignalAggregator, SignalUpdate};
 pub use types::{
     AccountSnapshot, BookSnapshot, ManagedOrder, MarketMetadata, PositionSnapshot, QuoteIntent,
-    QuoteSide, RuntimeFlags, RuntimeState, TokenMetadata, TradeFill,
+    QuoteSide, RewardSnapshot, RewardState, RuntimeFlags, RuntimeState, TokenMetadata, TradeFill,
 };

@@ -23,17 +23,20 @@ use pn_lp::types::SignalState;
 use pn_lp::{
     AccountSnapshot, ExchangeAdapter, ExchangeEvent, FlattenIntent, LpService, ManagedOrder,
     MarketMetadata, PositionSnapshot, QuoteIntent, QuoteMode, QuoteSide, ReconciliationSnapshot,
-    Reporter, RuntimeFlags, RuntimeState, ServiceConfig, TokenMetadata, TradeFill,
+    Reporter, RewardSnapshot, RewardState, RuntimeFlags, RuntimeState, ServiceConfig,
+    TokenMetadata, TradeFill,
 };
 use pn_notify::telegram::BotRegistry;
 use pn_polymarket::{
     BootstrapState, ExecutionConfig, PolymarketExecutionClient, QuoteRequest,
-    QuoteSide as SdkQuoteSide, StreamEvent as SdkStreamEvent,
+    QuoteSide as SdkQuoteSide, RewardSnapshot as SdkRewardSnapshot, StreamEvent as SdkStreamEvent,
 };
 
 #[derive(Clone)]
 struct LiveExchangeAdapter {
     client: Arc<PolymarketExecutionClient>,
+    reward_fetch_retries: usize,
+    reward_fetch_backoff: Duration,
 }
 
 #[async_trait]
@@ -155,6 +158,14 @@ impl ExchangeAdapter for LiveExchangeAdapter {
                 updated_at: Utc::now(),
             },
         })
+    }
+
+    async fn fetch_reward_snapshot(&self) -> Result<Option<RewardSnapshot>> {
+        let snapshot = self
+            .client
+            .fetch_reward_snapshot(self.reward_fetch_retries, self.reward_fetch_backoff)
+            .await?;
+        Ok(snapshot.map(map_reward_snapshot))
     }
 
     async fn post_quotes(&self, quotes: &[QuoteIntent]) -> Result<Vec<ManagedOrder>> {
@@ -320,6 +331,8 @@ async fn main() -> Result<()> {
 
     let exchange: Arc<dyn ExchangeAdapter> = Arc::new(LiveExchangeAdapter {
         client: sdk_client.clone(),
+        reward_fetch_retries: config.lp.strategy.reward_fetch_retries,
+        reward_fetch_backoff: Duration::from_millis(config.lp.strategy.reward_fetch_backoff_ms),
     });
 
     let (service, control) = LpService::new(
@@ -477,6 +490,11 @@ fn build_service_config(config: &AppConfig) -> Result<ServiceConfig> {
             quote_offset_ticks: config.lp.strategy.quote_offset_ticks,
             min_usdc_balance: decimal(config.lp.inventory.min_usdc_balance)?,
             min_token_balance: decimal(config.lp.inventory.min_token_balance)?,
+            min_inside_ticks: config.lp.strategy.min_inside_ticks,
+            min_inside_depth_multiple: decimal(config.lp.strategy.min_inside_depth_multiple)?,
+            reward_stale_after: chrono::Duration::seconds(
+                config.lp.strategy.reward_stale_after_secs as i64,
+            ),
         },
         risk: pn_lp::RiskConfig {
             max_position: decimal(config.lp.risk.max_position)?,
@@ -501,6 +519,9 @@ fn build_service_config(config: &AppConfig) -> Result<ServiceConfig> {
         report_interval: Duration::from_secs(config.lp.reporting.summary_interval_secs),
         snapshot_interval: Duration::from_secs(config.lp.logging.snapshot_interval_secs),
         max_quote_age: Duration::from_secs(config.lp.strategy.max_quote_age_secs),
+        reward_refresh_interval: Duration::from_secs(
+            config.lp.strategy.reward_refresh_interval_secs,
+        ),
     })
 }
 
@@ -619,6 +640,22 @@ fn build_initial_state(config: &AppConfig, bootstrap: BootstrapState) -> Runtime
         last_heartbeat_at: None,
         last_heartbeat_id: None,
         last_decision_reason: Some("bootstrap".to_string()),
+        reward: RewardState::default(),
+    }
+}
+
+fn map_reward_snapshot(snapshot: SdkRewardSnapshot) -> RewardSnapshot {
+    RewardSnapshot {
+        condition_id: snapshot.condition_id,
+        max_spread: snapshot.max_spread,
+        min_size: snapshot.min_size,
+        total_daily_rate: snapshot.total_daily_rate,
+        active_until: snapshot.active_until,
+        token_prices: snapshot
+            .token_prices
+            .into_iter()
+            .map(|token| (token.token_id, token.price))
+            .collect(),
     }
 }
 
@@ -679,6 +716,7 @@ fn html_escape(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use pn_common::config::{
         AdminConfig, AlertConfig, AppConfig, DatabaseConfig, LpApprovalConfig, LpConfig,
@@ -777,6 +815,12 @@ mod tests {
                     min_depth: 50.0,
                     quote_offset_ticks: 1,
                     max_quote_age_secs: 10,
+                    reward_refresh_interval_secs: 30,
+                    reward_stale_after_secs: 90,
+                    reward_fetch_retries: 3,
+                    reward_fetch_backoff_ms: 250,
+                    min_inside_ticks: 1,
+                    min_inside_depth_multiple: 1.5,
                     default_external_signal: true,
                 },
                 risk: LpRiskConfig {
@@ -907,6 +951,12 @@ mod tests {
                     min_depth: 50.0,
                     quote_offset_ticks: 1,
                     max_quote_age_secs: 10,
+                    reward_refresh_interval_secs: 30,
+                    reward_stale_after_secs: 90,
+                    reward_fetch_retries: 3,
+                    reward_fetch_backoff_ms: 250,
+                    min_inside_ticks: 1,
+                    min_inside_depth_multiple: 1.5,
                     default_external_signal: true,
                 },
                 risk: LpRiskConfig {
@@ -943,6 +993,15 @@ mod tests {
         let service_config = build_service_config(&config).expect("service config");
 
         assert_eq!(service_config.decision.quote_mode, QuoteMode::Outside);
+        assert_eq!(service_config.decision.min_inside_ticks, 1);
+        assert_eq!(
+            service_config.decision.min_inside_depth_multiple,
+            decimal(1.5).unwrap()
+        );
+        assert_eq!(
+            service_config.reward_refresh_interval,
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
@@ -991,6 +1050,12 @@ mod tests {
                     min_depth: 50.0,
                     quote_offset_ticks: 1,
                     max_quote_age_secs: 10,
+                    reward_refresh_interval_secs: 30,
+                    reward_stale_after_secs: 90,
+                    reward_fetch_retries: 3,
+                    reward_fetch_backoff_ms: 250,
+                    min_inside_ticks: 1,
+                    min_inside_depth_multiple: 1.5,
                     default_external_signal: true,
                 },
                 risk: LpRiskConfig {

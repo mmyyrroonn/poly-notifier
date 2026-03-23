@@ -137,7 +137,7 @@ mod tests {
     use super::{FlattenIntent, RiskAction, RiskConfig, RiskEngine};
     use crate::types::{
         AccountSnapshot, BookLevel, BookSnapshot, MarketMetadata, PositionSnapshot, QuoteSide,
-        RuntimeFlags, RuntimeState, SignalState, TokenMetadata, TradeFill,
+        RewardState, RuntimeFlags, RuntimeState, SignalState, TokenMetadata, TradeFill,
     };
 
     fn engine() -> RiskEngine {
@@ -209,6 +209,7 @@ mod tests {
             last_heartbeat_at: Some(now),
             last_heartbeat_id: Some("hb-1".to_string()),
             last_decision_reason: None,
+            reward: RewardState::default(),
         }
     }
 

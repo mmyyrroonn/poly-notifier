@@ -587,8 +587,8 @@ mod tests {
     use chrono::Utc;
     use pn_lp::types::SignalState;
     use pn_lp::{
-        AccountSnapshot, ControlCommand, LpControlHandle, MarketMetadata, RuntimeFlags,
-        RuntimeState, TokenMetadata,
+        AccountSnapshot, ControlCommand, LpControlHandle, MarketMetadata, RewardState,
+        RuntimeFlags, RuntimeState, TokenMetadata,
     };
     use sqlx::SqlitePool;
     use tokio::sync::{mpsc, watch};
@@ -642,6 +642,7 @@ mod tests {
             last_heartbeat_at: Some(now),
             last_heartbeat_id: Some("hb-1".to_string()),
             last_decision_reason: None,
+            reward: RewardState::default(),
         }
     }
 

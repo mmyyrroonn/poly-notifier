@@ -125,6 +125,24 @@ pub struct LpStrategyConfig {
     pub quote_offset_ticks: u32,
     /// Cancel/refresh quotes after this age.
     pub max_quote_age_secs: u64,
+    /// Refresh reward configuration on this interval.
+    #[serde(default = "default_reward_refresh_interval")]
+    pub reward_refresh_interval_secs: u64,
+    /// Treat reward configuration as stale after this long without a fresh fetch.
+    #[serde(default = "default_reward_stale_after")]
+    pub reward_stale_after_secs: u64,
+    /// Number of retry attempts when fetching reward configuration.
+    #[serde(default = "default_reward_fetch_retries")]
+    pub reward_fetch_retries: usize,
+    /// Base backoff between reward fetch retries in milliseconds.
+    #[serde(default = "default_reward_fetch_backoff_ms")]
+    pub reward_fetch_backoff_ms: u64,
+    /// Minimum number of better-priced ticks that must remain inside our quote.
+    #[serde(default = "default_min_inside_ticks")]
+    pub min_inside_ticks: u32,
+    /// Minimum better-priced depth multiple required inside our quote.
+    #[serde(default = "default_min_inside_depth_multiple")]
+    pub min_inside_depth_multiple: f64,
     /// Keep the external signal gate on by default until a real feed is added.
     #[serde(default = "default_true")]
     pub default_external_signal: bool,
@@ -132,6 +150,30 @@ pub struct LpStrategyConfig {
 
 fn default_quote_mode() -> String {
     "inside".to_string()
+}
+
+fn default_reward_refresh_interval() -> u64 {
+    30
+}
+
+fn default_reward_stale_after() -> u64 {
+    90
+}
+
+fn default_reward_fetch_retries() -> usize {
+    3
+}
+
+fn default_reward_fetch_backoff_ms() -> u64 {
+    250
+}
+
+fn default_min_inside_ticks() -> u32 {
+    1
+}
+
+fn default_min_inside_depth_multiple() -> f64 {
+    1.5
 }
 
 /// Runtime safety controls.

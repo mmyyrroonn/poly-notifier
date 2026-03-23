@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -129,6 +129,49 @@ pub struct QuoteIntent {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RewardSnapshot {
+    pub condition_id: String,
+    pub max_spread: Decimal,
+    pub min_size: Decimal,
+    pub total_daily_rate: Decimal,
+    pub active_until: NaiveDate,
+    pub token_prices: HashMap<String, Decimal>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RewardState {
+    pub snapshot: Option<RewardSnapshot>,
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+impl RewardState {
+    pub fn active_snapshot<'a>(
+        &'a self,
+        now: DateTime<Utc>,
+        stale_after: chrono::Duration,
+        condition_id: &str,
+    ) -> Option<&'a RewardSnapshot> {
+        let snapshot = self.snapshot.as_ref()?;
+        let last_success_at = self.last_success_at?;
+        if snapshot.condition_id != condition_id {
+            return None;
+        }
+        if snapshot.total_daily_rate <= Decimal::ZERO {
+            return None;
+        }
+        if snapshot.active_until < now.date_naive() {
+            return None;
+        }
+        if now.signed_duration_since(last_success_at) > stale_after {
+            return None;
+        }
+        Some(snapshot)
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RuntimeFlags {
     pub paused: bool,
@@ -158,6 +201,7 @@ pub struct RuntimeState {
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub last_heartbeat_id: Option<String>,
     pub last_decision_reason: Option<String>,
+    pub reward: RewardState,
 }
 
 impl RuntimeState {

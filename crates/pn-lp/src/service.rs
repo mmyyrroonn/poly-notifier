@@ -56,6 +56,7 @@ pub struct ServiceConfig {
     pub report_interval: Duration,
     pub snapshot_interval: Duration,
     pub max_quote_age: Duration,
+    pub reward_refresh_interval: Duration,
 }
 
 const BOOK_ACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -113,7 +114,9 @@ impl BookActivityTracker {
             .or_insert_with(|| BookActivityWindow::new(book.received_at));
 
         if window.updates > 0 {
-            let gap_ms = (book.received_at - window.last_seen_at).num_milliseconds().max(0);
+            let gap_ms = (book.received_at - window.last_seen_at)
+                .num_milliseconds()
+                .max(0);
             window.total_gap_ms += gap_ms;
             window.gap_samples += 1;
             window.max_gap_ms = window.max_gap_ms.max(gap_ms);
@@ -184,6 +187,8 @@ pub trait ExchangeAdapter: Send + Sync {
     fn start(&self, event_tx: mpsc::UnboundedSender<ExchangeEvent>, cancel: CancellationToken);
 
     async fn reconcile(&self) -> Result<ReconciliationSnapshot>;
+
+    async fn fetch_reward_snapshot(&self) -> Result<Option<crate::types::RewardSnapshot>>;
 
     async fn post_quotes(&self, quotes: &[QuoteIntent]) -> Result<Vec<ManagedOrder>>;
 
@@ -260,6 +265,10 @@ impl LpService {
         reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         reconcile_tick.tick().await;
 
+        let mut reward_tick = interval(self.config.reward_refresh_interval);
+        reward_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        reward_tick.tick().await;
+
         let mut report_tick = interval(self.config.report_interval);
         report_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         report_tick.tick().await;
@@ -294,6 +303,9 @@ impl LpService {
             .await?;
         }
         self.handle_heartbeat_tick(&mut state).await?;
+        if let Err(error) = self.refresh_reward_state(&mut state).await {
+            error!(?error, "startup reward refresh failed");
+        }
         self.refresh_health_flags(&mut state);
         self.recompute_quotes(&mut state).await?;
         self.publish_snapshot(&state);
@@ -337,6 +349,12 @@ impl LpService {
                     post_actions = LoopPostActions::timer_quote_path();
                     if let Err(error) = self.handle_reconciliation_tick(&mut state).await {
                         error!(?error, "reconciliation tick failed");
+                    }
+                }
+                _ = reward_tick.tick() => {
+                    post_actions = LoopPostActions::quote_path();
+                    if let Err(error) = self.refresh_reward_state(&mut state).await {
+                        error!(?error, "reward refresh tick failed");
                     }
                 }
                 _ = report_tick.tick() => {
@@ -393,6 +411,33 @@ impl LpService {
         }
         info!("LP service stopped");
         Ok(())
+    }
+
+    async fn refresh_reward_state(&self, state: &mut RuntimeState) -> Result<()> {
+        let attempted_at = Utc::now();
+        state.reward.last_attempt_at = Some(attempted_at);
+
+        match self.exchange.fetch_reward_snapshot().await {
+            Ok(snapshot) => {
+                let was_active = state.reward.snapshot.is_some();
+                let is_active = snapshot.is_some();
+                state.reward.snapshot = snapshot;
+                state.reward.last_success_at = Some(attempted_at);
+                state.reward.last_error = None;
+                info!(
+                    target: "lp.reward",
+                    was_active,
+                    is_active,
+                    "reward state refreshed"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                state.reward.snapshot = None;
+                state.reward.last_error = Some(error.to_string());
+                Err(error)
+            }
+        }
     }
 
     async fn handle_control_command(
@@ -1308,7 +1353,8 @@ mod tests {
     use crate::risk::{FlattenIntent, RiskConfig};
     use crate::types::{
         AccountSnapshot, BookLevel, BookSnapshot, ManagedOrder, MarketMetadata, PositionSnapshot,
-        QuoteIntent, QuoteSide, RuntimeFlags, RuntimeState, SignalState, TokenMetadata, TradeFill,
+        QuoteIntent, QuoteSide, RewardSnapshot, RewardState, RuntimeFlags, RuntimeState,
+        SignalState, TokenMetadata, TradeFill,
     };
 
     fn runtime_state_with_book() -> RuntimeState {
@@ -1363,6 +1409,19 @@ mod tests {
             last_heartbeat_at: Some(now),
             last_heartbeat_id: Some("hb-1".to_string()),
             last_decision_reason: None,
+            reward: RewardState {
+                snapshot: Some(RewardSnapshot {
+                    condition_id: "condition-1".to_string(),
+                    max_spread: dec!(0.03),
+                    min_size: dec!(50),
+                    total_daily_rate: dec!(4.5),
+                    active_until: chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+                    token_prices: HashMap::from([("asset-yes".to_string(), dec!(0.43))]),
+                }),
+                last_attempt_at: Some(now),
+                last_success_at: Some(now),
+                last_error: None,
+            },
         }
     }
 
@@ -1429,11 +1488,7 @@ mod tests {
         };
 
         assert!(tracker
-            .record(
-                &book,
-                received_at,
-                Duration::from_secs(1),
-            )
+            .record(&book, received_at, Duration::from_secs(1),)
             .is_none());
 
         book.received_at = received_at + chrono::Duration::milliseconds(200);
@@ -1476,7 +1531,10 @@ mod tests {
         flatten_result: Option<TradeFill>,
         reconcile_snapshot: Mutex<Option<ReconciliationSnapshot>>,
         start_events: Mutex<Vec<ExchangeEvent>>,
+        reward_snapshots: Mutex<Vec<TestRewardResponse>>,
     }
+
+    type TestRewardResponse = std::result::Result<Option<RewardSnapshot>, String>;
 
     impl RecordingExchange {
         fn with_flatten_result(flatten_result: Option<TradeFill>) -> Self {
@@ -1496,6 +1554,13 @@ mod tests {
         fn with_start_events(start_events: Vec<ExchangeEvent>) -> Self {
             Self {
                 start_events: Mutex::new(start_events),
+                ..Self::default()
+            }
+        }
+
+        fn with_reward_snapshots(reward_snapshots: Vec<TestRewardResponse>) -> Self {
+            Self {
+                reward_snapshots: Mutex::new(reward_snapshots),
                 ..Self::default()
             }
         }
@@ -1580,6 +1645,15 @@ mod tests {
         async fn merge(&self, _amount: rust_decimal::Decimal) -> Result<String> {
             Ok("tx-test".to_string())
         }
+
+        async fn fetch_reward_snapshot(&self) -> Result<Option<RewardSnapshot>> {
+            self.reward_snapshots
+                .lock()
+                .expect("reward snapshots mutex")
+                .pop()
+                .unwrap_or(Ok(None))
+                .map_err(|error| anyhow!(error))
+        }
     }
 
     #[async_trait]
@@ -1627,6 +1701,10 @@ mod tests {
         async fn merge(&self, _amount: rust_decimal::Decimal) -> Result<String> {
             Ok("tx-test".to_string())
         }
+
+        async fn fetch_reward_snapshot(&self) -> Result<Option<RewardSnapshot>> {
+            Ok(None)
+        }
     }
 
     fn service_config() -> ServiceConfig {
@@ -1639,6 +1717,9 @@ mod tests {
                 quote_offset_ticks: 1,
                 min_usdc_balance: dec!(50),
                 min_token_balance: dec!(10),
+                min_inside_ticks: 1,
+                min_inside_depth_multiple: dec!(1.5),
+                reward_stale_after: chrono::Duration::seconds(30),
             },
             risk: RiskConfig {
                 max_position: dec!(100),
@@ -1653,6 +1734,18 @@ mod tests {
             report_interval: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(3600),
             max_quote_age: Duration::from_secs(10),
+            reward_refresh_interval: Duration::from_secs(60),
+        }
+    }
+
+    fn active_reward_snapshot() -> RewardSnapshot {
+        RewardSnapshot {
+            condition_id: "condition-1".to_string(),
+            max_spread: dec!(0.03),
+            min_size: dec!(50),
+            total_daily_rate: dec!(4.5),
+            active_until: chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+            token_prices: HashMap::from([("asset-yes".to_string(), dec!(0.505))]),
         }
     }
 
@@ -1791,8 +1884,8 @@ mod tests {
     #[tokio::test]
     async fn run_cancels_open_orders_immediately_after_shallow_book_event() {
         let now = Utc::now();
-        let exchange = Arc::new(RecordingExchange::with_start_events(vec![ExchangeEvent::Book(
-            BookSnapshot {
+        let exchange = Arc::new(RecordingExchange::with_start_events(vec![
+            ExchangeEvent::Book(BookSnapshot {
                 asset_id: "asset-yes".to_string(),
                 bids: vec![BookLevel {
                     price: dec!(0.40),
@@ -1803,8 +1896,8 @@ mod tests {
                     size: dec!(100),
                 }],
                 received_at: now,
-            },
-        )]));
+            }),
+        ]));
         let pool = migrated_pool().await;
         let mut initial_state = runtime_state_with_book();
         initial_state.open_orders = vec![ManagedOrder {
@@ -1822,7 +1915,8 @@ mod tests {
         config.report_interval = Duration::from_secs(3600);
         config.snapshot_interval = Duration::from_secs(3600);
 
-        let (service, control) = LpService::new(exchange.clone(), pool, config, None, initial_state);
+        let (service, control) =
+            LpService::new(exchange.clone(), pool, config, None, initial_state);
         let cancel = CancellationToken::new();
         let service_cancel = cancel.clone();
         let handle = tokio::spawn(async move { service.run(service_cancel).await });
@@ -1929,6 +2023,144 @@ mod tests {
                 reason: "test pause".to_string(),
             })
             .is_ok());
+
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("service task join")
+            .expect("service task panicked");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_cancels_open_orders_when_reward_refresh_marks_market_inactive() {
+        let exchange = Arc::new(RecordingExchange::with_reward_snapshots(vec![
+            Ok(None),
+            Ok(Some(active_reward_snapshot())),
+        ]));
+        let pool = migrated_pool().await;
+        let mut initial_state = runtime_state_with_book();
+        let now = Utc::now();
+        initial_state.books.get_mut("asset-yes").unwrap().bids = vec![BookLevel {
+            price: dec!(0.50),
+            size: dec!(100),
+        }];
+        initial_state.books.get_mut("asset-yes").unwrap().asks = vec![BookLevel {
+            price: dec!(0.51),
+            size: dec!(100),
+        }];
+        initial_state
+            .account
+            .token_balances
+            .insert("asset-yes".to_string(), dec!(40));
+        initial_state.reward.snapshot = Some(active_reward_snapshot());
+        initial_state.reward.last_attempt_at = Some(now);
+        initial_state.reward.last_success_at = Some(now);
+        initial_state.open_orders = vec![ManagedOrder {
+            order_id: "sell-1".to_string(),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Sell,
+            price: dec!(0.53),
+            size: dec!(10),
+            created_at: now,
+            status: "LIVE".to_string(),
+        }];
+
+        let mut config = service_config();
+        config.heartbeat_interval = Duration::from_secs(3600);
+        config.reconciliation_interval = Duration::from_secs(3600);
+        config.report_interval = Duration::from_secs(3600);
+        config.snapshot_interval = Duration::from_secs(3600);
+        config.reward_refresh_interval = Duration::from_millis(10);
+
+        let (service, control) =
+            LpService::new(exchange.clone(), pool, config, None, initial_state);
+        let cancel = CancellationToken::new();
+        let service_cancel = cancel.clone();
+        let handle = tokio::spawn(async move { service.run(service_cancel).await });
+
+        timeout(Duration::from_secs(1), async {
+            while exchange.cancel_all_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reward refresh triggers cancel-all");
+
+        let snapshot = control.snapshot();
+        assert!(snapshot.open_orders.is_empty());
+        assert!(snapshot.reward.snapshot.is_none());
+
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("service task join")
+            .expect("service task panicked");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_cancels_open_orders_when_reward_refresh_errors() {
+        let exchange = Arc::new(RecordingExchange::with_reward_snapshots(vec![
+            Err("temporary reward failure".to_string()),
+            Ok(Some(active_reward_snapshot())),
+        ]));
+        let pool = migrated_pool().await;
+        let mut initial_state = runtime_state_with_book();
+        let now = Utc::now();
+        initial_state.books.get_mut("asset-yes").unwrap().bids = vec![BookLevel {
+            price: dec!(0.50),
+            size: dec!(100),
+        }];
+        initial_state.books.get_mut("asset-yes").unwrap().asks = vec![BookLevel {
+            price: dec!(0.51),
+            size: dec!(100),
+        }];
+        initial_state
+            .account
+            .token_balances
+            .insert("asset-yes".to_string(), dec!(40));
+        initial_state.reward.snapshot = Some(active_reward_snapshot());
+        initial_state.reward.last_attempt_at = Some(now);
+        initial_state.reward.last_success_at = Some(now);
+        initial_state.open_orders = vec![ManagedOrder {
+            order_id: "sell-1".to_string(),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Sell,
+            price: dec!(0.53),
+            size: dec!(10),
+            created_at: now,
+            status: "LIVE".to_string(),
+        }];
+
+        let mut config = service_config();
+        config.heartbeat_interval = Duration::from_secs(3600);
+        config.reconciliation_interval = Duration::from_secs(3600);
+        config.report_interval = Duration::from_secs(3600);
+        config.snapshot_interval = Duration::from_secs(3600);
+        config.reward_refresh_interval = Duration::from_millis(10);
+
+        let (service, control) =
+            LpService::new(exchange.clone(), pool, config, None, initial_state);
+        let cancel = CancellationToken::new();
+        let service_cancel = cancel.clone();
+        let handle = tokio::spawn(async move { service.run(service_cancel).await });
+
+        timeout(Duration::from_secs(1), async {
+            while exchange.cancel_all_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reward refresh error triggers cancel-all");
+
+        let snapshot = control.snapshot();
+        assert!(snapshot.open_orders.is_empty());
+        assert!(snapshot.reward.snapshot.is_none());
+        assert_eq!(
+            snapshot.reward.last_error.as_deref(),
+            Some("temporary reward failure")
+        );
 
         cancel.cancel();
         let result = timeout(Duration::from_secs(1), handle)
