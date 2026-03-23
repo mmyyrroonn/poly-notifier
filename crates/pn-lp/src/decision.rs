@@ -3,10 +3,11 @@ use std::str::FromStr;
 use chrono::Utc;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use serde::Serialize;
 
 use crate::types::{BookLevel, BookSnapshot, QuoteIntent, QuoteSide, RewardSnapshot, RuntimeState};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum QuoteMode {
     Join,
     Inside,
@@ -47,10 +48,85 @@ pub struct DecisionOutcome {
     pub desired_quotes: Vec<QuoteIntent>,
     pub cancel_all: bool,
     pub reason: String,
+    pub diagnostics: DecisionDiagnostics,
 }
 
 pub struct DecisionEngine {
     config: DecisionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DecisionDiagnostics {
+    pub quote_mode: QuoteMode,
+    pub quote_size: Decimal,
+    pub min_spread: Decimal,
+    pub min_depth: Decimal,
+    pub quote_offset_ticks: u32,
+    pub min_usdc_balance: Decimal,
+    pub min_token_balance: Decimal,
+    pub min_inside_ticks: u32,
+    pub min_inside_depth_multiple: Decimal,
+    pub min_inside_depth: Decimal,
+    pub reward_stale_after_secs: i64,
+    pub paused: bool,
+    pub flattening: bool,
+    pub heartbeat_healthy: bool,
+    pub market_feed_healthy: bool,
+    pub user_feed_healthy: bool,
+    pub signals_allow_quoting: bool,
+    pub signals: Vec<SignalDecisionDiagnostics>,
+    pub usdc_balance: Decimal,
+    pub open_orders: usize,
+    pub reward_snapshot_present: bool,
+    pub reward_active: bool,
+    pub reward_condition_matches: Option<bool>,
+    pub reward_max_spread: Option<Decimal>,
+    pub reward_min_size: Option<Decimal>,
+    pub reward_total_daily_rate: Option<Decimal>,
+    pub reward_last_attempt_at: Option<chrono::DateTime<Utc>>,
+    pub reward_last_success_at: Option<chrono::DateTime<Utc>>,
+    pub reward_active_until: Option<chrono::NaiveDate>,
+    pub reward_last_error: Option<String>,
+    pub tokens: Vec<TokenDecisionDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SignalDecisionDiagnostics {
+    pub name: String,
+    pub active: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TokenDecisionDiagnostics {
+    pub asset_id: String,
+    pub outcome: String,
+    pub tick_size: Decimal,
+    pub book_present: bool,
+    pub best_bid: Option<Decimal>,
+    pub best_bid_size: Option<Decimal>,
+    pub best_ask: Option<Decimal>,
+    pub best_ask_size: Option<Decimal>,
+    pub spread: Option<Decimal>,
+    pub min_top_depth: Decimal,
+    pub adjusted_midpoint: Option<Decimal>,
+    pub reward_max_spread: Option<Decimal>,
+    pub reward_min_size: Option<Decimal>,
+    pub rejection_reason: Option<String>,
+    pub buy: Option<SideDecisionDiagnostics>,
+    pub sell: Option<SideDecisionDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SideDecisionDiagnostics {
+    pub eligible_by_balance: bool,
+    pub balance_available: Decimal,
+    pub balance_required: Decimal,
+    pub qualifying_price: Option<Decimal>,
+    pub inside_ticks: Option<u32>,
+    pub inside_depth: Option<Decimal>,
+    pub selected: bool,
+    pub rejection_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,17 +137,36 @@ struct CandidateQuote {
     inventory_bias: Decimal,
 }
 
+struct TokenEvaluation {
+    diagnostics: TokenDecisionDiagnostics,
+    candidates: Vec<CandidateQuote>,
+}
+
+struct SideEvaluation {
+    diagnostics: SideDecisionDiagnostics,
+    candidate: Option<CandidateQuote>,
+}
+
 impl DecisionEngine {
     pub fn new(config: DecisionConfig) -> Self {
         Self { config }
     }
 
     pub fn evaluate(&self, state: &RuntimeState) -> DecisionOutcome {
+        let now = Utc::now();
+        let reward = state.reward.active_snapshot(
+            now,
+            self.config.reward_stale_after,
+            &state.market.condition_id,
+        );
+        let mut diagnostics = self.base_diagnostics(state, reward);
+
         if state.flags.paused || state.flags.flattening {
             return DecisionOutcome {
                 desired_quotes: Vec::new(),
                 cancel_all: true,
                 reason: "quoting paused".to_string(),
+                diagnostics,
             };
         }
 
@@ -83,6 +178,7 @@ impl DecisionEngine {
                 desired_quotes: Vec::new(),
                 cancel_all: true,
                 reason: "runtime unhealthy".to_string(),
+                diagnostics,
             };
         }
 
@@ -91,33 +187,35 @@ impl DecisionEngine {
                 desired_quotes: Vec::new(),
                 cancel_all: true,
                 reason: "signal gate blocked quoting".to_string(),
+                diagnostics,
             };
         }
 
-        let now = Utc::now();
-        let Some(reward) = state.reward.active_snapshot(
-            now,
-            self.config.reward_stale_after,
-            &state.market.condition_id,
-        ) else {
+        let Some(reward) = reward else {
             let cancel_all = !state.open_orders.is_empty();
             return DecisionOutcome {
                 desired_quotes: Vec::new(),
                 cancel_all,
                 reason: "reward state inactive".to_string(),
+                diagnostics,
             };
         };
 
         let mut candidates = Vec::new();
         for token in &state.market.tokens {
-            candidates.extend(self.reward_candidates(state, token, reward));
+            let evaluation = self.reward_candidates(state, token, reward);
+            diagnostics.tokens.push(evaluation.diagnostics);
+            candidates.extend(evaluation.candidates);
         }
 
-        let desired_quotes = candidates
+        let desired_quote = candidates
             .into_iter()
             .max_by(|left, right| compare_candidates(left, right))
-            .map(|candidate| vec![candidate.quote])
-            .unwrap_or_default();
+            .map(|candidate| candidate.quote);
+        if let Some(ref quote) = desired_quote {
+            diagnostics.mark_selected(quote);
+        }
+        let desired_quotes = desired_quote.into_iter().collect::<Vec<_>>();
         let cancel_all = desired_quotes.is_empty() && !state.open_orders.is_empty();
         let reason = if desired_quotes.is_empty() {
             "no reward-qualified quotes".to_string()
@@ -129,6 +227,62 @@ impl DecisionEngine {
             desired_quotes,
             cancel_all,
             reason,
+            diagnostics,
+        }
+    }
+
+    fn base_diagnostics(
+        &self,
+        state: &RuntimeState,
+        reward: Option<&RewardSnapshot>,
+    ) -> DecisionDiagnostics {
+        let mut signals = state
+            .signals
+            .iter()
+            .map(|(name, signal)| SignalDecisionDiagnostics {
+                name: name.clone(),
+                active: signal.active,
+                reason: signal.reason.clone(),
+            })
+            .collect::<Vec<_>>();
+        signals.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let snapshot = state.reward.snapshot.as_ref();
+
+        DecisionDiagnostics {
+            quote_mode: self.config.quote_mode,
+            quote_size: self.config.quote_size,
+            min_spread: self.config.min_spread,
+            min_depth: self.config.min_depth,
+            quote_offset_ticks: self.config.quote_offset_ticks,
+            min_usdc_balance: self.config.min_usdc_balance,
+            min_token_balance: self.config.min_token_balance,
+            min_inside_ticks: self.config.min_inside_ticks,
+            min_inside_depth_multiple: self.config.min_inside_depth_multiple,
+            min_inside_depth: self.config.quote_size * self.config.min_inside_depth_multiple,
+            reward_stale_after_secs: self.config.reward_stale_after.num_seconds(),
+            paused: state.flags.paused,
+            flattening: state.flags.flattening,
+            heartbeat_healthy: state.flags.heartbeat_healthy,
+            market_feed_healthy: state.flags.market_feed_healthy,
+            user_feed_healthy: state.flags.user_feed_healthy,
+            signals_allow_quoting: state.active_signals_allow_quoting(),
+            signals,
+            usdc_balance: state.account.usdc_balance,
+            open_orders: state.open_orders.len(),
+            reward_snapshot_present: snapshot.is_some(),
+            reward_active: reward.is_some(),
+            reward_condition_matches: snapshot.map(|snapshot| {
+                snapshot.condition_id == state.market.condition_id
+            }),
+            reward_max_spread: snapshot.map(|snapshot| snapshot.max_spread),
+            reward_min_size: snapshot.map(|snapshot| snapshot.min_size),
+            reward_total_daily_rate: snapshot.map(|snapshot| snapshot.total_daily_rate),
+            reward_last_attempt_at: state.reward.last_attempt_at,
+            reward_last_success_at: state.reward.last_success_at,
+            reward_active_until: snapshot.map(|snapshot| snapshot.active_until),
+            reward_last_error: state.reward.last_error.clone(),
+            tokens: Vec::new(),
         }
     }
 
@@ -137,80 +291,188 @@ impl DecisionEngine {
         state: &RuntimeState,
         token: &crate::types::TokenMetadata,
         reward: &RewardSnapshot,
-    ) -> Vec<CandidateQuote> {
+    ) -> TokenEvaluation {
+        let mut diagnostics = TokenDecisionDiagnostics {
+            asset_id: token.asset_id.clone(),
+            outcome: token.outcome.clone(),
+            tick_size: token.tick_size,
+            book_present: false,
+            best_bid: None,
+            best_bid_size: None,
+            best_ask: None,
+            best_ask_size: None,
+            spread: None,
+            min_top_depth: Decimal::ZERO,
+            adjusted_midpoint: None,
+            reward_max_spread: Some(reward.max_spread),
+            reward_min_size: Some(reward.min_size),
+            rejection_reason: None,
+            buy: None,
+            sell: None,
+        };
         let Some(book) = state.books.get(&token.asset_id) else {
-            return Vec::new();
+            diagnostics.rejection_reason = Some("missing_book".to_string());
+            return TokenEvaluation {
+                diagnostics,
+                candidates: Vec::new(),
+            };
         };
+        diagnostics.book_present = true;
         let (Some(best_bid), Some(best_ask)) = (book.best_bid(), book.best_ask()) else {
-            return Vec::new();
+            diagnostics.rejection_reason = Some("missing_best_levels".to_string());
+            return TokenEvaluation {
+                diagnostics,
+                candidates: Vec::new(),
+            };
         };
+        diagnostics.best_bid = Some(best_bid.price);
+        diagnostics.best_bid_size = Some(best_bid.size);
+        diagnostics.best_ask = Some(best_ask.price);
+        diagnostics.best_ask_size = Some(best_ask.size);
 
         let spread = best_ask.price - best_bid.price;
-        if spread < self.config.min_spread || book.min_top_depth() < self.config.min_depth {
-            return Vec::new();
+        diagnostics.spread = Some(spread);
+        diagnostics.min_top_depth = book.min_top_depth();
+        if spread < self.config.min_spread {
+            diagnostics.rejection_reason = Some("spread_below_min".to_string());
+            return TokenEvaluation {
+                diagnostics,
+                candidates: Vec::new(),
+            };
+        }
+        if diagnostics.min_top_depth < self.config.min_depth {
+            diagnostics.rejection_reason = Some("top_depth_below_min".to_string());
+            return TokenEvaluation {
+                diagnostics,
+                candidates: Vec::new(),
+            };
         }
 
         let Some(adjusted_midpoint) = adjusted_midpoint(book, reward.min_size) else {
-            return Vec::new();
+            diagnostics.rejection_reason = Some("reward_depth_unavailable".to_string());
+            return TokenEvaluation {
+                diagnostics,
+                candidates: Vec::new(),
+            };
         };
+        diagnostics.adjusted_midpoint = Some(adjusted_midpoint);
         if adjusted_midpoint < Decimal::new(10, 2) || adjusted_midpoint > Decimal::new(90, 2) {
-            return Vec::new();
+            diagnostics.rejection_reason = Some("adjusted_midpoint_out_of_range".to_string());
+            return TokenEvaluation {
+                diagnostics,
+                candidates: Vec::new(),
+            };
         }
 
         let mut candidates = Vec::new();
-        if state.account.usdc_balance >= self.config.min_usdc_balance {
-            if let Some(price) =
-                qualifying_bid_price(adjusted_midpoint, reward.max_spread, token.tick_size)
-            {
-                if let Some(candidate) = self.build_candidate(
-                    state,
-                    token.asset_id.as_str(),
-                    book,
-                    QuoteSide::Buy,
-                    price,
-                    token.tick_size,
-                ) {
-                    candidates.push(candidate);
-                }
-            }
+        let buy = self.evaluate_side(
+            state,
+            token.asset_id.as_str(),
+            book,
+            QuoteSide::Buy,
+            adjusted_midpoint,
+            reward.max_spread,
+            token.tick_size,
+        );
+        diagnostics.buy = Some(buy.diagnostics);
+        if let Some(candidate) = buy.candidate {
+            candidates.push(candidate);
         }
 
-        if state.account.token_balance(&token.asset_id) >= self.config.min_token_balance {
-            if let Some(price) =
-                qualifying_ask_price(adjusted_midpoint, reward.max_spread, token.tick_size)
-            {
-                if let Some(candidate) = self.build_candidate(
-                    state,
-                    token.asset_id.as_str(),
-                    book,
-                    QuoteSide::Sell,
-                    price,
-                    token.tick_size,
-                ) {
-                    candidates.push(candidate);
-                }
-            }
+        let sell = self.evaluate_side(
+            state,
+            token.asset_id.as_str(),
+            book,
+            QuoteSide::Sell,
+            adjusted_midpoint,
+            reward.max_spread,
+            token.tick_size,
+        );
+        diagnostics.sell = Some(sell.diagnostics);
+        if let Some(candidate) = sell.candidate {
+            candidates.push(candidate);
         }
 
-        candidates
+        if candidates.is_empty() {
+            diagnostics.rejection_reason = Some("no_side_qualified".to_string());
+        }
+
+        TokenEvaluation {
+            diagnostics,
+            candidates,
+        }
     }
 
-    fn build_candidate(
+    fn evaluate_side(
         &self,
         state: &RuntimeState,
         asset_id: &str,
         book: &BookSnapshot,
         side: QuoteSide,
-        price: Decimal,
+        adjusted_midpoint: Decimal,
+        reward_max_spread: Decimal,
         tick_size: Decimal,
-    ) -> Option<CandidateQuote> {
+    ) -> SideEvaluation {
+        let (balance_available, balance_required, qualifying_price, rejection_reason) = match side {
+            QuoteSide::Buy => (
+                state.account.usdc_balance,
+                self.config.min_usdc_balance,
+                qualifying_bid_price(adjusted_midpoint, reward_max_spread, tick_size),
+                "insufficient_usdc_balance",
+            ),
+            QuoteSide::Sell => (
+                state.account.token_balance(asset_id),
+                self.config.min_token_balance,
+                qualifying_ask_price(adjusted_midpoint, reward_max_spread, tick_size),
+                "insufficient_token_balance",
+            ),
+        };
+
+        let mut diagnostics = SideDecisionDiagnostics {
+            eligible_by_balance: balance_available >= balance_required,
+            balance_available,
+            balance_required,
+            qualifying_price: None,
+            inside_ticks: None,
+            inside_depth: None,
+            selected: false,
+            rejection_reason: None,
+        };
+
+        if !diagnostics.eligible_by_balance {
+            diagnostics.rejection_reason = Some(rejection_reason.to_string());
+            return SideEvaluation {
+                diagnostics,
+                candidate: None,
+            };
+        }
+
+        let Some(price) = qualifying_price else {
+            diagnostics.rejection_reason = Some("qualifying_price_unavailable".to_string());
+            return SideEvaluation {
+                diagnostics,
+                candidate: None,
+            };
+        };
+        diagnostics.qualifying_price = Some(price);
+
         let inside_ticks = inside_ticks(book, side.clone(), price, tick_size);
         let inside_depth = inside_depth(book, side.clone(), price);
+        diagnostics.inside_ticks = Some(inside_ticks);
+        diagnostics.inside_depth = Some(inside_depth);
         if inside_ticks < self.config.min_inside_ticks {
-            return None;
+            diagnostics.rejection_reason = Some("inside_ticks_below_min".to_string());
+            return SideEvaluation {
+                diagnostics,
+                candidate: None,
+            };
         }
         if inside_depth < self.config.quote_size * self.config.min_inside_depth_multiple {
-            return None;
+            diagnostics.rejection_reason = Some("inside_depth_below_min".to_string());
+            return SideEvaluation {
+                diagnostics,
+                candidate: None,
+            };
         }
 
         let inventory_bias = match side {
@@ -218,18 +480,35 @@ impl DecisionEngine {
             QuoteSide::Buy => Decimal::ZERO,
         };
 
-        Some(CandidateQuote {
-            quote: QuoteIntent {
-                asset_id: asset_id.to_string(),
-                side,
-                price,
-                size: self.config.quote_size,
-                reason: "reward-qualified quote".to_string(),
-            },
-            inside_ticks,
-            inside_depth,
-            inventory_bias,
-        })
+        SideEvaluation {
+            diagnostics,
+            candidate: Some(CandidateQuote {
+                quote: QuoteIntent {
+                    asset_id: asset_id.to_string(),
+                    side,
+                    price,
+                    size: self.config.quote_size,
+                    reason: "reward-qualified quote".to_string(),
+                },
+                inside_ticks,
+                inside_depth,
+                inventory_bias,
+            }),
+        }
+    }
+}
+
+impl DecisionDiagnostics {
+    fn mark_selected(&mut self, quote: &QuoteIntent) {
+        if let Some(token) = self.tokens.iter_mut().find(|token| token.asset_id == quote.asset_id) {
+            let side = match quote.side {
+                QuoteSide::Buy => &mut token.buy,
+                QuoteSide::Sell => &mut token.sell,
+            };
+            if let Some(side) = side.as_mut() {
+                side.selected = true;
+            }
+        }
     }
 }
 
@@ -645,5 +924,55 @@ mod tests {
 
         assert!(outcome.desired_quotes.is_empty());
         assert_eq!(outcome.reason, "no reward-qualified quotes");
+    }
+
+    #[test]
+    fn reward_aware_mode_exposes_rejection_diagnostics() {
+        let engine = DecisionEngine::new(decision_config(QuoteMode::Inside, 1));
+        let mut state = test_state();
+        state.account.token_balances.clear();
+        state.reward = active_reward_state(Utc::now(), dec!(0.01));
+        state.books.get_mut("asset-yes").unwrap().bids = vec![BookLevel {
+            price: dec!(0.50),
+            size: dec!(100),
+        }];
+        state.books.get_mut("asset-yes").unwrap().asks = vec![BookLevel {
+            price: dec!(0.51),
+            size: dec!(100),
+        }];
+
+        let outcome = engine.evaluate(&state);
+        let token = outcome
+            .diagnostics
+            .tokens
+            .iter()
+            .find(|token| token.asset_id == "asset-yes")
+            .expect("asset diagnostics");
+
+        assert_eq!(outcome.reason, "no reward-qualified quotes");
+        assert_eq!(outcome.diagnostics.quote_size, dec!(10));
+        assert_eq!(outcome.diagnostics.quote_offset_ticks, 1);
+        assert_eq!(outcome.diagnostics.min_inside_ticks, 1);
+        assert_eq!(outcome.diagnostics.min_inside_depth, dec!(15));
+        assert_eq!(token.best_bid, Some(dec!(0.50)));
+        assert_eq!(token.best_ask, Some(dec!(0.51)));
+        assert_eq!(token.spread, Some(dec!(0.01)));
+        assert_eq!(token.adjusted_midpoint, Some(dec!(0.505)));
+        assert_eq!(token.reward_max_spread, Some(dec!(0.01)));
+        assert_eq!(token.reward_min_size, Some(dec!(50)));
+        let buy = token.buy.as_ref().expect("buy diagnostics");
+        assert_eq!(buy.qualifying_price, Some(dec!(0.50)));
+        assert_eq!(buy.inside_ticks, Some(0));
+        assert_eq!(buy.inside_depth, Some(dec!(0)));
+        assert_eq!(
+            buy.rejection_reason.as_deref(),
+            Some("inside_ticks_below_min")
+        );
+        let sell = token.sell.as_ref().expect("sell diagnostics");
+        assert!(!sell.eligible_by_balance);
+        assert_eq!(
+            sell.rejection_reason.as_deref(),
+            Some("insufficient_token_balance")
+        );
     }
 }

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::control::{ControlCommand, LpControlHandle};
-use crate::decision::{DecisionConfig, DecisionEngine, DecisionOutcome};
+use crate::decision::{DecisionConfig, DecisionDiagnostics, DecisionEngine, DecisionOutcome};
 use crate::observability::{signal_transitions, summarize_quotes};
 use crate::risk::{FlattenIntent, RiskAction, RiskConfig, RiskEngine};
 use crate::signals::{SignalAggregator, SignalUpdate};
@@ -137,7 +137,7 @@ impl BookActivityTracker {
             asset_id: book.asset_id.clone(),
             updates: window.updates,
             avg_gap_ms: (window.gap_samples > 0)
-                .then_some(window.total_gap_ms / window.gap_samples as i64),
+                .then(|| window.total_gap_ms / window.gap_samples as i64),
             max_gap_ms: (window.gap_samples > 0).then_some(window.max_gap_ms),
             processing_lag_ms: now
                 .signed_duration_since(book.received_at)
@@ -219,6 +219,7 @@ pub struct LpService {
     reporter: Option<Arc<dyn Reporter>>,
     control_rx: mpsc::UnboundedReceiver<ControlCommand>,
     snapshot_tx: watch::Sender<RuntimeState>,
+    last_decision_diagnostics: Mutex<Option<DecisionDiagnostics>>,
     book_activity: Mutex<BookActivityTracker>,
     book_activity_log_interval: Duration,
 }
@@ -244,6 +245,7 @@ impl LpService {
                 reporter,
                 control_rx,
                 snapshot_tx,
+                last_decision_diagnostics: Mutex::new(None),
                 book_activity: Mutex::new(BookActivityTracker::default()),
                 book_activity_log_interval: BOOK_ACTIVITY_LOG_INTERVAL,
             },
@@ -859,13 +861,34 @@ impl LpService {
         let previous_reason = state.last_decision_reason.clone();
         let outcome = self.decision.evaluate(state);
         state.last_decision_reason = Some(outcome.reason.clone());
-        if previous_reason.as_deref() != Some(outcome.reason.as_str()) {
+        let diagnostics_changed = {
+            let mut previous = self
+                .last_decision_diagnostics
+                .lock()
+                .expect("decision diagnostics mutex");
+            let changed = previous.as_ref() != Some(&outcome.diagnostics);
+            *previous = Some(outcome.diagnostics.clone());
+            changed
+        };
+        let should_log_decision =
+            previous_reason.as_deref() != Some(outcome.reason.as_str()) || diagnostics_changed;
+        let should_log_cancel = outcome.cancel_all && !state.open_orders.is_empty();
+        let diagnostics = if should_log_decision || should_log_cancel {
+            Some(
+                serde_json::to_string(&outcome.diagnostics)
+                    .unwrap_or_else(|error| format!("{{\"serialization_error\":\"{error}\"}}")),
+            )
+        } else {
+            None
+        };
+        if should_log_decision {
             info!(
                 target: "lp.decision",
                 reason = %outcome.reason,
                 cancel_all = outcome.cancel_all,
                 desired_quotes = outcome.desired_quotes.len(),
                 quotes = %summarize_quotes(&outcome.desired_quotes),
+                diagnostics = %diagnostics.as_deref().unwrap_or("{}"),
                 "decision updated"
             );
         }
@@ -876,6 +899,7 @@ impl LpService {
                     target: "lp.quote",
                     open_orders = state.open_orders.len(),
                     reason = %outcome.reason,
+                    diagnostics = %diagnostics.as_deref().unwrap_or("{}"),
                     "decision requested quote cancellation"
                 );
                 self.exchange.cancel_all().await?;
@@ -1348,8 +1372,7 @@ mod tests {
         ExchangeAdapter, ExchangeEvent, LpService, ReconciliationSnapshot, ServiceConfig,
     };
     use crate::control::ControlCommand;
-    use crate::decision::DecisionConfig;
-    use crate::decision::DecisionOutcome;
+    use crate::decision::{DecisionConfig, DecisionEngine, DecisionOutcome};
     use crate::risk::{FlattenIntent, RiskConfig};
     use crate::types::{
         AccountSnapshot, BookLevel, BookSnapshot, ManagedOrder, MarketMetadata, PositionSnapshot,
@@ -1423,6 +1446,12 @@ mod tests {
                 last_error: None,
             },
         }
+    }
+
+    fn placeholder_decision_diagnostics() -> crate::decision::DecisionDiagnostics {
+        DecisionEngine::new(service_config().decision.clone())
+            .evaluate(&runtime_state_with_book())
+            .diagnostics
     }
 
     #[test]
@@ -1517,6 +1546,41 @@ mod tests {
         assert_eq!(snapshot.min_top_depth, dec!(30));
         assert_eq!(snapshot.best_bid, Some(dec!(0.40)));
         assert_eq!(snapshot.best_ask, Some(dec!(0.46)));
+    }
+
+    #[test]
+    fn book_activity_tracker_handles_single_update_window() {
+        let received_at = Utc::now();
+        let mut tracker = BookActivityTracker::default();
+        let book = BookSnapshot {
+            asset_id: "asset-no".to_string(),
+            bids: vec![BookLevel {
+                price: dec!(0.51),
+                size: dec!(25),
+            }],
+            asks: vec![BookLevel {
+                price: dec!(0.53),
+                size: dec!(20),
+            }],
+            received_at,
+        };
+
+        let snapshot = tracker
+            .record(
+                &book,
+                received_at + chrono::Duration::milliseconds(1200),
+                Duration::from_secs(1),
+            )
+            .expect("window snapshot");
+
+        assert_eq!(snapshot.asset_id, "asset-no");
+        assert_eq!(snapshot.updates, 1);
+        assert_eq!(snapshot.avg_gap_ms, None);
+        assert_eq!(snapshot.max_gap_ms, None);
+        assert_eq!(snapshot.processing_lag_ms, 1200);
+        assert_eq!(snapshot.min_top_depth, dec!(20));
+        assert_eq!(snapshot.best_bid, Some(dec!(0.51)));
+        assert_eq!(snapshot.best_ask, Some(dec!(0.53)));
     }
 
     #[derive(Default)]
@@ -2193,6 +2257,7 @@ mod tests {
             }],
             cancel_all: false,
             reason: "test".to_string(),
+            diagnostics: placeholder_decision_diagnostics(),
         };
 
         assert!(!desired_quotes_match(
@@ -2225,6 +2290,7 @@ mod tests {
             }],
             cancel_all: false,
             reason: "test".to_string(),
+            diagnostics: placeholder_decision_diagnostics(),
         };
 
         assert!(!desired_quotes_match(
