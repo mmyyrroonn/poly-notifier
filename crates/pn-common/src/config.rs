@@ -88,12 +88,6 @@ pub struct GuardConfig {
     /// How often the guard checks for missed heartbeats.
     #[serde(default = "default_guard_check_interval")]
     pub check_interval_secs: u64,
-    /// Optional override for the admin API base URL.
-    #[serde(default)]
-    pub admin_base_url: Option<String>,
-    /// HTTP timeout used when the guard calls cancel-all.
-    #[serde(default = "default_guard_request_timeout")]
-    pub request_timeout_secs: u64,
 }
 
 /// LP daemon trading/client settings.
@@ -399,10 +393,6 @@ fn default_guard_check_interval() -> u64 {
     1
 }
 
-fn default_guard_request_timeout() -> u64 {
-    5
-}
-
 fn default_log_directory() -> String {
     "logs".to_string()
 }
@@ -437,8 +427,6 @@ impl Default for GuardConfig {
             heartbeat_interval_secs: default_guard_heartbeat_interval(),
             heartbeat_timeout_secs: default_guard_heartbeat_timeout(),
             check_interval_secs: default_guard_check_interval(),
-            admin_base_url: None,
-            request_timeout_secs: default_guard_request_timeout(),
         }
     }
 }

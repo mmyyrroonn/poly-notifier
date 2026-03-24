@@ -103,6 +103,12 @@ pub struct ExecutionConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct DirectCancelConfig {
+    pub clob_base_url: String,
+    pub chain_id: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ApprovalTarget {
     pub label: String,
     pub address: Address,
@@ -259,6 +265,80 @@ pub struct PolymarketExecutionClient {
     neg_risk_adapter: Option<Address>,
 }
 
+pub struct PolymarketDirectCancelClient {
+    clob: AuthenticatedClobClient,
+}
+
+type AuthenticatedClobClient = clob::Client<
+    polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+>;
+
+async fn connect_authenticated_clob(
+    clob_base_url: &str,
+    chain_id: u64,
+) -> Result<(PrivateKeySigner, TradingAccount, AuthenticatedClobClient)> {
+    let private_key = env::var(PRIVATE_KEY_VAR)
+        .with_context(|| format!("{PRIVATE_KEY_VAR} environment variable is required"))?;
+    let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(chain_id));
+    let funder_address = env::var(FUNDER_ADDRESS_VAR).ok();
+    let signature_type = env::var(SIGNATURE_TYPE_VAR).ok();
+    let account = resolve_trading_account(
+        signer.address(),
+        chain_id,
+        funder_address.as_deref(),
+        signature_type.as_deref(),
+    )?;
+
+    let clob_config = clob::Config::builder()
+        .heartbeat_interval(Duration::from_secs(5))
+        .build();
+    let mut auth = clob::Client::new(clob_base_url, clob_config)?
+        .authentication_builder(&signer)
+        .signature_type(account.signature_type());
+    if let Some(funder) = account.funder {
+        auth = auth.funder(funder);
+    }
+    let mut clob = auth.authenticate().await?;
+
+    if clob.heartbeats_active() {
+        clob.stop_heartbeats().await?;
+    }
+
+    Ok((signer, account, clob))
+}
+
+impl PolymarketDirectCancelClient {
+    pub async fn connect(config: DirectCancelConfig) -> Result<Self> {
+        info!(
+            target: "pn_polymarket::direct_cancel",
+            clob_base_url = %config.clob_base_url,
+            chain_id = config.chain_id,
+            "connecting direct Polymarket cancel client"
+        );
+        let (_signer, account, clob) =
+            connect_authenticated_clob(&config.clob_base_url, config.chain_id).await?;
+
+        info!(
+            target: "pn_polymarket::direct_cancel",
+            signer = %account.signer,
+            trading_address = %account.trading_address(),
+            signature_type = ?account.signature_type(),
+            "direct Polymarket cancel client connected"
+        );
+
+        Ok(Self { clob })
+    }
+
+    pub async fn cancel_all(&self) -> Result<()> {
+        info!(
+            target: "pn_polymarket::direct_cancel",
+            "canceling all open orders"
+        );
+        self.clob.cancel_all_orders().await?;
+        Ok(())
+    }
+}
+
 impl PolymarketExecutionClient {
     pub async fn connect(config: ExecutionConfig) -> Result<Self> {
         info!(
@@ -269,32 +349,8 @@ impl PolymarketExecutionClient {
             chain_id = config.chain_id,
             "connecting authenticated Polymarket execution client"
         );
-        let private_key = env::var(PRIVATE_KEY_VAR)
-            .with_context(|| format!("{PRIVATE_KEY_VAR} environment variable is required"))?;
-        let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(config.chain_id));
-        let funder_address = env::var(FUNDER_ADDRESS_VAR).ok();
-        let signature_type = env::var(SIGNATURE_TYPE_VAR).ok();
-        let account = resolve_trading_account(
-            signer.address(),
-            config.chain_id,
-            funder_address.as_deref(),
-            signature_type.as_deref(),
-        )?;
-
-        let clob_config = clob::Config::builder()
-            .heartbeat_interval(Duration::from_secs(5))
-            .build();
-        let mut auth = clob::Client::new(&config.clob_base_url, clob_config)?
-            .authentication_builder(&signer)
-            .signature_type(account.signature_type());
-        if let Some(funder) = account.funder {
-            auth = auth.funder(funder);
-        }
-        let mut clob = auth.authenticate().await?;
-
-        if clob.heartbeats_active() {
-            clob.stop_heartbeats().await?;
-        }
+        let (signer, account, clob) =
+            connect_authenticated_clob(&config.clob_base_url, config.chain_id).await?;
 
         let condition_id = B256::from_str(&config.condition_id)
             .with_context(|| format!("invalid condition id {}", config.condition_id))?;

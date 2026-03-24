@@ -31,8 +31,6 @@ port = 37373
 heartbeat_interval_secs = 5
 heartbeat_timeout_secs = 15
 check_interval_secs = 1
-admin_base_url = ""
-request_timeout_secs = 5
 
 [lp.trading]
 condition_id = "0x306d10d4a4d51b41910dbc779ca00908bd917c131541c5c42bbbc736258d2d56"

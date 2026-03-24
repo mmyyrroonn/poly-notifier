@@ -11,6 +11,7 @@ use axum::{
     Json, Router,
 };
 use pn_common::config::AppConfig;
+use pn_polymarket::DirectCancelConfig;
 use reqwest::Client;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -28,9 +29,6 @@ pub struct GuardRuntimeConfig {
     pub port: u16,
     pub heartbeat_timeout: Duration,
     pub check_interval: Duration,
-    pub request_timeout: Duration,
-    pub cancel_url: String,
-    pub admin_password: String,
 }
 
 #[derive(Debug)]
@@ -60,33 +58,8 @@ struct SharedState {
 }
 
 #[async_trait]
-trait CancelAllTransport: Send + Sync {
-    async fn cancel_all(&self, cancel_url: &str, admin_password: &str, reason: &str) -> Result<()>;
-}
-
-struct ReqwestCancelAllTransport {
-    client: Client,
-}
-
-#[async_trait]
-impl CancelAllTransport for ReqwestCancelAllTransport {
-    async fn cancel_all(&self, cancel_url: &str, admin_password: &str, reason: &str) -> Result<()> {
-        let response = self
-            .client
-            .post(cancel_url)
-            .bearer_auth(admin_password)
-            .json(&serde_json::json!({ "reason": reason }))
-            .send()
-            .await
-            .with_context(|| format!("failed to call cancel-all endpoint {cancel_url}"))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("cancel-all returned status {status}: {body}"));
-        }
-
-        Ok(())
-    }
+pub trait CancelAllTransport: Send + Sync {
+    async fn cancel_all(&self, reason: &str) -> Result<()>;
 }
 
 pub fn guard_heartbeat_url(config: &AppConfig) -> Option<String> {
@@ -102,31 +75,19 @@ pub fn guard_heartbeat_url(config: &AppConfig) -> Option<String> {
     ))
 }
 
-pub fn guard_cancel_url(config: &AppConfig) -> String {
-    let base_url = config
-        .guard
-        .admin_base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", config.admin.port));
-
-    format!("{}/admin/lp/cancel-all", base_url.trim_end_matches('/'))
-}
-
-pub fn build_guard_runtime_config(
-    config: &AppConfig,
-    admin_password: String,
-) -> GuardRuntimeConfig {
+pub fn build_guard_runtime_config(config: &AppConfig) -> GuardRuntimeConfig {
     GuardRuntimeConfig {
         bind_addr: config.guard.bind_addr.clone(),
         port: config.guard.port,
         heartbeat_timeout: Duration::from_secs(config.guard.heartbeat_timeout_secs),
         check_interval: Duration::from_secs(config.guard.check_interval_secs),
-        request_timeout: Duration::from_secs(config.guard.request_timeout_secs),
-        cancel_url: guard_cancel_url(config),
-        admin_password,
+    }
+}
+
+pub fn build_guard_cancel_config(config: &AppConfig) -> DirectCancelConfig {
+    DirectCancelConfig {
+        clob_base_url: config.lp.trading.clob_base_url.clone(),
+        chain_id: config.lp.trading.chain_id,
     }
 }
 
@@ -181,18 +142,19 @@ pub fn spawn_guard_heartbeat_loop(
     })
 }
 
-pub async fn run_guard(
+pub async fn run_guard<T>(
     config: GuardRuntimeConfig,
+    transport: T,
     cancel: CancellationToken,
-) -> Result<(SocketAddr, JoinHandle<Result<()>>)> {
+) -> Result<(SocketAddr, JoinHandle<Result<()>>)>
+where
+    T: CancelAllTransport + 'static,
+{
     let GuardRuntimeConfig {
         bind_addr,
         port,
         heartbeat_timeout,
         check_interval,
-        request_timeout,
-        cancel_url,
-        admin_password,
     } = config;
     let shared_state = SharedState {
         guard: Arc::new(Mutex::new(GuardState::new(Instant::now()))),
@@ -209,12 +171,6 @@ pub async fn run_guard(
     let server_cancel = cancel.clone();
     let watchdog_cancel = cancel.clone();
     let watchdog_state = shared_state.clone();
-    let client = Client::builder()
-        .timeout(request_timeout)
-        .build()
-        .context("failed to build guard admin client")?;
-    let transport = ReqwestCancelAllTransport { client };
-    let logged_cancel_url = cancel_url.clone();
 
     let task = tokio::spawn(async move {
         let watchdog = tokio::spawn(async move {
@@ -226,13 +182,9 @@ pub async fn run_guard(
                 tokio::select! {
                     () = watchdog_cancel.cancelled() => break,
                     _ = tick.tick() => {
-                        if let Err(error) = maybe_cancel_all(
-                            &watchdog_state,
-                            &transport,
-                            &cancel_url,
-                            &admin_password,
-                            heartbeat_timeout,
-                        ).await {
+                        if let Err(error) =
+                            maybe_cancel_all(&watchdog_state, &transport, heartbeat_timeout).await
+                        {
                             warn!(?error, "guard cancel-all attempt failed");
                         }
                     }
@@ -246,9 +198,7 @@ pub async fn run_guard(
             .await
             .context("guard HTTP server failed");
 
-        let watchdog_result = watchdog
-            .await
-            .context("guard watchdog task join failed")?;
+        let watchdog_result = watchdog.await.context("guard watchdog task join failed")?;
 
         serve_result?;
         watchdog_result?;
@@ -258,7 +208,6 @@ pub async fn run_guard(
     info!(
         %listen_addr,
         heartbeat_timeout_secs = heartbeat_timeout.as_secs(),
-        %logged_cancel_url,
         "guard listening"
     );
 
@@ -287,8 +236,6 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
 async fn maybe_cancel_all(
     state: &SharedState,
     transport: &dyn CancelAllTransport,
-    cancel_url: &str,
-    admin_password: &str,
     heartbeat_timeout: Duration,
 ) -> Result<()> {
     {
@@ -302,7 +249,7 @@ async fn maybe_cancel_all(
         "guard heartbeat timeout after {}s",
         heartbeat_timeout.as_secs_f64()
     );
-    if let Err(error) = transport.cancel_all(cancel_url, admin_password, &reason).await {
+    if let Err(error) = transport.cancel_all(&reason).await {
         let mut guard = state.guard.lock().await;
         guard.last_cancel_error = Some(error.to_string());
         return Err(error);
@@ -338,24 +285,24 @@ mod tests {
 
     struct RecordingTransport {
         calls: AtomicUsize,
-        last_url: Mutex<Option<String>>,
-        last_auth: Mutex<Option<String>>,
         last_reason: Mutex<Option<String>>,
     }
 
     #[async_trait]
     impl CancelAllTransport for RecordingTransport {
-        async fn cancel_all(
-            &self,
-            cancel_url: &str,
-            admin_password: &str,
-            reason: &str,
-        ) -> Result<()> {
+        async fn cancel_all(&self, reason: &str) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_url.lock().await = Some(cancel_url.to_string());
-            *self.last_auth.lock().await = Some(admin_password.to_string());
             *self.last_reason.lock().await = Some(reason.to_string());
             Ok(())
+        }
+    }
+
+    struct FailingTransport;
+
+    #[async_trait]
+    impl CancelAllTransport for FailingTransport {
+        async fn cancel_all(&self, _reason: &str) -> Result<()> {
+            Err(anyhow!("direct cancel failed"))
         }
     }
 
@@ -390,8 +337,6 @@ mod tests {
                 heartbeat_interval_secs: 5,
                 heartbeat_timeout_secs: 15,
                 check_interval_secs: 1,
-                admin_base_url: None,
-                request_timeout_secs: 5,
             },
             lp: LpConfig {
                 trading: LpTradingConfig {
@@ -467,10 +412,15 @@ mod tests {
             guard_heartbeat_url(&config).as_deref(),
             Some("http://127.0.0.1:37373/heartbeat")
         );
-        assert_eq!(
-            guard_cancel_url(&config),
-            "http://127.0.0.1:36363/admin/lp/cancel-all"
-        );
+    }
+
+    #[test]
+    fn build_guard_cancel_config_uses_only_direct_cancel_settings() {
+        let config = test_config();
+        let cancel = build_guard_cancel_config(&config);
+
+        assert_eq!(cancel.clob_base_url, "https://clob.example");
+        assert_eq!(cancel.chain_id, 137);
     }
 
     #[tokio::test]
@@ -490,7 +440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maybe_cancel_all_triggers_once_per_missed_heartbeat_window() {
+    async fn maybe_cancel_all_uses_direct_transport_once_per_missed_heartbeat_window() {
         let state = test_state();
         {
             let mut guard = state.guard.lock().await;
@@ -498,61 +448,56 @@ mod tests {
         }
         let transport = RecordingTransport {
             calls: AtomicUsize::new(0),
-            last_url: Mutex::new(None),
-            last_auth: Mutex::new(None),
             last_reason: Mutex::new(None),
         };
 
-        maybe_cancel_all(
-            &state,
-            &transport,
-            "http://127.0.0.1:36363/admin/lp/cancel-all",
-            "secret",
-            Duration::from_secs(15),
-        )
-        .await
-        .expect("cancel-all should be triggered");
-        maybe_cancel_all(
-            &state,
-            &transport,
-            "http://127.0.0.1:36363/admin/lp/cancel-all",
-            "secret",
-            Duration::from_secs(15),
-        )
-        .await
-        .expect("repeat check should be ignored after first cancel");
+        maybe_cancel_all(&state, &transport, Duration::from_secs(15))
+            .await
+            .expect("direct cancel should be triggered");
+        maybe_cancel_all(&state, &transport, Duration::from_secs(15))
+            .await
+            .expect("repeat check should be ignored after first cancel");
 
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            transport.last_url.lock().await.as_deref(),
-            Some("http://127.0.0.1:36363/admin/lp/cancel-all")
-        );
-        assert_eq!(transport.last_auth.lock().await.as_deref(), Some("secret"));
-        assert!(
-            transport
-                .last_reason
-                .lock()
-                .await
-                .as_deref()
-                .unwrap_or_default()
-                .contains("guard heartbeat timeout")
-        );
+        assert!(transport
+            .last_reason
+            .lock()
+            .await
+            .as_deref()
+            .unwrap_or_default()
+            .contains("guard heartbeat timeout"));
 
         let _ = heartbeat(State(state.clone())).await.into_response();
         {
             let mut guard = state.guard.lock().await;
             guard.last_heartbeat_at = Instant::now() - Duration::from_secs(30);
         }
-        maybe_cancel_all(
-            &state,
-            &transport,
-            "http://127.0.0.1:36363/admin/lp/cancel-all",
-            "secret",
-            Duration::from_secs(15),
-        )
-        .await
-        .expect("cancel-all should trigger again after a new heartbeat window");
+        maybe_cancel_all(&state, &transport, Duration::from_secs(15))
+            .await
+            .expect("direct cancel should trigger again after a new heartbeat window");
 
         assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn maybe_cancel_all_records_error_and_does_not_trip_guard_when_direct_cancel_fails() {
+        let state = test_state();
+        {
+            let mut guard = state.guard.lock().await;
+            guard.last_heartbeat_at = Instant::now() - Duration::from_secs(30);
+        }
+
+        let error = maybe_cancel_all(&state, &FailingTransport, Duration::from_secs(15))
+            .await
+            .expect_err("direct cancel should fail");
+        assert!(error.to_string().contains("direct cancel failed"));
+
+        let guard = state.guard.lock().await;
+        assert!(!guard.cancel_triggered);
+        assert_eq!(guard.cancel_count, 0);
+        assert_eq!(
+            guard.last_cancel_error.as_deref(),
+            Some("direct cancel failed")
+        );
     }
 }

@@ -22,7 +22,7 @@
 cargo run -p poly-lp --release
 ```
 
-## 必配项
+## `poly-lp` 必配项
 
 - `POLYMARKET_PRIVATE_KEY`
 - `APP__LP__TRADING__CONDITION_ID`
@@ -35,6 +35,28 @@ cargo run -p poly-lp --release
 - `APP__DATABASE__URL`
 - `APP__LP__REPORTING__OPERATOR_CHAT_IDS`
 - `TELEGRAM_BOT_TOKENS`
+
+## 外部 guard
+
+`poly-guard` 现在是直接连 Polymarket 做 `cancel_all`，不再回调主程序的 `/admin/lp/cancel-all`。
+
+两机部署时建议这样配：
+
+- 主程序机器
+  `APP__GUARD__ENABLED=true`
+  `APP__GUARD__BIND_ADDR=<guard机器IP或域名>`
+  `APP__GUARD__PORT=37373`
+  `APP__LP__CONTROL__BIND_ADDR` 只影响主程序自己的 admin API 监听地址，不再是 guard 的取消依赖。
+- guard 机器
+  也需要自己的 `POLYMARKET_PRIVATE_KEY`
+  如果你用 proxy/safe 账户，也要配 `POLYMARKET_FUNDER_ADDRESS` / `POLYMARKET_SIGNATURE_TYPE`
+  直连撤单只需要能认证到同一个交易账户；不依赖 `ADMIN_PASSWORD`
+  需要正确的 `clob_base_url` 和 `chain_id`
+  `APP__GUARD__ENABLED=true`
+  `APP__GUARD__BIND_ADDR=0.0.0.0`
+  `APP__GUARD__PORT=37373`
+
+行为上，guard 触发全撤后，主程序会在下一次 reconciliation 把外部撤单同步回来；如果你希望收敛更快，可以把 `APP__LP__CONTROL__RECONCILIATION_INTERVAL_SECS` 调小一点，例如 `5`。
 
 ## 当前可配置参数
 
