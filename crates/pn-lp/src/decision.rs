@@ -123,6 +123,7 @@ pub struct SideDecisionDiagnostics {
     pub balance_available: Decimal,
     pub balance_required: Decimal,
     pub qualifying_price: Option<Decimal>,
+    pub quote_price: Option<Decimal>,
     pub inside_ticks: Option<u32>,
     pub inside_depth: Option<Decimal>,
     pub selected: bool,
@@ -433,6 +434,7 @@ impl DecisionEngine {
             balance_available,
             balance_required,
             qualifying_price: None,
+            quote_price: None,
             inside_ticks: None,
             inside_depth: None,
             selected: false,
@@ -455,9 +457,12 @@ impl DecisionEngine {
             };
         };
         diagnostics.qualifying_price = Some(price);
+        let quote_price =
+            reward_quote_price(price, side.clone(), tick_size, &self.config);
+        diagnostics.quote_price = Some(quote_price);
 
-        let inside_ticks = inside_ticks(book, side.clone(), price, tick_size);
-        let inside_depth = inside_depth(book, side.clone(), price);
+        let inside_ticks = inside_ticks(book, side.clone(), quote_price, tick_size);
+        let inside_depth = inside_depth(book, side.clone(), quote_price);
         diagnostics.inside_ticks = Some(inside_ticks);
         diagnostics.inside_depth = Some(inside_depth);
         if inside_ticks < self.config.min_inside_ticks {
@@ -486,9 +491,9 @@ impl DecisionEngine {
                 quote: QuoteIntent {
                     asset_id: asset_id.to_string(),
                     side,
-                    price,
+                    price: quote_price,
                     size: self.config.quote_size,
-                    reason: "reward-qualified quote".to_string(),
+                    reason: "reward-aware quote".to_string(),
                 },
                 inside_ticks,
                 inside_depth,
@@ -570,6 +575,30 @@ fn qualifying_ask_price(
     let price = adjusted_midpoint + max_spread;
     let aligned = round_down_to_tick(price.min(Decimal::ONE - tick_size), tick_size);
     (aligned > Decimal::ZERO).then_some(aligned)
+}
+
+fn reward_quote_price(
+    qualifying_price: Decimal,
+    side: QuoteSide,
+    tick_size: Decimal,
+    config: &DecisionConfig,
+) -> Decimal {
+    if config.quote_mode != QuoteMode::Outside || config.quote_offset_ticks == 0 {
+        return qualifying_price;
+    }
+
+    let tick_offset = tick_size * Decimal::from(config.quote_offset_ticks);
+    let shifted = match side {
+        QuoteSide::Buy => qualifying_price - tick_offset,
+        QuoteSide::Sell => qualifying_price + tick_offset,
+    };
+    clamp_reward_quote_price(shifted, tick_size)
+}
+
+fn clamp_reward_quote_price(price: Decimal, tick_size: Decimal) -> Decimal {
+    let mut clamped = price.clamp(tick_size, Decimal::ONE - tick_size);
+    clamped.rescale(tick_size.scale());
+    clamped
 }
 
 fn round_up_to_tick(price: Decimal, tick_size: Decimal) -> Decimal {
@@ -907,6 +936,40 @@ mod tests {
     }
 
     #[test]
+    fn reward_aware_mode_can_quote_one_tick_outside_reward_boundary() {
+        let engine = DecisionEngine::new(decision_config(QuoteMode::Outside, 1));
+        let mut state = test_state();
+        state.books.get_mut("asset-yes").unwrap().bids = vec![BookLevel {
+            price: dec!(0.50),
+            size: dec!(100),
+        }];
+        state.books.get_mut("asset-yes").unwrap().asks = vec![BookLevel {
+            price: dec!(0.51),
+            size: dec!(100),
+        }];
+
+        let outcome = engine.evaluate(&state);
+        let token = outcome
+            .diagnostics
+            .tokens
+            .iter()
+            .find(|token| token.asset_id == "asset-yes")
+            .expect("asset diagnostics");
+        let sell = token.sell.as_ref().expect("sell diagnostics");
+
+        assert_eq!(outcome.desired_quotes.len(), 1);
+        assert_eq!(
+            outcome.desired_quotes[0].side,
+            crate::types::QuoteSide::Sell
+        );
+        assert_eq!(outcome.desired_quotes[0].price, dec!(0.54));
+        assert_eq!(sell.qualifying_price, Some(dec!(0.53)));
+        assert_eq!(sell.quote_price, Some(dec!(0.54)));
+        assert_eq!(sell.inside_ticks, Some(3));
+        assert_eq!(sell.inside_depth, Some(dec!(100)));
+    }
+
+    #[test]
     fn reward_aware_mode_refuses_to_quote_without_inside_protection() {
         let engine = DecisionEngine::new(decision_config(QuoteMode::Inside, 1));
         let mut state = test_state();
@@ -963,6 +1026,7 @@ mod tests {
         assert_eq!(token.reward_min_size, Some(dec!(50)));
         let buy = token.buy.as_ref().expect("buy diagnostics");
         assert_eq!(buy.qualifying_price, Some(dec!(0.50)));
+        assert_eq!(buy.quote_price, Some(dec!(0.50)));
         assert_eq!(buy.inside_ticks, Some(0));
         assert_eq!(buy.inside_depth, Some(dec!(0)));
         assert_eq!(
