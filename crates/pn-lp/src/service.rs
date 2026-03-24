@@ -396,7 +396,11 @@ impl LpService {
                     let canceled_orders = state.open_orders.clone();
                     remember_terminal_orders(&mut state, &canceled_orders);
                     if let Err(error) = self
-                        .mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
+                        .mark_orders_status(
+                            &state.market.condition_id,
+                            &canceled_orders,
+                            "CANCELED",
+                        )
                         .await
                     {
                         error!(?error, "failed to persist shutdown cancel status");
@@ -739,7 +743,11 @@ impl LpService {
                     self.exchange.cancel_all().await?;
                     let canceled_orders = state.open_orders.clone();
                     remember_terminal_orders(state, &canceled_orders);
-                    self.mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
+                    self.mark_orders_status(
+                        &state.market.condition_id,
+                        &canceled_orders,
+                        "CANCELED",
+                    )
                     .await?;
                     state.open_orders.clear();
                     self.emit_risk("cancel_all", "warn", json!({ "reason": reason }))

@@ -273,9 +273,8 @@ impl DecisionEngine {
             open_orders: state.open_orders.len(),
             reward_snapshot_present: snapshot.is_some(),
             reward_active: reward.is_some(),
-            reward_condition_matches: snapshot.map(|snapshot| {
-                snapshot.condition_id == state.market.condition_id
-            }),
+            reward_condition_matches: snapshot
+                .map(|snapshot| snapshot.condition_id == state.market.condition_id),
             reward_max_spread: snapshot.map(|snapshot| snapshot.max_spread),
             reward_min_size: snapshot.map(|snapshot| snapshot.min_size),
             reward_total_daily_rate: snapshot.map(|snapshot| snapshot.total_daily_rate),
@@ -457,8 +456,7 @@ impl DecisionEngine {
             };
         };
         diagnostics.qualifying_price = Some(price);
-        let quote_price =
-            reward_quote_price(price, side.clone(), tick_size, &self.config);
+        let quote_price = reward_quote_price(price, side.clone(), tick_size, &self.config);
         diagnostics.quote_price = Some(quote_price);
 
         let inside_ticks = inside_ticks(book, side.clone(), quote_price, tick_size);
@@ -505,7 +503,11 @@ impl DecisionEngine {
 
 impl DecisionDiagnostics {
     fn mark_selected(&mut self, quote: &QuoteIntent) {
-        if let Some(token) = self.tokens.iter_mut().find(|token| token.asset_id == quote.asset_id) {
+        if let Some(token) = self
+            .tokens
+            .iter_mut()
+            .find(|token| token.asset_id == quote.asset_id)
+        {
             let side = match quote.side {
                 QuoteSide::Buy => &mut token.buy,
                 QuoteSide::Sell => &mut token.sell,
