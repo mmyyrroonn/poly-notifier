@@ -456,7 +456,7 @@ impl DecisionEngine {
             };
         };
         diagnostics.qualifying_price = Some(price);
-        let quote_price = reward_quote_price(price, side.clone(), tick_size, &self.config);
+        let quote_price = reward_quote_price(price, book, side.clone(), tick_size, &self.config);
         diagnostics.quote_price = Some(quote_price);
 
         let inside_ticks = inside_ticks(book, side.clone(), quote_price, tick_size);
@@ -581,20 +581,40 @@ fn qualifying_ask_price(
 
 fn reward_quote_price(
     qualifying_price: Decimal,
+    book: &BookSnapshot,
     side: QuoteSide,
     tick_size: Decimal,
     config: &DecisionConfig,
 ) -> Decimal {
-    if config.quote_mode != QuoteMode::Outside || config.quote_offset_ticks == 0 {
+    if config.quote_offset_ticks == 0 {
         return qualifying_price;
     }
 
     let tick_offset = tick_size * Decimal::from(config.quote_offset_ticks);
-    let shifted = match side {
-        QuoteSide::Buy => qualifying_price - tick_offset,
-        QuoteSide::Sell => qualifying_price + tick_offset,
+    let inset_price = match side {
+        QuoteSide::Buy => clamp_reward_quote_price(qualifying_price + tick_offset, tick_size),
+        QuoteSide::Sell => clamp_reward_quote_price(qualifying_price - tick_offset, tick_size),
     };
-    clamp_reward_quote_price(shifted, tick_size)
+
+    if preserves_inside_ticks(book, side, inset_price, tick_size, config.min_inside_ticks) {
+        inset_price
+    } else {
+        qualifying_price
+    }
+}
+
+fn preserves_inside_ticks(
+    book: &BookSnapshot,
+    side: QuoteSide,
+    price: Decimal,
+    tick_size: Decimal,
+    min_inside_ticks: u32,
+) -> bool {
+    if min_inside_ticks == 0 {
+        return true;
+    }
+
+    inside_ticks(book, side, price, tick_size) >= min_inside_ticks
 }
 
 fn clamp_reward_quote_price(price: Decimal, tick_size: Decimal) -> Decimal {
@@ -787,7 +807,7 @@ mod tests {
             outcome.desired_quotes[0].side,
             crate::types::QuoteSide::Sell
         );
-        assert_eq!(outcome.desired_quotes[0].price, dec!(0.53));
+        assert_eq!(outcome.desired_quotes[0].price, dec!(0.52));
     }
 
     #[test]
@@ -823,7 +843,7 @@ mod tests {
 
         assert_eq!(outcome.desired_quotes.len(), 1);
         assert_eq!(outcome.desired_quotes[0].side, crate::types::QuoteSide::Buy);
-        assert_eq!(outcome.desired_quotes[0].price.to_string(), "0.71");
+        assert_eq!(outcome.desired_quotes[0].price.to_string(), "0.72");
     }
 
     #[test]
@@ -911,7 +931,7 @@ mod tests {
 
         assert_eq!(outcome.desired_quotes.len(), 1);
         assert_eq!(outcome.desired_quotes[0].side, crate::types::QuoteSide::Buy);
-        assert_eq!(outcome.desired_quotes[0].price, dec!(0.48));
+        assert_eq!(outcome.desired_quotes[0].price, dec!(0.49));
     }
 
     #[test]
@@ -934,11 +954,11 @@ mod tests {
             outcome.desired_quotes[0].side,
             crate::types::QuoteSide::Sell
         );
-        assert_eq!(outcome.desired_quotes[0].price, dec!(0.53));
+        assert_eq!(outcome.desired_quotes[0].price, dec!(0.52));
     }
 
     #[test]
-    fn reward_aware_mode_can_quote_one_tick_outside_reward_boundary() {
+    fn reward_aware_mode_insets_one_tick_inside_reward_boundary() {
         let engine = DecisionEngine::new(decision_config(QuoteMode::Outside, 1));
         let mut state = test_state();
         state.books.get_mut("asset-yes").unwrap().bids = vec![BookLevel {
@@ -964,10 +984,10 @@ mod tests {
             outcome.desired_quotes[0].side,
             crate::types::QuoteSide::Sell
         );
-        assert_eq!(outcome.desired_quotes[0].price, dec!(0.54));
+        assert_eq!(outcome.desired_quotes[0].price, dec!(0.52));
         assert_eq!(sell.qualifying_price, Some(dec!(0.53)));
-        assert_eq!(sell.quote_price, Some(dec!(0.54)));
-        assert_eq!(sell.inside_ticks, Some(3));
+        assert_eq!(sell.quote_price, Some(dec!(0.52)));
+        assert_eq!(sell.inside_ticks, Some(1));
         assert_eq!(sell.inside_depth, Some(dec!(100)));
     }
 
