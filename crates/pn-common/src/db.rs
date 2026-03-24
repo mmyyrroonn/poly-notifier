@@ -12,7 +12,7 @@
 //! model struct.
 
 use chrono::Utc;
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{migrate::MigrateDatabase, sqlite::SqlitePoolOptions, Sqlite, SqlitePool};
 use tracing::info;
 
 use crate::{
@@ -52,6 +52,11 @@ use crate::{
 /// ```
 pub async fn init_db(database_url: &str, max_connections: u32) -> Result<SqlitePool> {
     info!(%database_url, max_connections, "initialising SQLite pool");
+
+    if !database_url.contains("mode=ro") && !Sqlite::database_exists(database_url).await? {
+        info!(%database_url, "creating SQLite database file");
+        Sqlite::create_database(database_url).await?;
+    }
 
     let pool = SqlitePoolOptions::new()
         .max_connections(max_connections)
@@ -806,10 +811,26 @@ pub async fn get_recent_notifications(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::{
         get_recent_lp_control_actions, get_recent_lp_heartbeats, init_db, insert_lp_control_action,
         insert_lp_heartbeat,
     };
+
+    fn unique_db_path(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pn-common-{test_name}-{}-{nanos}.db",
+            std::process::id()
+        ))
+    }
 
     #[tokio::test]
     async fn insert_lp_control_action_persists_actor() {
@@ -845,5 +866,22 @@ mod tests {
             .await
             .expect("heartbeats fetched");
         assert_eq!(heartbeats.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn init_db_creates_missing_sqlite_file() {
+        let db_path = unique_db_path("creates-missing-sqlite-file");
+        let database_url = format!("sqlite:{}", db_path.display());
+
+        assert!(!db_path.exists(), "test database should not exist yet");
+
+        let pool = init_db(&database_url, 1)
+            .await
+            .expect("sqlite file database should be created");
+        drop(pool);
+
+        assert!(db_path.exists(), "sqlite database file should exist");
+
+        std::fs::remove_file(&db_path).expect("temporary sqlite database removed");
     }
 }
