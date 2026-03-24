@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use reqwest::Client;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{de::Deserializer, Deserialize};
 
 const DEFAULT_BASE_URL: &str = "https://clob.polymarket.com";
 
@@ -91,8 +91,10 @@ pub struct RewardMarketEntry {
     pub question: String,
     pub market_slug: String,
     pub event_slug: String,
-    pub rewards_max_spread: i64,
-    pub rewards_min_size: i64,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub rewards_max_spread: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub rewards_min_size: Decimal,
     #[serde(default)]
     pub tokens: Vec<RewardTokenPrice>,
     #[serde(default)]
@@ -166,8 +168,8 @@ pub(crate) fn build_reward_snapshot(
         question: market.question.clone(),
         market_slug: market.market_slug.clone(),
         event_slug: market.event_slug.clone(),
-        max_spread: Decimal::new(market.rewards_max_spread, 2),
-        min_size: Decimal::from(market.rewards_min_size),
+        max_spread: market.rewards_max_spread / Decimal::from(100),
+        min_size: market.rewards_min_size,
         total_daily_rate,
         token_prices: market
             .tokens
@@ -219,6 +221,32 @@ fn decimal_from_float(value: f64) -> Decimal {
         .expect("reward API decimals should parse")
 }
 
+fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DecimalRepr {
+        Integer(i64),
+        Unsigned(u64),
+        Float(f64),
+        String(String),
+    }
+
+    let value = DecimalRepr::deserialize(deserializer)?;
+    match value {
+        DecimalRepr::Integer(value) => Ok(Decimal::from(value)),
+        DecimalRepr::Unsigned(value) => Ok(Decimal::from(value)),
+        DecimalRepr::Float(value) => {
+            Decimal::from_str_exact(&value.to_string()).map_err(serde::de::Error::custom)
+        }
+        DecimalRepr::String(value) => {
+            Decimal::from_str_exact(&value).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
 fn parse_reward_market_response(body: &str) -> Result<RewardMarketResponse> {
     serde_json::from_str(body).with_context(|| "parsing reward market response JSON")
 }
@@ -226,6 +254,7 @@ fn parse_reward_market_response(body: &str) -> Result<RewardMarketResponse> {
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
+    use rust_decimal::Decimal;
 
     use super::{
         build_reward_snapshot, parse_reward_market_response, retry_with_backoff, RewardConfigEntry,
@@ -240,8 +269,8 @@ mod tests {
                 question: "Will X happen?".to_string(),
                 market_slug: "will-x-happen".to_string(),
                 event_slug: "will-x-happen".to_string(),
-                rewards_max_spread: 3,
-                rewards_min_size: 50,
+                rewards_max_spread: Decimal::from(3),
+                rewards_min_size: Decimal::from(50),
                 tokens: vec![
                     RewardTokenPrice {
                         token_id: "yes-token".to_string(),
@@ -288,8 +317,8 @@ mod tests {
                 question: "Will X happen?".to_string(),
                 market_slug: "will-x-happen".to_string(),
                 event_slug: "will-x-happen".to_string(),
-                rewards_max_spread: 3,
-                rewards_min_size: 50,
+                rewards_max_spread: Decimal::from(3),
+                rewards_min_size: Decimal::from(50),
                 tokens: vec![],
                 rewards_config: vec![RewardConfigEntry {
                     start_date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
@@ -362,5 +391,43 @@ mod tests {
 
         assert_eq!(snapshot.condition_id, "condition-1");
         assert_eq!(snapshot.total_daily_rate, "4.5".parse().unwrap());
+    }
+
+    #[test]
+    fn reward_response_json_parses_fractional_reward_thresholds() {
+        let body = r#"{
+          "data": [
+            {
+              "condition_id": "condition-1",
+              "question": "Will X happen?",
+              "market_slug": "will-x-happen",
+              "event_slug": "will-x-happen",
+              "rewards_max_spread": 5.5,
+              "rewards_min_size": 12.5,
+              "tokens": [
+                {
+                  "token_id": "asset-yes",
+                  "outcome": "YES",
+                  "price": 0.61
+                }
+              ],
+              "rewards_config": [
+                {
+                  "start_date": "2026-03-01",
+                  "end_date": "2026-04-01",
+                  "rate_per_day": 4.5
+                }
+              ]
+            }
+          ]
+        }"#;
+
+        let response = parse_reward_market_response(body).expect("reward JSON parses");
+        let snapshot =
+            build_reward_snapshot(&response, NaiveDate::from_ymd_opt(2026, 3, 23).unwrap())
+                .expect("active reward snapshot");
+
+        assert_eq!(snapshot.max_spread, "0.055".parse().unwrap());
+        assert_eq!(snapshot.min_size, "12.5".parse().unwrap());
     }
 }
