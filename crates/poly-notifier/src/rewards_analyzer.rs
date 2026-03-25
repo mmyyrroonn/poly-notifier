@@ -3,12 +3,12 @@ use chrono::Utc;
 use pn_polymarket::{GammaMarketSummary, PublicBookLevel, PublicOrderBook};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const SINGLE_SIDED_FACTOR: u32 = 3;
 const DAYS_PER_YEAR: u32 = 365;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyzerConfig {
     pub quote_size: Decimal,
     pub quote_offset_ticks: u32,
@@ -17,21 +17,21 @@ pub struct AnalyzerConfig {
     pub top_n: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
     Buy,
     Sell,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StrategyProfile {
     OuterLowRisk,
     AggressiveMid,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyAnalysis {
     pub profile: StrategyProfile,
     pub recommended_side: Side,
@@ -50,7 +50,7 @@ pub struct StrategyAnalysis {
     pub our_side_score: Decimal,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketAnalysis {
     pub condition_id: String,
     pub slug: String,
@@ -70,7 +70,7 @@ pub struct MarketAnalysis {
     pub aggressive_mid: Option<StrategyAnalysis>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RewardDistribution {
     pub min: Decimal,
     pub median: Decimal,
@@ -104,8 +104,16 @@ pub fn analyze_market(
     let effective_quote_size = config.quote_size.max(rewards_min_size);
     let current_config_eligible = config.quote_size >= rewards_min_size;
     let existing_q_min = existing_book_q_min(book, midpoint, max_spread);
-    let best_bid = book.bids.first().map(|level| level.price).or(market.best_bid);
-    let best_ask = book.asks.first().map(|level| level.price).or(market.best_ask);
+    let best_bid = book
+        .bids
+        .first()
+        .map(|level| level.price)
+        .or(market.best_bid);
+    let best_ask = book
+        .asks
+        .first()
+        .map(|level| level.price)
+        .or(market.best_ask);
     let current_spread = best_bid.zip(best_ask).map(|(bid, ask)| ask - bid);
 
     Ok(MarketAnalysis {
@@ -151,14 +159,24 @@ pub fn render_shortlist_toml(
 ) -> String {
     let mut outer = analyses
         .iter()
-        .filter_map(|analysis| analysis.outer_low_risk.as_ref().map(|profile| (analysis, profile)))
+        .filter_map(|analysis| {
+            analysis
+                .outer_low_risk
+                .as_ref()
+                .map(|profile| (analysis, profile))
+        })
         .collect::<Vec<_>>();
     outer.sort_by(compare_profile_rank);
     outer.truncate(config.top_n);
 
     let mut aggressive = analyses
         .iter()
-        .filter_map(|analysis| analysis.aggressive_mid.as_ref().map(|profile| (analysis, profile)))
+        .filter_map(|analysis| {
+            analysis
+                .aggressive_mid
+                .as_ref()
+                .map(|profile| (analysis, profile))
+        })
         .collect::<Vec<_>>();
     aggressive.sort_by(compare_profile_rank);
     aggressive.truncate(config.top_n);
@@ -464,7 +482,12 @@ fn enumerate_profile_candidates(
     candidates
 }
 
-fn price_in_profile_window(side: Side, price: Decimal, midpoint: Decimal, tick_size: Decimal) -> bool {
+fn price_in_profile_window(
+    side: Side,
+    price: Decimal,
+    midpoint: Decimal,
+    tick_size: Decimal,
+) -> bool {
     match side {
         Side::Buy => price >= tick_size && price < midpoint,
         Side::Sell => price > midpoint && price <= Decimal::ONE - tick_size,
@@ -542,7 +565,8 @@ fn build_candidate(
     } else {
         Decimal::ZERO
     };
-    let existing_qualified_ahead_size = qualified_ahead_size(book, side, price, midpoint, max_spread);
+    let existing_qualified_ahead_size =
+        qualified_ahead_size(book, side, price, midpoint, max_spread);
     let crowdedness_score = if effective_quote_size > Decimal::ZERO {
         existing_qualified_ahead_size / effective_quote_size
     } else {
@@ -568,7 +592,10 @@ fn build_candidate(
     })
 }
 
-fn compare_outer_candidates(left: &StrategyAnalysis, right: &StrategyAnalysis) -> std::cmp::Ordering {
+fn compare_outer_candidates(
+    left: &StrategyAnalysis,
+    right: &StrategyAnalysis,
+) -> std::cmp::Ordering {
     left.inside_ticks
         .cmp(&right.inside_ticks)
         .then_with(|| left.inside_depth.cmp(&right.inside_depth))
@@ -583,7 +610,10 @@ fn compare_aggressive_candidates(
 ) -> std::cmp::Ordering {
     left.roi_daily_conservative
         .cmp(&right.roi_daily_conservative)
-        .then_with(|| left.estimated_daily_reward.cmp(&right.estimated_daily_reward))
+        .then_with(|| {
+            left.estimated_daily_reward
+                .cmp(&right.estimated_daily_reward)
+        })
         .then_with(|| right.crowdedness_score.cmp(&left.crowdedness_score))
         .then_with(|| left.inside_ticks.cmp(&right.inside_ticks))
 }
@@ -597,8 +627,16 @@ fn compare_profile_rank(
     left_profile
         .roi_daily_conservative
         .cmp(&right_profile.roi_daily_conservative)
-        .then_with(|| left_profile.estimated_daily_reward.cmp(&right_profile.estimated_daily_reward))
-        .then_with(|| right_profile.crowdedness_score.cmp(&left_profile.crowdedness_score))
+        .then_with(|| {
+            left_profile
+                .estimated_daily_reward
+                .cmp(&right_profile.estimated_daily_reward)
+        })
+        .then_with(|| {
+            right_profile
+                .crowdedness_score
+                .cmp(&left_profile.crowdedness_score)
+        })
 }
 
 fn existing_book_q_min(book: &PublicOrderBook, midpoint: Decimal, max_spread: Decimal) -> Decimal {
@@ -644,7 +682,12 @@ fn reward_score(max_spread: Decimal, spread_from_mid: Decimal, size: Decimal) ->
     decay * decay * size
 }
 
-fn q_min(q_one: Decimal, q_two: Decimal, midpoint: Decimal, single_sided_factor: Decimal) -> Decimal {
+fn q_min(
+    q_one: Decimal,
+    q_two: Decimal,
+    midpoint: Decimal,
+    single_sided_factor: Decimal,
+) -> Decimal {
     if midpoint >= Decimal::new(10, 2) && midpoint <= Decimal::new(90, 2) {
         q_one
             .min(q_two)

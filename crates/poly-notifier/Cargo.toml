@@ -19,6 +19,10 @@ path = "src/bin/poly-guard.rs"
 name = "poly-rewards"
 path = "src/bin/poly-rewards.rs"
 
+[[bin]]
+name = "poly-rewards-filter"
+path = "src/bin/poly-rewards-filter.rs"
+
 [dependencies]
 pn-common = { workspace = true }
 pn-polymarket = { workspace = true }

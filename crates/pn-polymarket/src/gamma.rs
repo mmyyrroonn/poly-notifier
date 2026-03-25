@@ -277,7 +277,10 @@ mod tests {
 
         assert_eq!(markets.len(), 1);
         let market = &markets[0];
-        assert_eq!(market.condition_id, "0xb48621f7eba07b0a3eeabc6afb09ae42490239903997b9d412b0f69aeb040c8b");
+        assert_eq!(
+            market.condition_id,
+            "0xb48621f7eba07b0a3eeabc6afb09ae42490239903997b9d412b0f69aeb040c8b"
+        );
         assert_eq!(market.tokens.len(), 2);
         assert_eq!(market.tokens[0].token_id, "yes-token");
         assert_eq!(market.tokens[0].outcome, "Yes");
@@ -423,11 +426,17 @@ fn parse_raw_market_summary(raw: GammaRawMarketSummary) -> Option<GammaMarketSum
     })
 }
 
-fn parse_clob_reward(raw: GammaRawClobReward, fallback_condition_id: &str) -> Option<GammaClobReward> {
+fn parse_clob_reward(
+    raw: GammaRawClobReward,
+    fallback_condition_id: &str,
+) -> Option<GammaClobReward> {
     let id = match raw.id {
         Some(id) if !id.is_empty() => id,
         _ => {
-            warn!(condition_id = fallback_condition_id, "skipping reward summary with missing id");
+            warn!(
+                condition_id = fallback_condition_id,
+                "skipping reward summary with missing id"
+            );
             return None;
         }
     };

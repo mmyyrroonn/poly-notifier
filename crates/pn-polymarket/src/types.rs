@@ -164,7 +164,11 @@ pub(crate) struct GammaRawMarketSummary {
     pub spread: Option<Decimal>,
     #[serde(default, deserialize_with = "deserialize_option_decimal")]
     pub liquidity_clob: Option<Decimal>,
-    #[serde(default, rename = "volume24hrClob", deserialize_with = "deserialize_option_decimal")]
+    #[serde(
+        default,
+        rename = "volume24hrClob",
+        deserialize_with = "deserialize_option_decimal"
+    )]
     pub volume_24hr_clob: Option<Decimal>,
     #[serde(default, deserialize_with = "deserialize_option_decimal")]
     pub competitive: Option<Decimal>,
@@ -350,9 +354,7 @@ enum DecimalRepr {
     String(String),
 }
 
-pub(crate) fn deserialize_decimal<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Decimal, D::Error>
+pub(crate) fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<Decimal, D::Error>
 where
     D: Deserializer<'de>,
 {

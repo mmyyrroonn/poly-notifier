@@ -38,7 +38,7 @@ pub use lp::{
 };
 pub use rewards::{RewardClient, RewardSnapshot};
 pub use types::{
-    GammaClobReward, GammaMarket, GammaMarketSummary, GammaToken, PublicBookLevel,
-    PublicOrderBook, WsEvent,
+    GammaClobReward, GammaMarket, GammaMarketSummary, GammaToken, PublicBookLevel, PublicOrderBook,
+    WsEvent,
 };
 pub use ws::PolymarketWs;

@@ -7,10 +7,10 @@ use pn_common::config::AppConfig;
 use pn_polymarket::{ClobClient, GammaClient, GammaMarketSummary};
 use poly_lp::rewards_analyzer::{
     active_daily_reward, analyze_market, render_shortlist_toml, reward_distribution,
-    AnalyzerConfig, MarketAnalysis, RewardDistribution, StrategyAnalysis,
+    AnalyzerConfig, MarketAnalysis, StrategyAnalysis,
 };
+use poly_lp::rewards_report::{RewardsReport, SkippedMarket};
 use rust_decimal::Decimal;
-use serde::Serialize;
 
 const DEFAULT_CONFIG_PATH: &str = "config/default.toml";
 const DEFAULT_OUT_DIR: &str = "outputs/rewards";
@@ -23,25 +23,6 @@ struct CliArgs {
     out_dir: PathBuf,
     top_n: usize,
     max_markets: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SkippedMarket {
-    condition_id: String,
-    slug: String,
-    question: String,
-    reason: String,
-}
-
-#[derive(Debug, Serialize)]
-struct RewardsReport {
-    generated_at: String,
-    scan_count: usize,
-    analyzed_count: usize,
-    skipped_count: usize,
-    distribution: Option<RewardDistribution>,
-    analyses: Vec<MarketAnalysis>,
-    skipped: Vec<SkippedMarket>,
 }
 
 enum AnalysisOutcome {
@@ -168,10 +149,10 @@ fn parse_cli_args(args: Vec<String>) -> Result<CliArgs> {
 }
 
 fn print_usage() {
+    println!("Usage: poly-rewards [--config path] [--out-dir path] [--top-n N] [--max-markets N]");
     println!(
-        "Usage: poly-rewards [--config path] [--out-dir path] [--top-n N] [--max-markets N]"
+        "Scans all active reward markets, analyzes order-book crowding, and writes report files."
     );
-    println!("Scans all active reward markets, analyzes order-book crowding, and writes report files.");
 }
 
 fn analyzer_config_from_app(app_config: &AppConfig, top_n: usize) -> Result<AnalyzerConfig> {
@@ -257,10 +238,9 @@ async fn analyze_reward_market(
 
     match analyze_market(&market, &book, &analyzer_config) {
         Ok(analysis) => AnalysisOutcome::Analysis(analysis),
-        Err(error) => AnalysisOutcome::Skipped(skip_market(
-            &market,
-            format!("analysis_failed: {error:#}"),
-        )),
+        Err(error) => {
+            AnalysisOutcome::Skipped(skip_market(&market, format!("analysis_failed: {error:#}")))
+        }
     }
 }
 
@@ -320,7 +300,12 @@ fn print_summary(
         report
             .analyses
             .iter()
-            .filter_map(|analysis| analysis.outer_low_risk.as_ref().map(|profile| (analysis, profile)))
+            .filter_map(|analysis| {
+                analysis
+                    .outer_low_risk
+                    .as_ref()
+                    .map(|profile| (analysis, profile))
+            })
             .collect(),
         analyzer_config.top_n.min(5),
     );
@@ -329,7 +314,12 @@ fn print_summary(
         report
             .analyses
             .iter()
-            .filter_map(|analysis| analysis.aggressive_mid.as_ref().map(|profile| (analysis, profile)))
+            .filter_map(|analysis| {
+                analysis
+                    .aggressive_mid
+                    .as_ref()
+                    .map(|profile| (analysis, profile))
+            })
             .collect(),
         analyzer_config.top_n.min(5),
     );
@@ -362,7 +352,12 @@ fn print_top_profile(
             .1
             .roi_daily_conservative
             .cmp(&left.1.roi_daily_conservative)
-            .then_with(|| right.1.estimated_daily_reward.cmp(&left.1.estimated_daily_reward))
+            .then_with(|| {
+                right
+                    .1
+                    .estimated_daily_reward
+                    .cmp(&left.1.estimated_daily_reward)
+            })
     });
 
     println!("Top {} candidates:", name);

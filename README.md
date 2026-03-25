@@ -33,6 +33,7 @@ cargo run -p poly-lp --release
 - `POLYMARKET_RPC_URL`
   现在不只是 `split/merge` 用，启动时 approval 检查和自动 approve 也会用到。
 - `APP__DATABASE__URL`
+  如果你用 SQLite，本地缺失的数据库文件和父目录会自动创建。
 - `APP__LP__REPORTING__OPERATOR_CHAT_IDS`
 - `TELEGRAM_BOT_TOKENS`
 
@@ -87,6 +88,7 @@ cargo run -p poly-lp --release
 - 只有当 spread `>= min_spread` 且顶档深度 `>= min_depth` 才挂
 - 买价 = `best_bid + quote_offset_ticks * tick_size`
 - 卖价 = `best_ask - quote_offset_ticks * tick_size`
+- 如果市场有 liquidity rewards，报价会尽量保持在 reward 合格区间内，不会再为了偏移把价格挪到奖励边界外
 - 价格会被钳制，避免穿价
 - 被动单使用 `GTC + post-only`
 - fill 后 flatten 使用 `FAK`，除非 `flatten_use_fok = true`
@@ -166,6 +168,74 @@ cargo run -p poly-lp --bin poly-target -- "https://polymarket.com/event/..."
 ```bash
 cargo run -p poly-lp --bin poly-target -- --config /tmp/next-target.toml "https://polymarket.com/event/..."
 ```
+
+## Rewards 分析 CLI
+
+如果你想先离线评估哪个 reward pool 更值得做，可以先生成全市场奖励报告：
+
+```bash
+cargo run -p poly-lp --bin poly-rewards -- --out-dir outputs/rewards
+```
+
+它会：
+
+- 扫描所有 active reward markets
+- 拉公开 order book
+- 估算 `outer_low_risk` 和 `aggressive_mid` 两种 profile
+- 输出 [outputs/rewards/report.json](outputs/rewards/report.json) 和 [outputs/rewards/shortlist.toml](outputs/rewards/shortlist.toml)
+
+`report.json` 是完整原始分析结果，适合后续二次筛选；`shortlist.toml` 是直接可读的排行摘录。
+
+如果只想快速抽样跑一小部分市场：
+
+```bash
+cargo run -p poly-lp --bin poly-rewards -- --top-n 10 --max-markets 100 --out-dir outputs/rewards
+```
+
+## Rewards 二次筛选 CLI
+
+基于已经生成的 `report.json`，可以继续做纯离线筛选，不需要重新抓网络：
+
+```bash
+cargo run -p poly-lp --bin poly-rewards-filter -- --report outputs/rewards/report.json
+```
+
+默认是：
+
+- `profile = outer_low_risk`
+- `sort = balanced`
+
+这个 `balanced` 排序会在 `roi_daily_conservative` 的基础上，再结合这些风险代理做平衡：
+
+- `inside_ticks`
+- `inside_depth / effective_quote_size`
+- `reward_gap_headroom / reward_band`
+- `crowdedness_score`
+- `current_config_eligible`
+
+常用筛选示例：
+
+```bash
+cargo run -p poly-lp --bin poly-rewards-filter -- --report outputs/rewards/report.json --profile outer_low_risk --sort balanced --top-n 20
+```
+
+```bash
+cargo run -p poly-lp --bin poly-rewards-filter -- --report outputs/rewards/report.json --profile outer_low_risk --sort roi_daily --min-inside-ticks 2 --max-crowdedness 20 --eligible-only
+```
+
+```bash
+cargo run -p poly-lp --bin poly-rewards-filter -- --report outputs/rewards/report.json --sort safety --out outputs/rewards/filtered.json
+```
+
+支持的排序键：
+
+- `balanced`
+- `roi_daily`
+- `roi_annual`
+- `estimated_daily_reward`
+- `daily_reward`
+- `crowdedness`
+- `safety`
 
 ## 启动后检查
 
