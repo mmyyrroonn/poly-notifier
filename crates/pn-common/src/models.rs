@@ -323,6 +323,7 @@ pub struct LpPositionSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct LpRiskEvent {
     pub id: i64,
+    pub condition_id: Option<String>,
     pub event_type: String,
     pub severity: String,
     pub details_json: String,
@@ -333,6 +334,7 @@ pub struct LpRiskEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct LpHeartbeat {
     pub id: i64,
+    pub condition_id: Option<String>,
     pub heartbeat_id: String,
     pub status: String,
     pub note: Option<String>,
@@ -343,6 +345,7 @@ pub struct LpHeartbeat {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct LpReport {
     pub id: i64,
+    pub condition_id: Option<String>,
     pub report_type: String,
     pub payload: String,
     pub created_at: NaiveDateTime,
@@ -352,6 +355,7 @@ pub struct LpReport {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct LpControlAction {
     pub id: i64,
+    pub condition_id: Option<String>,
     pub action: String,
     pub actor: String,
     pub reason: Option<String>,

@@ -109,6 +109,18 @@ pub struct DirectCancelConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct SharedStreamConfig {
+    pub clob_base_url: String,
+    pub chain_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedStreamSubscription {
+    pub condition_id: String,
+    pub asset_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ApprovalTarget {
     pub label: String,
     pub address: Address,
@@ -269,6 +281,16 @@ pub struct PolymarketDirectCancelClient {
     clob: AuthenticatedClobClient,
 }
 
+#[derive(Clone)]
+pub struct PolymarketSharedStreamClient {
+    market_ws: clob::ws::Client,
+    user_ws: clob::ws::Client<
+        polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+    >,
+    asset_ids: Arc<Vec<U256>>,
+    markets: Arc<Vec<B256>>,
+}
+
 type AuthenticatedClobClient = clob::Client<
     polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
 >;
@@ -336,6 +358,70 @@ impl PolymarketDirectCancelClient {
         );
         self.clob.cancel_all_orders().await?;
         Ok(())
+    }
+}
+
+impl PolymarketSharedStreamClient {
+    pub async fn connect(
+        config: SharedStreamConfig,
+        subscriptions: &[SharedStreamSubscription],
+    ) -> Result<Self> {
+        let (_signer, _account, clob) =
+            connect_authenticated_clob(&config.clob_base_url, config.chain_id).await?;
+        let credentials = clob.credentials().clone();
+        let address = clob.address();
+        let market_ws = clob::ws::Client::default();
+        let user_ws = clob::ws::Client::default().authenticate(credentials, address)?;
+
+        let mut asset_ids = Vec::new();
+        let mut markets = Vec::new();
+        for subscription in subscriptions {
+            let market = B256::from_str(&subscription.condition_id)
+                .with_context(|| format!("invalid condition id {}", subscription.condition_id))?;
+            if !markets.contains(&market) {
+                markets.push(market);
+            }
+            for asset_id in &subscription.asset_ids {
+                let asset_id = parse_u256(asset_id)?;
+                if !asset_ids.contains(&asset_id) {
+                    asset_ids.push(asset_id);
+                }
+            }
+        }
+
+        Ok(Self {
+            market_ws,
+            user_ws,
+            asset_ids: Arc::new(asset_ids),
+            markets: Arc::new(markets),
+        })
+    }
+
+    pub fn start(&self, event_tx: mpsc::UnboundedSender<StreamEvent>, cancel: CancellationToken) {
+        spawn_market_stream(
+            self.market_ws.clone(),
+            (*self.asset_ids).clone(),
+            event_tx.clone(),
+            cancel.clone(),
+        );
+        spawn_tick_size_stream(
+            self.market_ws.clone(),
+            (*self.asset_ids).clone(),
+            event_tx.clone(),
+            cancel.clone(),
+        );
+        spawn_order_stream(
+            self.user_ws.clone(),
+            (*self.markets).clone(),
+            event_tx.clone(),
+            cancel.clone(),
+        );
+        spawn_trade_stream(
+            self.user_ws.clone(),
+            (*self.markets).clone(),
+            event_tx,
+            cancel,
+        );
     }
 }
 
@@ -590,10 +676,30 @@ impl PolymarketExecutionClient {
         event_tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: CancellationToken,
     ) {
-        self.start_market_stream(event_tx.clone(), cancel.clone());
-        self.start_tick_size_stream(event_tx.clone(), cancel.clone());
-        self.start_order_stream(event_tx.clone(), cancel.clone());
-        self.start_trade_stream(event_tx, cancel);
+        spawn_market_stream(
+            self.market_ws.clone(),
+            (*self.asset_ids).clone(),
+            event_tx.clone(),
+            cancel.clone(),
+        );
+        spawn_tick_size_stream(
+            self.market_ws.clone(),
+            (*self.asset_ids).clone(),
+            event_tx.clone(),
+            cancel.clone(),
+        );
+        spawn_order_stream(
+            self.user_ws.clone(),
+            vec![self.condition_id],
+            event_tx.clone(),
+            cancel.clone(),
+        );
+        spawn_trade_stream(
+            self.user_ws.clone(),
+            vec![self.condition_id],
+            event_tx,
+            cancel,
+        );
     }
 
     pub async fn reconcile(&self) -> Result<ReconciliationState> {
@@ -976,304 +1082,304 @@ impl PolymarketExecutionClient {
             include_inventory,
         )
     }
+}
 
-    fn start_market_stream(
-        &self,
-        event_tx: mpsc::UnboundedSender<StreamEvent>,
-        cancel: CancellationToken,
-    ) {
-        let client = self.market_ws.clone();
-        let asset_ids = (*self.asset_ids).clone();
-        tokio::spawn(async move {
-            let mut backoff_secs = 1u64;
-            loop {
-                if cancel.is_cancelled() {
-                    break;
+fn spawn_market_stream(
+    client: clob::ws::Client,
+    asset_ids: Vec<U256>,
+    event_tx: mpsc::UnboundedSender<StreamEvent>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            let stream = match client.subscribe_orderbook(asset_ids.clone()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    warn!(?error, "failed to subscribe to market orderbook stream");
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = next_reconnect_backoff_secs(backoff_secs);
+                    continue;
                 }
+            };
+            tokio::pin!(stream);
 
-                let stream = match client.subscribe_orderbook(asset_ids.clone()) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        warn!(?error, "failed to subscribe to market orderbook stream");
-                        sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
-                        continue;
-                    }
-                };
-                tokio::pin!(stream);
-
-                let mut disconnected = false;
-                let mut received_message = false;
-                while !cancel.is_cancelled() {
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        message = stream.next() => {
-                            match message {
-                                Some(Ok(book)) => {
-                                    mark_stream_message_received(&mut received_message, &mut backoff_secs);
-                                    let event = StreamEvent::Book(BookSnapshot {
-                                        asset_id: book.asset_id.to_string(),
-                                        bids: book.bids.into_iter().map(|level| BookLevel {
-                                            price: level.price,
-                                            size: level.size,
-                                        }).collect(),
-                                        asks: book.asks.into_iter().map(|level| BookLevel {
-                                            price: level.price,
-                                            size: level.size,
-                                        }).collect(),
-                                    });
-                                    if event_tx.send(event).is_err() {
-                                        return;
-                                    }
+            let mut disconnected = false;
+            let mut received_message = false;
+            while !cancel.is_cancelled() {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    message = stream.next() => {
+                        match message {
+                            Some(Ok(book)) => {
+                                mark_stream_message_received(&mut received_message, &mut backoff_secs);
+                                let event = StreamEvent::Book(BookSnapshot {
+                                    asset_id: book.asset_id.to_string(),
+                                    bids: book.bids.into_iter().map(|level| BookLevel {
+                                        price: level.price,
+                                        size: level.size,
+                                    }).collect(),
+                                    asks: book.asks.into_iter().map(|level| BookLevel {
+                                        price: level.price,
+                                        size: level.size,
+                                    }).collect(),
+                                });
+                                if event_tx.send(event).is_err() {
+                                    return;
                                 }
-                                Some(Err(error)) => {
-                                    warn!(?error, "market orderbook stream disconnected");
-                                    disconnected = true;
-                                    break;
-                                }
-                                None => {
-                                    disconnected = true;
-                                    break;
-                                }
+                            }
+                            Some(Err(error)) => {
+                                warn!(?error, "market orderbook stream disconnected");
+                                disconnected = true;
+                                break;
+                            }
+                            None => {
+                                disconnected = true;
+                                break;
                             }
                         }
                     }
                 }
-
-                if !disconnected || cancel.is_cancelled() {
-                    break;
-                }
-
-                sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
-        });
-    }
 
-    fn start_tick_size_stream(
-        &self,
-        event_tx: mpsc::UnboundedSender<StreamEvent>,
-        cancel: CancellationToken,
-    ) {
-        let client = self.market_ws.clone();
-        let asset_ids = (*self.asset_ids).clone();
-        tokio::spawn(async move {
-            let mut backoff_secs = 1u64;
-            loop {
-                if cancel.is_cancelled() {
-                    break;
+            if !disconnected || cancel.is_cancelled() {
+                break;
+            }
+
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_reconnect_backoff_secs(backoff_secs);
+        }
+    });
+}
+
+fn spawn_tick_size_stream(
+    client: clob::ws::Client,
+    asset_ids: Vec<U256>,
+    event_tx: mpsc::UnboundedSender<StreamEvent>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            let stream = match client.subscribe_tick_size_change(asset_ids.clone()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    warn!(?error, "failed to subscribe to tick size stream");
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = next_reconnect_backoff_secs(backoff_secs);
+                    continue;
                 }
+            };
+            tokio::pin!(stream);
 
-                let stream = match client.subscribe_tick_size_change(asset_ids.clone()) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        warn!(?error, "failed to subscribe to tick size stream");
-                        sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
-                        continue;
-                    }
-                };
-                tokio::pin!(stream);
-
-                let mut disconnected = false;
-                let mut received_message = false;
-                while !cancel.is_cancelled() {
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        message = stream.next() => {
-                            match message {
-                                Some(Ok(change)) => {
-                                    mark_stream_message_received(&mut received_message, &mut backoff_secs);
-                                    if event_tx.send(StreamEvent::TickSize {
-                                        asset_id: change.asset_id.to_string(),
-                                        new_tick_size: change.new_tick_size,
-                                    }).is_err() {
-                                        return;
-                                    }
+            let mut disconnected = false;
+            let mut received_message = false;
+            while !cancel.is_cancelled() {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    message = stream.next() => {
+                        match message {
+                            Some(Ok(change)) => {
+                                mark_stream_message_received(&mut received_message, &mut backoff_secs);
+                                if event_tx.send(StreamEvent::TickSize {
+                                    asset_id: change.asset_id.to_string(),
+                                    new_tick_size: change.new_tick_size,
+                                }).is_err() {
+                                    return;
                                 }
-                                Some(Err(error)) => {
-                                    warn!(?error, "tick size stream disconnected");
-                                    disconnected = true;
-                                    break;
-                                }
-                                None => {
-                                    disconnected = true;
-                                    break;
-                                }
+                            }
+                            Some(Err(error)) => {
+                                warn!(?error, "tick size stream disconnected");
+                                disconnected = true;
+                                break;
+                            }
+                            None => {
+                                disconnected = true;
+                                break;
                             }
                         }
                     }
                 }
-
-                if !disconnected || cancel.is_cancelled() {
-                    break;
-                }
-
-                sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
-        });
-    }
 
-    fn start_order_stream(
-        &self,
-        event_tx: mpsc::UnboundedSender<StreamEvent>,
-        cancel: CancellationToken,
-    ) {
-        let client = self.user_ws.clone();
-        let markets = vec![self.condition_id];
-        tokio::spawn(async move {
-            let mut backoff_secs = 1u64;
-            loop {
-                if cancel.is_cancelled() {
-                    break;
+            if !disconnected || cancel.is_cancelled() {
+                break;
+            }
+
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_reconnect_backoff_secs(backoff_secs);
+        }
+    });
+}
+
+fn spawn_order_stream(
+    client: clob::ws::Client<
+        polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+    >,
+    markets: Vec<B256>,
+    event_tx: mpsc::UnboundedSender<StreamEvent>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            let stream = match client.subscribe_orders(markets.clone()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    warn!(?error, "failed to subscribe to user order stream");
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = next_reconnect_backoff_secs(backoff_secs);
+                    continue;
                 }
+            };
+            tokio::pin!(stream);
 
-                let stream = match client.subscribe_orders(markets.clone()) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        warn!(?error, "failed to subscribe to user order stream");
-                        sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
-                        continue;
-                    }
-                };
-                tokio::pin!(stream);
-
-                let mut disconnected = false;
-                let mut received_message = false;
-                while !cancel.is_cancelled() {
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        message = stream.next() => {
-                            match message {
-                                Some(Ok(order)) => {
-                                    mark_stream_message_received(&mut received_message, &mut backoff_secs);
-                                    let side = match side_from_sdk(order.side) {
-                                        Ok(side) => side,
-                                        Err(error) => {
-                                            warn!(?error, "dropping user order update with unsupported side");
-                                            continue;
-                                        }
-                                    };
-                                    let event = StreamEvent::Order(ManagedOrder {
-                                        order_id: order.id,
-                                        asset_id: order.asset_id.to_string(),
-                                        side,
-                                        price: order.price,
-                                        size: remaining_order_size(
-                                            order.original_size.unwrap_or(Decimal::ZERO),
-                                            order.size_matched.unwrap_or(Decimal::ZERO),
-                                        ),
-                                        status: order.status.map(|status| status.to_string()).unwrap_or_else(|| "UNKNOWN".to_string()),
-                                    });
-                                    if event_tx.send(event).is_err() {
-                                        return;
+            let mut disconnected = false;
+            let mut received_message = false;
+            while !cancel.is_cancelled() {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    message = stream.next() => {
+                        match message {
+                            Some(Ok(order)) => {
+                                mark_stream_message_received(&mut received_message, &mut backoff_secs);
+                                let side = match side_from_sdk(order.side) {
+                                    Ok(side) => side,
+                                    Err(error) => {
+                                        warn!(?error, "dropping user order update with unsupported side");
+                                        continue;
                                     }
+                                };
+                                let event = StreamEvent::Order(ManagedOrder {
+                                    order_id: order.id,
+                                    asset_id: order.asset_id.to_string(),
+                                    side,
+                                    price: order.price,
+                                    size: remaining_order_size(
+                                        order.original_size.unwrap_or(Decimal::ZERO),
+                                        order.size_matched.unwrap_or(Decimal::ZERO),
+                                    ),
+                                    status: order.status.map(|status| status.to_string()).unwrap_or_else(|| "UNKNOWN".to_string()),
+                                });
+                                if event_tx.send(event).is_err() {
+                                    return;
                                 }
-                                Some(Err(error)) => {
-                                    warn!(?error, "user order stream disconnected");
-                                    disconnected = true;
-                                    break;
-                                }
-                                None => {
-                                    disconnected = true;
-                                    break;
-                                }
+                            }
+                            Some(Err(error)) => {
+                                warn!(?error, "user order stream disconnected");
+                                disconnected = true;
+                                break;
+                            }
+                            None => {
+                                disconnected = true;
+                                break;
                             }
                         }
                     }
                 }
-
-                if !disconnected || cancel.is_cancelled() {
-                    break;
-                }
-
-                sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
-        });
-    }
 
-    fn start_trade_stream(
-        &self,
-        event_tx: mpsc::UnboundedSender<StreamEvent>,
-        cancel: CancellationToken,
-    ) {
-        let client = self.user_ws.clone();
-        let markets = vec![self.condition_id];
-        tokio::spawn(async move {
-            let mut backoff_secs = 1u64;
-            loop {
-                if cancel.is_cancelled() {
-                    break;
+            if !disconnected || cancel.is_cancelled() {
+                break;
+            }
+
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_reconnect_backoff_secs(backoff_secs);
+        }
+    });
+}
+
+fn spawn_trade_stream(
+    client: clob::ws::Client<
+        polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>,
+    >,
+    markets: Vec<B256>,
+    event_tx: mpsc::UnboundedSender<StreamEvent>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            let stream = match client.subscribe_trades(markets.clone()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    warn!(?error, "failed to subscribe to user trade stream");
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = next_reconnect_backoff_secs(backoff_secs);
+                    continue;
                 }
+            };
+            tokio::pin!(stream);
 
-                let stream = match client.subscribe_trades(markets.clone()) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        warn!(?error, "failed to subscribe to user trade stream");
-                        sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
-                        continue;
-                    }
-                };
-                tokio::pin!(stream);
-
-                let mut disconnected = false;
-                let mut received_message = false;
-                while !cancel.is_cancelled() {
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        message = stream.next() => {
-                            match message {
-                                Some(Ok(trade)) => {
-                                    mark_stream_message_received(&mut received_message, &mut backoff_secs);
-                                    let side = match side_from_sdk(trade.side) {
-                                        Ok(side) => side,
-                                        Err(error) => {
-                                            warn!(?error, "dropping user trade update with unsupported side");
-                                            continue;
-                                        }
-                                    };
-                                    let order_id = trade_order_id(&trade);
-                                    let status = trade_status_label(&trade.status);
-                                    let event = StreamEvent::Trade(TradeFill {
-                                        trade_id: trade.id,
-                                        order_id,
-                                        asset_id: trade.asset_id.to_string(),
-                                        side,
-                                        price: trade.price,
-                                        size: trade.size,
-                                        status,
-                                    });
-                                    if event_tx.send(event).is_err() {
-                                        return;
+            let mut disconnected = false;
+            let mut received_message = false;
+            while !cancel.is_cancelled() {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    message = stream.next() => {
+                        match message {
+                            Some(Ok(trade)) => {
+                                mark_stream_message_received(&mut received_message, &mut backoff_secs);
+                                let side = match side_from_sdk(trade.side) {
+                                    Ok(side) => side,
+                                    Err(error) => {
+                                        warn!(?error, "dropping user trade update with unsupported side");
+                                        continue;
                                     }
+                                };
+                                let order_id = trade_order_id(&trade);
+                                let status = trade_status_label(&trade.status);
+                                let event = StreamEvent::Trade(TradeFill {
+                                    trade_id: trade.id,
+                                    order_id,
+                                    asset_id: trade.asset_id.to_string(),
+                                    side,
+                                    price: trade.price,
+                                    size: trade.size,
+                                    status,
+                                });
+                                if event_tx.send(event).is_err() {
+                                    return;
                                 }
-                                Some(Err(error)) => {
-                                    warn!(?error, "user trade stream disconnected");
-                                    disconnected = true;
-                                    break;
-                                }
-                                None => {
-                                    disconnected = true;
-                                    break;
-                                }
+                            }
+                            Some(Err(error)) => {
+                                warn!(?error, "user trade stream disconnected");
+                                disconnected = true;
+                                break;
+                            }
+                            None => {
+                                disconnected = true;
+                                break;
                             }
                         }
                     }
                 }
-
-                if !disconnected || cancel.is_cancelled() {
-                    break;
-                }
-
-                sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
-        });
-    }
+
+            if !disconnected || cancel.is_cancelled() {
+                break;
+            }
+
+            sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = next_reconnect_backoff_secs(backoff_secs);
+        }
+    });
 }
 
 fn map_open_order(

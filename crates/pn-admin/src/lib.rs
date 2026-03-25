@@ -40,7 +40,7 @@ pub mod handlers;
 pub mod routes;
 
 use axum::Router;
-use pn_lp::LpControlHandle;
+use pn_lp::MultiLpControlHandle;
 use sqlx::SqlitePool;
 
 /// Shared application state threaded through both the auth middleware and
@@ -56,7 +56,7 @@ pub struct AdminState {
     /// Expected admin Bearer token.
     pub admin_password: String,
     /// Optional LP runtime control handle.
-    pub lp_control: Option<LpControlHandle>,
+    pub lp_control: Option<MultiLpControlHandle>,
 }
 
 impl AdminState {
@@ -64,7 +64,7 @@ impl AdminState {
     pub fn new(
         pool: SqlitePool,
         admin_password: String,
-        lp_control: Option<LpControlHandle>,
+        lp_control: Option<MultiLpControlHandle>,
     ) -> Self {
         Self {
             pool,
@@ -87,7 +87,7 @@ impl AdminState {
 pub fn create_router(
     pool: SqlitePool,
     admin_password: String,
-    lp_control: Option<LpControlHandle>,
+    lp_control: Option<MultiLpControlHandle>,
 ) -> Router {
     let state = AdminState::new(pool, admin_password, lp_control);
     routes::build_router(state)

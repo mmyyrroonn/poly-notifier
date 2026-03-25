@@ -1,12 +1,12 @@
 # poly-lp
 
-单市场的 Polymarket LP daemon。当前版本是事件驱动架构，负责：
+支持单市场和多市场的 Polymarket LP daemon。当前版本是事件驱动架构，负责：
 
-- 订阅市场盘口和用户订单/成交流
+- 共享订阅市场盘口和用户订单/成交流
 - 根据盘口深度和价差决定是否挂单、撤单
 - 成交后触发风控和平仓
 - 记录订单、成交、风控事件、心跳和运行日志
-- 通过本地 admin API 做暂停、恢复、全撤、flatten、split、merge
+- 通过本地 admin API 做暂停、恢复、按 market 撤单、flatten、split、merge
 
 更详细的运行逻辑见 [lp-architecture.md](docs/lp-architecture.md)。
 
@@ -22,10 +22,17 @@
 cargo run -p poly-lp --release
 ```
 
+如果你要跑独立的多市场配置文件：
+
+```bash
+cargo run -p poly-lp --release -- --config config/rewards-markets.toml
+```
+
 ## `poly-lp` 必配项
 
 - `POLYMARKET_PRIVATE_KEY`
 - `APP__LP__TRADING__CONDITION_ID`
+  这是 legacy 单市场入口。多市场模式下改成在 TOML 里写 `[[lp.markets]]`。
 - `ADMIN_PASSWORD`
 
 推荐也一起配：
@@ -39,7 +46,7 @@ cargo run -p poly-lp --release
 
 ## 外部 guard
 
-`poly-guard` 现在是直接连 Polymarket 做 `cancel_all`，不再回调主程序的 `/admin/lp/cancel-all`。
+`poly-guard` 现在是直接连 Polymarket 做全账户 `cancel_all`，不再回调主程序的 `/admin/lp/cancel-all`。
 
 两机部署时建议这样配：
 
@@ -57,14 +64,14 @@ cargo run -p poly-lp --release
   `APP__GUARD__BIND_ADDR=0.0.0.0`
   `APP__GUARD__PORT=37373`
 
-行为上，guard 触发全撤后，主程序会在下一次 reconciliation 把外部撤单同步回来；如果你希望收敛更快，可以把 `APP__LP__CONTROL__RECONCILIATION_INTERVAL_SECS` 调小一点，例如 `5`。
+行为上，guard 触发的是全账户全撤；主程序自己的 `cancel-all` 只会撤当前配置 market。guard 触发后，主程序会在下一次 reconciliation 把外部撤单同步回来；如果你希望收敛更快，可以把 `APP__LP__CONTROL__RECONCILIATION_INTERVAL_SECS` 调小一点，例如 `5`。
 
 ## 当前可配置参数
 
 主要配置都在 [config/default.toml](config/default.toml)：
 
 - `[lp.trading]`
-  `condition_id`、API base URL、`chain_id`
+  legacy `condition_id`、API base URL、`chain_id`
 - `[lp.inventory]`
   最低 USDC / token 库存、是否启动自动 split、启动 split 数量
 - `[lp.strategy]`
@@ -79,6 +86,47 @@ cargo run -p poly-lp --release
   admin bind、heartbeat interval、reconciliation interval
 - `[lp.logging]`
   snapshot 周期、日志目录、滚动文件前缀、保留文件数、JSON 输出
+
+## 多市场配置
+
+多市场模式在同一个进程里启动多个独立 market runtime，但行情和用户流是共享连接，不会按 market 线性增加整套 WS 连接。运行时会共享：
+
+- 一套 market data 订阅
+- 一套 user orders 订阅
+- 一套 user trades 订阅
+- 一套 authenticated REST 执行入口
+
+每个 market 继续有自己的决策、风控、订单状态和 admin 控制句柄。主程序内的 `cancel-all` 只作用目标 market；`poly-guard` 仍然保留全账户全撤语义。
+
+TOML 结构：
+
+```toml
+[[lp.markets]]
+condition_id = "0x..."
+enabled = true
+slug = "example-market"
+question = "Will X happen?"
+
+[lp.markets.strategy]
+quote_size = 20.0
+quote_mode = "both"
+
+[lp.markets.capital]
+buy_budget_usdc = 15.0
+```
+
+支持的 per-market override：
+
+- `[lp.markets.strategy]`
+  `quote_mode`、`quote_size`、`quote_offset_ticks`、`min_inside_ticks`、`min_inside_depth_multiple`
+- `[lp.markets.inventory]`
+  `min_usdc_balance`、`min_token_balance`、`auto_split_on_startup`、`startup_split_amount`
+- `[lp.markets.risk]`
+  `max_position`、`flat_position_tolerance`、`auto_flatten_after_fill`、`flatten_use_fok`、`stale_feed_after_secs`
+- `[lp.markets.capital]`
+  `buy_budget_usdc`
+
+顶层 `[lp.inventory]`、`[lp.strategy]`、`[lp.risk]` 继续作为默认值。`buy_budget_usdc` 是可选硬上限，用来限制单个 market 能占用的买单资金；多 market 同时发单时，主程序也会做共享 USDC 预约，避免把同一笔余额重复拿去挂单。
 
 ## 挂单逻辑
 
@@ -237,6 +285,36 @@ cargo run -p poly-lp --bin poly-rewards-filter -- --report outputs/rewards/repor
 - `crowdedness`
 - `safety`
 
+如果你想直接把筛选结果变成主程序可运行的多市场配置：
+
+```bash
+cargo run -p poly-lp --bin poly-rewards-filter -- \
+  --report outputs/rewards/report.json \
+  --profile outer_low_risk \
+  --sort balanced \
+  --top-n 8 \
+  --emit-multi-config config/rewards-markets.toml
+```
+
+也可以基于别的基础配置生成：
+
+```bash
+cargo run -p poly-lp --bin poly-rewards-filter -- \
+  --report outputs/rewards/report.json \
+  --emit-multi-config config/rewards-markets.toml \
+  --base-config config/default.toml \
+  --config-top-n 5
+```
+
+生成文件会：
+
+- 保留 base config 的公共配置
+- 为选中的 market 追加 `[[lp.markets]]`
+- 默认把 `strategy.quote_size` 设成 `rewards_min_size`
+- 在每个 market block 前写参考注释，例如 `daily_reward`、`recommended_price`、`roi_daily_conservative`、`crowdedness_score`
+
+这些注释不会参与运行；你可以直接手动改每个 market 的 `quote_size`、策略覆盖和 `buy_budget_usdc`。
+
 ## 启动后检查
 
 健康检查：
@@ -244,6 +322,13 @@ cargo run -p poly-lp --bin poly-rewards-filter -- --report outputs/rewards/repor
 ```bash
 curl -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/health
 curl -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/state
+```
+
+多市场模式下可以按 `condition_id` 查单个 market：
+
+```bash
+curl -H "Authorization: Bearer <ADMIN_PASSWORD>" "http://127.0.0.1:36363/admin/lp/health?condition_id=0x..."
+curl -H "Authorization: Bearer <ADMIN_PASSWORD>" "http://127.0.0.1:36363/admin/lp/state?condition_id=0x..."
 ```
 
 常用控制：
@@ -254,6 +339,8 @@ curl -X POST -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/
 curl -X POST -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/cancel-all
 curl -X POST -H "Authorization: Bearer <ADMIN_PASSWORD>" http://127.0.0.1:36363/admin/lp/flatten
 ```
+
+多市场模式下不带 `condition_id` 会广播到所有配置 market；带上 `condition_id` 时只影响目标 market。`split` / `merge` 在多市场模式下必须带 `condition_id`。
 
 ## 日志
 

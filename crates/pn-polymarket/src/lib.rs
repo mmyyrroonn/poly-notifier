@@ -33,8 +33,9 @@ pub use gamma::GammaClient;
 pub use lp::{
     AccountSnapshot, ApprovalCheck, ApprovalStatus, ApprovalTarget, BookLevel, BookSnapshot,
     BootstrapState, DirectCancelConfig, ExecutionConfig, FlattenRequest, ManagedOrder,
-    MarketMetadata, PolymarketDirectCancelClient, PolymarketExecutionClient, PositionSnapshot,
-    QuoteRequest, QuoteSide, ReconciliationState, StreamEvent, TokenMetadata, TradeFill,
+    MarketMetadata, PolymarketDirectCancelClient, PolymarketExecutionClient,
+    PolymarketSharedStreamClient, PositionSnapshot, QuoteRequest, QuoteSide, ReconciliationState,
+    SharedStreamConfig, SharedStreamSubscription, StreamEvent, TokenMetadata, TradeFill,
 };
 pub use rewards::{RewardClient, RewardSnapshot};
 pub use types::{

@@ -47,4 +47,5 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 teloxide = { workspace = true }
 futures-util = { workspace = true }
+dashmap = { workspace = true }
 rustls = "0.23"

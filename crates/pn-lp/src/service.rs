@@ -454,14 +454,28 @@ impl LpService {
         match command {
             ControlCommand::Pause { reason } => {
                 warn!(target: "lp.control", reason = %reason, "pause requested");
-                insert_lp_control_action(&self.pool, "pause", Some(&reason), actor).await?;
+                insert_lp_control_action(
+                    &self.pool,
+                    Some(&state.market.condition_id),
+                    "pause",
+                    Some(&reason),
+                    actor,
+                )
+                .await?;
                 state.flags.paused = true;
                 self.emit_risk("control_pause", "info", json!({ "reason": reason }))
                     .await?;
             }
             ControlCommand::Resume { reason } => {
                 info!(target: "lp.control", reason = %reason, "resume requested");
-                insert_lp_control_action(&self.pool, "resume", Some(&reason), actor).await?;
+                insert_lp_control_action(
+                    &self.pool,
+                    Some(&state.market.condition_id),
+                    "resume",
+                    Some(&reason),
+                    actor,
+                )
+                .await?;
                 state.flags.paused = false;
                 state.flags.flattening = false;
                 self.emit_risk("control_resume", "info", json!({ "reason": reason }))
@@ -469,7 +483,14 @@ impl LpService {
             }
             ControlCommand::CancelAll { reason } => {
                 warn!(target: "lp.control", reason = %reason, open_orders = state.open_orders.len(), "cancel-all requested");
-                insert_lp_control_action(&self.pool, "cancel_all", Some(&reason), actor).await?;
+                insert_lp_control_action(
+                    &self.pool,
+                    Some(&state.market.condition_id),
+                    "cancel_all",
+                    Some(&reason),
+                    actor,
+                )
+                .await?;
                 self.exchange.cancel_all().await?;
                 let canceled_orders = state.open_orders.clone();
                 remember_terminal_orders(state, &canceled_orders);
@@ -481,7 +502,14 @@ impl LpService {
             }
             ControlCommand::Flatten { reason } => {
                 warn!(target: "lp.control", reason = %reason, positions = state.positions.len(), "flatten requested");
-                insert_lp_control_action(&self.pool, "flatten", Some(&reason), actor).await?;
+                insert_lp_control_action(
+                    &self.pool,
+                    Some(&state.market.condition_id),
+                    "flatten",
+                    Some(&reason),
+                    actor,
+                )
+                .await?;
                 state.flags.paused = true;
                 state.flags.flattening = true;
                 self.exchange.cancel_all().await?;
@@ -497,7 +525,14 @@ impl LpService {
             }
             ControlCommand::Split { amount, reason } => {
                 info!(target: "lp.control", reason = %reason, amount = %amount, "split requested");
-                insert_lp_control_action(&self.pool, "split", Some(&reason), actor).await?;
+                insert_lp_control_action(
+                    &self.pool,
+                    Some(&state.market.condition_id),
+                    "split",
+                    Some(&reason),
+                    actor,
+                )
+                .await?;
                 let amount = amount
                     .parse::<Decimal>()
                     .with_context(|| format!("invalid split amount {amount}"))?;
@@ -512,7 +547,14 @@ impl LpService {
             }
             ControlCommand::Merge { amount, reason } => {
                 info!(target: "lp.control", reason = %reason, amount = %amount, "merge requested");
-                insert_lp_control_action(&self.pool, "merge", Some(&reason), actor).await?;
+                insert_lp_control_action(
+                    &self.pool,
+                    Some(&state.market.condition_id),
+                    "merge",
+                    Some(&reason),
+                    actor,
+                )
+                .await?;
                 let amount = amount
                     .parse::<Decimal>()
                     .with_context(|| format!("invalid merge amount {amount}"))?;
@@ -532,6 +574,7 @@ impl LpService {
             } => {
                 insert_lp_control_action(
                     &self.pool,
+                    Some(&state.market.condition_id),
                     &format!("signal:{name}"),
                     Some(&reason),
                     actor,
@@ -643,13 +686,26 @@ impl LpService {
                 state.flags.heartbeat_healthy = true;
                 state.last_heartbeat_at = Some(Utc::now());
                 state.last_heartbeat_id = Some(heartbeat_id.clone());
-                insert_lp_heartbeat(&self.pool, &heartbeat_id, "ok", None).await?;
+                insert_lp_heartbeat(
+                    &self.pool,
+                    Some(&state.market.condition_id),
+                    &heartbeat_id,
+                    "ok",
+                    None,
+                )
+                .await?;
                 info!(target: "lp.heartbeat", heartbeat_id = %heartbeat_id, "heartbeat acknowledged");
             }
             Err(error) => {
                 state.flags.heartbeat_healthy = false;
-                insert_lp_heartbeat(&self.pool, "unknown", "error", Some(&error.to_string()))
-                    .await?;
+                insert_lp_heartbeat(
+                    &self.pool,
+                    Some(&state.market.condition_id),
+                    "unknown",
+                    "error",
+                    Some(&error.to_string()),
+                )
+                .await?;
                 error!(target: "lp.heartbeat", error = %error, "heartbeat submission failed");
                 self.emit_risk(
                     "heartbeat_error",
@@ -716,16 +772,28 @@ impl LpService {
                 RiskAction::None => {}
                 RiskAction::Pause { reason } => {
                     warn!(target: "lp.risk", reason = %reason, "risk pause triggered");
-                    insert_lp_control_action(&self.pool, "pause", Some(&reason), "risk_engine")
-                        .await?;
+                    insert_lp_control_action(
+                        &self.pool,
+                        Some(&state.market.condition_id),
+                        "pause",
+                        Some(&reason),
+                        "risk_engine",
+                    )
+                    .await?;
                     state.flags.paused = true;
                     self.emit_risk("pause", "warn", json!({ "reason": reason }))
                         .await?;
                 }
                 RiskAction::Resume { reason } => {
                     info!(target: "lp.risk", reason = %reason, "risk resume triggered");
-                    insert_lp_control_action(&self.pool, "resume", Some(&reason), "risk_engine")
-                        .await?;
+                    insert_lp_control_action(
+                        &self.pool,
+                        Some(&state.market.condition_id),
+                        "resume",
+                        Some(&reason),
+                        "risk_engine",
+                    )
+                    .await?;
                     state.flags.paused = false;
                     state.flags.flattening = false;
                     self.emit_risk("resume", "info", json!({ "reason": reason }))
@@ -735,6 +803,7 @@ impl LpService {
                     warn!(target: "lp.risk", reason = %reason, open_orders = state.open_orders.len(), "risk cancel-all triggered");
                     insert_lp_control_action(
                         &self.pool,
+                        Some(&state.market.condition_id),
                         "cancel_all",
                         Some(&reason),
                         "risk_engine",
@@ -757,6 +826,7 @@ impl LpService {
                     intent.price = flatten_reference_price(state, &intent.asset_id, intent.price);
                     insert_lp_control_action(
                         &self.pool,
+                        Some(&state.market.condition_id),
                         "flatten",
                         Some("risk flatten"),
                         "risk_engine",
@@ -1067,7 +1137,13 @@ impl LpService {
             "last_decision_reason": state.last_decision_reason,
         });
         let rendered = serde_json::to_string_pretty(&payload)?;
-        insert_lp_report(&self.pool, "summary", &rendered).await?;
+        insert_lp_report(
+            &self.pool,
+            Some(&state.market.condition_id),
+            "summary",
+            &rendered,
+        )
+        .await?;
         info!(target: "lp.report", report_type = "summary", payload = %rendered, "operator summary generated");
         if let Some(reporter) = &self.reporter {
             reporter.send("summary", &rendered).await?;
@@ -1119,7 +1195,15 @@ impl LpService {
         details: serde_json::Value,
     ) -> Result<()> {
         let payload = serde_json::to_string(&details)?;
-        insert_lp_risk_event(&self.pool, event_type, severity, &payload).await?;
+        let condition_id = self.snapshot_tx.borrow().market.condition_id.clone();
+        insert_lp_risk_event(
+            &self.pool,
+            Some(&condition_id),
+            event_type,
+            severity,
+            &payload,
+        )
+        .await?;
         match severity {
             "error" => {
                 error!(target: "lp.risk", event_type = %event_type, details = %payload, "risk event")

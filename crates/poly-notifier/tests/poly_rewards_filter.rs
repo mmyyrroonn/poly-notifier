@@ -12,6 +12,8 @@ fn poly_rewards_filter_prints_help() {
     assert!(stdout.contains("Usage: poly-rewards-filter"));
     assert!(stdout.contains("--report"));
     assert!(stdout.contains("--sort"));
+    assert!(stdout.contains("--emit-multi-config"));
+    assert!(stdout.contains("--base-config"));
 }
 
 #[test]

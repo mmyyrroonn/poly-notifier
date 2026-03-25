@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use dotenvy::dotenv;
+use futures_util::future::join_all;
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -17,85 +18,49 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use pn_admin::create_router;
-use pn_common::config::AppConfig;
+use pn_common::config::{AppConfig, LpMarketConfig};
 use pn_common::db::init_db;
 use pn_lp::types::SignalState;
 use pn_lp::{
     AccountSnapshot, ExchangeAdapter, ExchangeEvent, FlattenIntent, LpService, ManagedOrder,
-    MarketMetadata, PositionSnapshot, QuoteIntent, QuoteMode, QuoteSide, ReconciliationSnapshot,
-    Reporter, RewardSnapshot, RewardState, RuntimeFlags, RuntimeState, ServiceConfig,
-    TokenMetadata, TradeFill,
+    MarketMetadata, MultiLpControlHandle, PositionSnapshot, QuoteIntent, QuoteMode, QuoteSide,
+    ReconciliationSnapshot, Reporter, RewardSnapshot, RewardState, RuntimeFlags, RuntimeState,
+    ServiceConfig, TokenMetadata, TradeFill,
 };
 use pn_notify::telegram::BotRegistry;
 use pn_polymarket::{
-    BootstrapState, ExecutionConfig, PolymarketExecutionClient, QuoteRequest,
-    QuoteSide as SdkQuoteSide, RewardSnapshot as SdkRewardSnapshot, StreamEvent as SdkStreamEvent,
+    BootstrapState, ExecutionConfig, PolymarketExecutionClient, PolymarketSharedStreamClient,
+    QuoteRequest, QuoteSide as SdkQuoteSide, RewardSnapshot as SdkRewardSnapshot,
+    SharedStreamConfig, SharedStreamSubscription, StreamEvent as SdkStreamEvent,
 };
 use poly_lp::guard::{guard_heartbeat_url, spawn_guard_heartbeat_loop};
+use poly_lp::shared_streams::{BuyReservationLedger, SharedEventFanout};
 
 #[derive(Clone)]
 struct LiveExchangeAdapter {
+    condition_id: String,
     client: Arc<PolymarketExecutionClient>,
     reward_fetch_retries: usize,
     reward_fetch_backoff: Duration,
+    shared_fanout: Option<SharedEventFanout>,
+    asset_ids: Vec<String>,
+    buy_ledger: BuyReservationLedger,
 }
 
 #[async_trait]
 impl ExchangeAdapter for LiveExchangeAdapter {
     fn start(&self, event_tx: mpsc::UnboundedSender<ExchangeEvent>, cancel: CancellationToken) {
+        if let Some(fanout) = &self.shared_fanout {
+            fanout.register(self.asset_ids.clone(), event_tx);
+            return;
+        }
+
         let (sdk_tx, mut sdk_rx) = mpsc::unbounded_channel();
         self.client.start_streams(sdk_tx, cancel.clone());
 
         tokio::spawn(async move {
             while let Some(event) = sdk_rx.recv().await {
-                let mapped = match event {
-                    SdkStreamEvent::Book(book) => ExchangeEvent::Book(pn_lp::BookSnapshot {
-                        asset_id: book.asset_id,
-                        bids: book
-                            .bids
-                            .into_iter()
-                            .map(|level| pn_lp::types::BookLevel {
-                                price: level.price,
-                                size: level.size,
-                            })
-                            .collect(),
-                        asks: book
-                            .asks
-                            .into_iter()
-                            .map(|level| pn_lp::types::BookLevel {
-                                price: level.price,
-                                size: level.size,
-                            })
-                            .collect(),
-                        received_at: Utc::now(),
-                    }),
-                    SdkStreamEvent::Order(order) => ExchangeEvent::Order(ManagedOrder {
-                        order_id: order.order_id,
-                        asset_id: order.asset_id,
-                        side: map_sdk_side(order.side),
-                        price: order.price,
-                        size: order.size,
-                        created_at: Utc::now(),
-                        status: order.status,
-                    }),
-                    SdkStreamEvent::Trade(fill) => ExchangeEvent::Trade(TradeFill {
-                        trade_id: fill.trade_id,
-                        order_id: fill.order_id,
-                        asset_id: fill.asset_id,
-                        side: map_sdk_side(fill.side),
-                        price: fill.price,
-                        size: fill.size,
-                        status: fill.status,
-                        received_at: Utc::now(),
-                    }),
-                    SdkStreamEvent::TickSize {
-                        asset_id,
-                        new_tick_size,
-                    } => ExchangeEvent::TickSize {
-                        asset_id,
-                        new_tick_size,
-                    },
-                };
+                let mapped = map_sdk_stream_event(event);
 
                 if event_tx.send(mapped).is_err() {
                     break;
@@ -106,6 +71,24 @@ impl ExchangeAdapter for LiveExchangeAdapter {
 
     async fn reconcile(&self) -> Result<ReconciliationSnapshot> {
         let snapshot = self.client.reconcile().await?;
+        let open_orders = snapshot
+            .open_orders
+            .into_iter()
+            .map(|order| ManagedOrder {
+                order_id: order.order_id,
+                asset_id: order.asset_id,
+                side: map_sdk_side(order.side),
+                price: order.price,
+                size: order.size,
+                created_at: Utc::now(),
+                status: order.status,
+            })
+            .collect::<Vec<_>>();
+        self.buy_ledger.refresh_market(
+            &self.condition_id,
+            snapshot.account.usdc_balance,
+            &open_orders,
+        );
         Ok(ReconciliationSnapshot {
             books: snapshot
                 .books
@@ -131,19 +114,7 @@ impl ExchangeAdapter for LiveExchangeAdapter {
                     received_at: Utc::now(),
                 })
                 .collect(),
-            open_orders: snapshot
-                .open_orders
-                .into_iter()
-                .map(|order| ManagedOrder {
-                    order_id: order.order_id,
-                    asset_id: order.asset_id,
-                    side: map_sdk_side(order.side),
-                    price: order.price,
-                    size: order.size,
-                    created_at: Utc::now(),
-                    status: order.status,
-                })
-                .collect(),
+            open_orders,
             positions: snapshot
                 .positions
                 .into_iter()
@@ -170,6 +141,10 @@ impl ExchangeAdapter for LiveExchangeAdapter {
     }
 
     async fn post_quotes(&self, quotes: &[QuoteIntent]) -> Result<Vec<ManagedOrder>> {
+        let previous_reserved = self
+            .buy_ledger
+            .reserve_quotes(&self.condition_id, quotes)
+            .map_err(anyhow::Error::msg)?;
         let requests = quotes
             .iter()
             .map(|quote| QuoteRequest {
@@ -179,7 +154,14 @@ impl ExchangeAdapter for LiveExchangeAdapter {
                 size: quote.size,
             })
             .collect::<Vec<_>>();
-        let posted = self.client.post_quotes(&requests).await?;
+        let posted = match self.client.post_quotes(&requests).await {
+            Ok(posted) => posted,
+            Err(error) => {
+                self.buy_ledger
+                    .restore_market(&self.condition_id, previous_reserved);
+                return Err(error);
+            }
+        };
         Ok(posted
             .into_iter()
             .map(|order| ManagedOrder {
@@ -199,7 +181,9 @@ impl ExchangeAdapter for LiveExchangeAdapter {
     }
 
     async fn cancel_all(&self) -> Result<()> {
-        self.client.cancel_all().await
+        self.client.cancel_market_orders(None).await?;
+        self.buy_ledger.clear_market(&self.condition_id);
+        Ok(())
     }
 
     async fn flatten(&self, intent: &FlattenIntent) -> Result<Option<TradeFill>> {
@@ -226,6 +210,72 @@ impl ExchangeAdapter for LiveExchangeAdapter {
 
     async fn merge(&self, amount: Decimal) -> Result<String> {
         self.client.merge_positions(amount).await
+    }
+}
+
+fn map_sdk_stream_event(event: SdkStreamEvent) -> ExchangeEvent {
+    match event {
+        SdkStreamEvent::Book(book) => ExchangeEvent::Book(pn_lp::BookSnapshot {
+            asset_id: book.asset_id,
+            bids: book
+                .bids
+                .into_iter()
+                .map(|level| pn_lp::types::BookLevel {
+                    price: level.price,
+                    size: level.size,
+                })
+                .collect(),
+            asks: book
+                .asks
+                .into_iter()
+                .map(|level| pn_lp::types::BookLevel {
+                    price: level.price,
+                    size: level.size,
+                })
+                .collect(),
+            received_at: Utc::now(),
+        }),
+        SdkStreamEvent::Order(order) => ExchangeEvent::Order(ManagedOrder {
+            order_id: order.order_id,
+            asset_id: order.asset_id,
+            side: map_sdk_side(order.side),
+            price: order.price,
+            size: order.size,
+            created_at: Utc::now(),
+            status: order.status,
+        }),
+        SdkStreamEvent::Trade(fill) => ExchangeEvent::Trade(TradeFill {
+            trade_id: fill.trade_id,
+            order_id: fill.order_id,
+            asset_id: fill.asset_id,
+            side: map_sdk_side(fill.side),
+            price: fill.price,
+            size: fill.size,
+            status: fill.status,
+            received_at: Utc::now(),
+        }),
+        SdkStreamEvent::TickSize {
+            asset_id,
+            new_tick_size,
+        } => ExchangeEvent::TickSize {
+            asset_id,
+            new_tick_size,
+        },
+    }
+}
+
+#[derive(Clone)]
+struct PrefixedReporter {
+    inner: Arc<dyn Reporter>,
+    label: String,
+}
+
+#[async_trait]
+impl Reporter for PrefixedReporter {
+    async fn send(&self, report_type: &str, message: &str) -> Result<()> {
+        self.inner
+            .send(report_type, &format!("[{}]\n{}", self.label, message))
+            .await
     }
 }
 
@@ -260,7 +310,167 @@ impl Reporter for TelegramReporter {
     }
 }
 
+#[derive(Clone)]
+struct ResolvedMarketConfig {
+    condition_id: String,
+    slug: Option<String>,
+    question_hint: Option<String>,
+    buy_budget_usdc: Option<f64>,
+    quote_mode: String,
+    quote_size: f64,
+    quote_offset_ticks: u32,
+    min_inside_ticks: u32,
+    min_inside_depth_multiple: f64,
+    min_usdc_balance: f64,
+    min_token_balance: f64,
+    auto_split_on_startup: bool,
+    startup_split_amount: f64,
+    max_position: f64,
+    flat_position_tolerance: f64,
+    auto_flatten_after_fill: bool,
+    flatten_use_fok: bool,
+    stale_feed_after_secs: u64,
+}
+
+struct MarketRuntimeSeed {
+    resolved: ResolvedMarketConfig,
+    client: Arc<PolymarketExecutionClient>,
+    initial_state: RuntimeState,
+    asset_ids: Vec<String>,
+}
+
+fn resolved_markets(config: &AppConfig) -> Result<Vec<ResolvedMarketConfig>> {
+    if !config.lp.markets.is_empty() {
+        let markets = config
+            .lp
+            .markets
+            .iter()
+            .filter(|market| market.enabled)
+            .map(|market| resolve_market(config, Some(market)))
+            .collect::<Result<Vec<_>>>()?;
+        if markets.is_empty() {
+            anyhow::bail!("no enabled lp markets are configured");
+        }
+        return Ok(markets);
+    }
+
+    let Some(condition_id) = config.lp.trading.condition_id.clone() else {
+        anyhow::bail!("no enabled lp market is configured");
+    };
+
+    Ok(vec![ResolvedMarketConfig {
+        condition_id,
+        slug: None,
+        question_hint: None,
+        buy_budget_usdc: None,
+        quote_mode: config.lp.strategy.quote_mode.clone(),
+        quote_size: config.lp.strategy.quote_size,
+        quote_offset_ticks: config.lp.strategy.quote_offset_ticks,
+        min_inside_ticks: config.lp.strategy.min_inside_ticks,
+        min_inside_depth_multiple: config.lp.strategy.min_inside_depth_multiple,
+        min_usdc_balance: config.lp.inventory.min_usdc_balance,
+        min_token_balance: config.lp.inventory.min_token_balance,
+        auto_split_on_startup: config.lp.inventory.auto_split_on_startup,
+        startup_split_amount: config.lp.inventory.startup_split_amount,
+        max_position: config.lp.risk.max_position,
+        flat_position_tolerance: config.lp.risk.flat_position_tolerance,
+        auto_flatten_after_fill: config.lp.risk.auto_flatten_after_fill,
+        flatten_use_fok: config.lp.risk.flatten_use_fok,
+        stale_feed_after_secs: config.lp.risk.stale_feed_after_secs,
+    }])
+}
+
+fn resolve_market(
+    config: &AppConfig,
+    market: Option<&LpMarketConfig>,
+) -> Result<ResolvedMarketConfig> {
+    let market = market.expect("market override required");
+    if market.condition_id.trim().is_empty() {
+        anyhow::bail!("lp.markets.condition_id must not be empty");
+    }
+
+    let strategy = market.strategy.as_ref();
+    let inventory = market.inventory.as_ref();
+    let risk = market.risk.as_ref();
+    let capital = market.capital.as_ref();
+
+    Ok(ResolvedMarketConfig {
+        condition_id: market.condition_id.clone(),
+        slug: market.slug.clone(),
+        question_hint: market.question.clone(),
+        buy_budget_usdc: capital.and_then(|capital| capital.buy_budget_usdc),
+        quote_mode: strategy
+            .and_then(|strategy| strategy.quote_mode.clone())
+            .unwrap_or_else(|| config.lp.strategy.quote_mode.clone()),
+        quote_size: strategy
+            .and_then(|strategy| strategy.quote_size)
+            .unwrap_or(config.lp.strategy.quote_size),
+        quote_offset_ticks: strategy
+            .and_then(|strategy| strategy.quote_offset_ticks)
+            .unwrap_or(config.lp.strategy.quote_offset_ticks),
+        min_inside_ticks: strategy
+            .and_then(|strategy| strategy.min_inside_ticks)
+            .unwrap_or(config.lp.strategy.min_inside_ticks),
+        min_inside_depth_multiple: strategy
+            .and_then(|strategy| strategy.min_inside_depth_multiple)
+            .unwrap_or(config.lp.strategy.min_inside_depth_multiple),
+        min_usdc_balance: inventory
+            .and_then(|inventory| inventory.min_usdc_balance)
+            .unwrap_or(config.lp.inventory.min_usdc_balance),
+        min_token_balance: inventory
+            .and_then(|inventory| inventory.min_token_balance)
+            .unwrap_or(config.lp.inventory.min_token_balance),
+        auto_split_on_startup: inventory
+            .and_then(|inventory| inventory.auto_split_on_startup)
+            .unwrap_or(config.lp.inventory.auto_split_on_startup),
+        startup_split_amount: inventory
+            .and_then(|inventory| inventory.startup_split_amount)
+            .unwrap_or(config.lp.inventory.startup_split_amount),
+        max_position: risk
+            .and_then(|risk| risk.max_position)
+            .unwrap_or(config.lp.risk.max_position),
+        flat_position_tolerance: risk
+            .and_then(|risk| risk.flat_position_tolerance)
+            .unwrap_or(config.lp.risk.flat_position_tolerance),
+        auto_flatten_after_fill: risk
+            .and_then(|risk| risk.auto_flatten_after_fill)
+            .unwrap_or(config.lp.risk.auto_flatten_after_fill),
+        flatten_use_fok: risk
+            .and_then(|risk| risk.flatten_use_fok)
+            .unwrap_or(config.lp.risk.flatten_use_fok),
+        stale_feed_after_secs: risk
+            .and_then(|risk| risk.stale_feed_after_secs)
+            .unwrap_or(config.lp.risk.stale_feed_after_secs),
+    })
+}
+
 static RUSTLS_PROVIDER_READY: OnceLock<()> = OnceLock::new();
+
+struct CliArgs {
+    config_path: String,
+}
+
+fn parse_cli_args(args: Vec<String>) -> Result<CliArgs> {
+    let mut config_path = "config/default.toml".to_string();
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => {
+                config_path = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
+            }
+            "--help" | "-h" => {
+                println!("Usage: poly-lp [--config path]");
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("unexpected argument '{other}'"),
+        }
+    }
+
+    Ok(CliArgs { config_path })
+}
 
 fn ensure_rustls_crypto_provider() -> Result<()> {
     if RUSTLS_PROVIDER_READY.get().is_some() {
@@ -281,81 +491,163 @@ fn ensure_rustls_crypto_provider() -> Result<()> {
 async fn main() -> Result<()> {
     ensure_rustls_crypto_provider()?;
     let _ = dotenv();
-    let config = AppConfig::load()?;
-    validate_condition_id(&config.lp.trading.condition_id)?;
+    let args = parse_cli_args(std::env::args().skip(1).collect())?;
+    let config = AppConfig::load_from(&args.config_path)?;
+    let markets = resolved_markets(&config)?;
+    for market in &markets {
+        validate_condition_id(&market.condition_id)?;
+    }
     let _logging_guards = init_tracing(&config)?;
 
     let pool = init_db(&config.database.url, config.database.max_connections).await?;
 
     let bot_registry = build_bot_registry();
     let reporter = build_reporter(&config, bot_registry.clone());
-
-    let sdk_client = Arc::new(
-        PolymarketExecutionClient::connect(ExecutionConfig {
-            condition_id: config.lp.trading.condition_id.clone(),
-            clob_base_url: config.lp.trading.clob_base_url.clone(),
-            data_api_base_url: config.lp.trading.data_api_base_url.clone(),
-            chain_id: config.lp.trading.chain_id,
-        })
-        .await?,
-    );
-    let include_inventory_approval =
-        config.lp.inventory.auto_split_on_startup && config.lp.inventory.startup_split_amount > 0.0;
-    let approval_status = sdk_client
-        .check_approvals(include_inventory_approval)
-        .await?;
-    if !approval_status.is_ready() {
-        if config.lp.approvals.auto_approve_on_startup {
-            warn!(
-                missing = ?approval_status.missing_permissions(),
-                "startup approvals missing; auto-approve enabled"
-            );
-            sdk_client
-                .ensure_approvals(include_inventory_approval)
-                .await?;
-        } else if config.lp.approvals.require_on_startup {
-            anyhow::bail!(
-                "missing required approvals: {}",
-                approval_status.missing_permissions().join(", ")
-            );
-        } else {
-            warn!(
-                missing = ?approval_status.missing_permissions(),
-                "startup approvals missing; continuing because require_on_startup=false"
-            );
-        }
-    } else {
-        info!("startup approvals verified");
-    }
-    let bootstrap = sdk_client.bootstrap().await?;
-    let initial_state = build_initial_state(&config, bootstrap);
-
-    let exchange: Arc<dyn ExchangeAdapter> = Arc::new(LiveExchangeAdapter {
-        client: sdk_client.clone(),
-        reward_fetch_retries: config.lp.strategy.reward_fetch_retries,
-        reward_fetch_backoff: Duration::from_millis(config.lp.strategy.reward_fetch_backoff_ms),
-    });
-
-    let (service, control) = LpService::new(
-        exchange,
-        pool.clone(),
-        build_service_config(&config)?,
-        reporter,
-        initial_state,
-    );
-
     let cancel = CancellationToken::new();
-
-    let service_cancel = cancel.clone();
-    let service_handle = tokio::spawn(async move {
-        if let Err(error) = service.run(service_cancel).await {
-            error!(?error, "LP service exited with error");
+    let include_inventory_approval = markets
+        .iter()
+        .any(|market| market.auto_split_on_startup && market.startup_split_amount > 0.0);
+    let mut approvals_verified = false;
+    let mut seeds = Vec::with_capacity(markets.len());
+    for market in markets {
+        let sdk_client = Arc::new(
+            PolymarketExecutionClient::connect(ExecutionConfig {
+                condition_id: market.condition_id.clone(),
+                clob_base_url: config.lp.trading.clob_base_url.clone(),
+                data_api_base_url: config.lp.trading.data_api_base_url.clone(),
+                chain_id: config.lp.trading.chain_id,
+            })
+            .await?,
+        );
+        if !approvals_verified {
+            let approval_status = sdk_client
+                .check_approvals(include_inventory_approval)
+                .await?;
+            if !approval_status.is_ready() {
+                if config.lp.approvals.auto_approve_on_startup {
+                    warn!(
+                        missing = ?approval_status.missing_permissions(),
+                        "startup approvals missing; auto-approve enabled"
+                    );
+                    sdk_client
+                        .ensure_approvals(include_inventory_approval)
+                        .await?;
+                } else if config.lp.approvals.require_on_startup {
+                    anyhow::bail!(
+                        "missing required approvals: {}",
+                        approval_status.missing_permissions().join(", ")
+                    );
+                } else {
+                    warn!(
+                        missing = ?approval_status.missing_permissions(),
+                        "startup approvals missing; continuing because require_on_startup=false"
+                    );
+                }
+            } else {
+                info!("startup approvals verified");
+            }
+            approvals_verified = true;
         }
-    });
+
+        let bootstrap = sdk_client.bootstrap().await?;
+        let initial_state = build_initial_state(&config, bootstrap);
+        let asset_ids = initial_state
+            .market
+            .tokens
+            .iter()
+            .map(|token| token.asset_id.clone())
+            .collect::<Vec<_>>();
+        seeds.push(MarketRuntimeSeed {
+            resolved: market,
+            client: sdk_client,
+            initial_state,
+            asset_ids,
+        });
+    }
+
+    let buy_ledger = BuyReservationLedger::default();
+    for seed in &seeds {
+        let buy_budget = seed.resolved.buy_budget_usdc.map(decimal).transpose()?;
+        buy_ledger.configure_market(&seed.resolved.condition_id, buy_budget);
+        buy_ledger.refresh_market(
+            &seed.resolved.condition_id,
+            seed.initial_state.account.usdc_balance,
+            &seed.initial_state.open_orders,
+        );
+    }
+
+    let shared_fanout = (seeds.len() > 1).then(SharedEventFanout::default);
+    let shared_stream_forwarder = if let Some(fanout) = shared_fanout.clone() {
+        let subscriptions = seeds
+            .iter()
+            .map(|seed| SharedStreamSubscription {
+                condition_id: seed.resolved.condition_id.clone(),
+                asset_ids: seed.asset_ids.clone(),
+            })
+            .collect::<Vec<_>>();
+        let shared_client = PolymarketSharedStreamClient::connect(
+            SharedStreamConfig {
+                clob_base_url: config.lp.trading.clob_base_url.clone(),
+                chain_id: config.lp.trading.chain_id,
+            },
+            &subscriptions,
+        )
+        .await?;
+        let (sdk_tx, mut sdk_rx) = mpsc::unbounded_channel();
+        shared_client.start(sdk_tx, cancel.clone());
+        Some(tokio::spawn(async move {
+            while let Some(event) = sdk_rx.recv().await {
+                fanout.dispatch(map_sdk_stream_event(event));
+            }
+        }))
+    } else {
+        None
+    };
+
+    let mut controls = BTreeMap::new();
+    let mut service_handles = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let label = seed
+            .resolved
+            .slug
+            .clone()
+            .or(seed.resolved.question_hint.clone())
+            .unwrap_or_else(|| seed.resolved.condition_id.clone());
+        let market_reporter = reporter
+            .clone()
+            .map(|inner| Arc::new(PrefixedReporter { inner, label }) as Arc<dyn Reporter>);
+        let exchange: Arc<dyn ExchangeAdapter> = Arc::new(LiveExchangeAdapter {
+            condition_id: seed.resolved.condition_id.clone(),
+            client: seed.client.clone(),
+            reward_fetch_retries: config.lp.strategy.reward_fetch_retries,
+            reward_fetch_backoff: Duration::from_millis(config.lp.strategy.reward_fetch_backoff_ms),
+            shared_fanout: shared_fanout.clone(),
+            asset_ids: seed.asset_ids.clone(),
+            buy_ledger: buy_ledger.clone(),
+        });
+        let (service, control) = LpService::new(
+            exchange,
+            pool.clone(),
+            build_service_config_for_market(&config, &seed.resolved)?,
+            market_reporter,
+            seed.initial_state,
+        );
+        controls.insert(seed.resolved.condition_id.clone(), control);
+        let service_cancel = cancel.clone();
+        service_handles.push(tokio::spawn(async move {
+            if let Err(error) = service.run(service_cancel).await {
+                error!(?error, "LP service exited with error");
+            }
+        }));
+    }
 
     let admin_password = std::env::var("ADMIN_PASSWORD")
         .expect("ADMIN_PASSWORD env var must be set - the admin API controls live trading");
-    let router = create_router(pool.clone(), admin_password, Some(control.clone()));
+    let router = create_router(
+        pool.clone(),
+        admin_password,
+        Some(MultiLpControlHandle::new(controls)),
+    );
     let admin_addr = format!("{}:{}", config.lp.control.bind_addr, config.admin.port);
     let admin_cancel = cancel.clone();
     let admin_handle = tokio::spawn(async move {
@@ -386,7 +678,11 @@ async fn main() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     cancel.cancel();
 
-    let _ = tokio::join!(service_handle, admin_handle);
+    let _ = join_all(service_handles).await;
+    let _ = admin_handle.await;
+    if let Some(shared_stream_forwarder) = shared_stream_forwarder {
+        let _ = shared_stream_forwarder.await;
+    }
     if let Some(guard_heartbeat_handle) = guard_heartbeat_handle {
         let _ = guard_heartbeat_handle.await;
     }
@@ -490,42 +786,50 @@ fn build_reporter(config: &AppConfig, bot_registry: Arc<BotRegistry>) -> Option<
     }))
 }
 
+#[cfg(test)]
 fn build_service_config(config: &AppConfig) -> Result<ServiceConfig> {
-    let quote_mode = QuoteMode::from_str(&config.lp.strategy.quote_mode).map_err(|error| {
+    let market = resolved_markets(config)?
+        .into_iter()
+        .next()
+        .expect("resolved at least one market");
+    build_service_config_for_market(config, &market)
+}
+
+fn build_service_config_for_market(
+    config: &AppConfig,
+    market: &ResolvedMarketConfig,
+) -> Result<ServiceConfig> {
+    let quote_mode = QuoteMode::from_str(&market.quote_mode).map_err(|error| {
         anyhow::anyhow!(
             "invalid lp.strategy.quote_mode '{}': {error}",
-            config.lp.strategy.quote_mode
+            market.quote_mode
         )
     })?;
 
     Ok(ServiceConfig {
         decision: pn_lp::DecisionConfig {
             quote_mode,
-            quote_size: decimal(config.lp.strategy.quote_size)?,
+            quote_size: decimal(market.quote_size)?,
             min_spread: decimal(config.lp.strategy.min_spread)?,
             min_depth: decimal(config.lp.strategy.min_depth)?,
-            quote_offset_ticks: config.lp.strategy.quote_offset_ticks,
-            min_usdc_balance: decimal(config.lp.inventory.min_usdc_balance)?,
-            min_token_balance: decimal(config.lp.inventory.min_token_balance)?,
-            min_inside_ticks: config.lp.strategy.min_inside_ticks,
-            min_inside_depth_multiple: decimal(config.lp.strategy.min_inside_depth_multiple)?,
+            quote_offset_ticks: market.quote_offset_ticks,
+            min_usdc_balance: decimal(market.min_usdc_balance)?,
+            min_token_balance: decimal(market.min_token_balance)?,
+            min_inside_ticks: market.min_inside_ticks,
+            min_inside_depth_multiple: decimal(market.min_inside_depth_multiple)?,
             reward_stale_after: chrono::Duration::seconds(
                 config.lp.strategy.reward_stale_after_secs as i64,
             ),
         },
         risk: pn_lp::RiskConfig {
-            max_position: decimal(config.lp.risk.max_position)?,
-            flat_position_tolerance: decimal(config.lp.risk.flat_position_tolerance)?,
-            stale_feed_after: chrono::Duration::seconds(
-                config.lp.risk.stale_feed_after_secs as i64,
-            ),
-            auto_flatten_after_fill: config.lp.risk.auto_flatten_after_fill,
-            flatten_use_fok: config.lp.risk.flatten_use_fok,
+            max_position: decimal(market.max_position)?,
+            flat_position_tolerance: decimal(market.flat_position_tolerance)?,
+            stale_feed_after: chrono::Duration::seconds(market.stale_feed_after_secs as i64),
+            auto_flatten_after_fill: market.auto_flatten_after_fill,
+            flatten_use_fok: market.flatten_use_fok,
         },
-        startup_split_amount: if config.lp.inventory.auto_split_on_startup
-            && config.lp.inventory.startup_split_amount > 0.0
-        {
-            Some(decimal(config.lp.inventory.startup_split_amount)?)
+        startup_split_amount: if market.auto_split_on_startup && market.startup_split_amount > 0.0 {
+            Some(decimal(market.startup_split_amount)?)
         } else {
             None
         },
@@ -751,7 +1055,7 @@ mod tests {
 
     use super::{
         build_initial_state, build_service_config, decimal, ensure_rustls_crypto_provider,
-        map_flatten_fill, validate_condition_id, QuoteMode,
+        map_flatten_fill, parse_cli_args, validate_condition_id, QuoteMode,
     };
 
     #[test]
@@ -780,6 +1084,14 @@ mod tests {
     fn validate_condition_id_rejects_placeholder_value() {
         assert!(validate_condition_id("replace-me").is_err());
         assert!(validate_condition_id("0xabc").is_ok());
+    }
+
+    #[test]
+    fn parse_cli_args_accepts_explicit_config_path() {
+        let args = parse_cli_args(vec!["--config".to_string(), "/tmp/multi.toml".to_string()])
+            .expect("parse args");
+
+        assert_eq!(args.config_path, "/tmp/multi.toml");
     }
 
     #[test]
@@ -816,7 +1128,7 @@ mod tests {
             guard: GuardConfig::default(),
             lp: LpConfig {
                 trading: LpTradingConfig {
-                    condition_id: "0xabc".to_string(),
+                    condition_id: Some("0xabc".to_string()),
                     clob_base_url: "https://clob.example".to_string(),
                     gamma_base_url: "https://gamma.example".to_string(),
                     data_api_base_url: "https://data.example".to_string(),
@@ -871,6 +1183,7 @@ mod tests {
                     max_files: 3,
                     json: true,
                 },
+                markets: Vec::new(),
             },
         };
         let state = build_initial_state(
@@ -953,7 +1266,7 @@ mod tests {
             guard: GuardConfig::default(),
             lp: LpConfig {
                 trading: LpTradingConfig {
-                    condition_id: "0xabc".to_string(),
+                    condition_id: Some("0xabc".to_string()),
                     clob_base_url: "https://clob.example".to_string(),
                     gamma_base_url: "https://gamma.example".to_string(),
                     data_api_base_url: "https://data.example".to_string(),
@@ -1008,6 +1321,7 @@ mod tests {
                     max_files: 3,
                     json: true,
                 },
+                markets: Vec::new(),
             },
         };
 
@@ -1053,7 +1367,7 @@ mod tests {
             guard: GuardConfig::default(),
             lp: LpConfig {
                 trading: LpTradingConfig {
-                    condition_id: "0xabc".to_string(),
+                    condition_id: Some("0xabc".to_string()),
                     clob_base_url: "https://clob.example".to_string(),
                     gamma_base_url: "https://gamma.example".to_string(),
                     data_api_base_url: "https://data.example".to_string(),
@@ -1108,6 +1422,7 @@ mod tests {
                     max_files: 3,
                     json: true,
                 },
+                markets: Vec::new(),
             },
         };
 

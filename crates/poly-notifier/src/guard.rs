@@ -340,7 +340,7 @@ mod tests {
             },
             lp: LpConfig {
                 trading: LpTradingConfig {
-                    condition_id: "0xabc".to_string(),
+                    condition_id: Some("0xabc".to_string()),
                     clob_base_url: "https://clob.example".to_string(),
                     gamma_base_url: "https://gamma.example".to_string(),
                     data_api_base_url: "https://data.example".to_string(),
@@ -395,6 +395,7 @@ mod tests {
                     max_files: 3,
                     json: true,
                 },
+                markets: Vec::new(),
             },
         }
     }

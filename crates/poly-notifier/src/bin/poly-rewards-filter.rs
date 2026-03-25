@@ -2,7 +2,8 @@ use std::{env, fs, path::PathBuf, str::FromStr};
 
 use anyhow::{anyhow, bail, Context, Result};
 use poly_lp::rewards_filter::{
-    filter_markets, FilterConfig, FilteredMarket, ProfileSelection, SortKey,
+    filter_markets, render_multi_market_config, FilterConfig, FilteredMarket, ProfileSelection,
+    SortKey,
 };
 use poly_lp::rewards_report::RewardsReport;
 use rust_decimal::Decimal;
@@ -22,6 +23,9 @@ struct CliArgs {
     min_inside_ticks: Option<u32>,
     eligible_only: bool,
     out_path: Option<PathBuf>,
+    base_config_path: Option<PathBuf>,
+    emit_multi_config_path: Option<PathBuf>,
+    config_top_n: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,7 +60,7 @@ fn main() -> Result<()> {
             profile: args.profile,
             sort_by: args.sort_by,
             count: filtered.len(),
-            entries: filtered,
+            entries: filtered.clone(),
         };
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)
@@ -65,6 +69,44 @@ fn main() -> Result<()> {
         fs::write(out_path, serde_json::to_vec_pretty(&output)?)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
         println!("Filtered output: {}", out_path.display());
+    }
+
+    if let Some(out_path) = &args.emit_multi_config_path {
+        let base_config_path = args
+            .base_config_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("config/default.toml"));
+        let base_config = fs::read_to_string(&base_config_path)
+            .with_context(|| format!("failed to read {}", base_config_path.display()))?;
+        let config_count = args
+            .config_top_n
+            .unwrap_or(filtered.len())
+            .min(filtered.len());
+        let rendered = render_multi_market_config(
+            &base_config,
+            &args.report_path.display().to_string(),
+            match args.profile {
+                ProfileSelection::OuterLowRisk => "outer_low_risk",
+                ProfileSelection::AggressiveMid => "aggressive_mid",
+            },
+            match args.sort_by {
+                SortKey::Balanced => "balanced",
+                SortKey::RoiDaily => "roi_daily",
+                SortKey::RoiAnnual => "roi_annual",
+                SortKey::EstimatedDailyReward => "estimated_daily_reward",
+                SortKey::DailyReward => "daily_reward",
+                SortKey::Crowdedness => "crowdedness",
+                SortKey::Safety => "safety",
+            },
+            &filtered[..config_count],
+        )?;
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(out_path, rendered)
+            .with_context(|| format!("failed to write {}", out_path.display()))?;
+        println!("Runtime config: {}", out_path.display());
     }
 
     Ok(())
@@ -81,6 +123,9 @@ fn parse_cli_args(args: Vec<String>) -> Result<CliArgs> {
     let mut min_inside_ticks = None;
     let mut eligible_only = false;
     let mut out_path = None;
+    let mut base_config_path = None;
+    let mut emit_multi_config_path = None;
+    let mut config_top_n = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -151,6 +196,26 @@ fn parse_cli_args(args: Vec<String>) -> Result<CliArgs> {
                         .ok_or_else(|| anyhow!("--out requires a path"))?,
                 ));
             }
+            "--base-config" => {
+                base_config_path = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| anyhow!("--base-config requires a path"))?,
+                ));
+            }
+            "--emit-multi-config" => {
+                emit_multi_config_path =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        anyhow!("--emit-multi-config requires a path")
+                    })?));
+            }
+            "--config-top-n" => {
+                config_top_n = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow!("--config-top-n requires a value"))?
+                        .parse::<usize>()
+                        .context("config-top-n must be a positive integer")?,
+                );
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -174,6 +239,9 @@ fn parse_cli_args(args: Vec<String>) -> Result<CliArgs> {
         min_inside_ticks,
         eligible_only,
         out_path,
+        base_config_path,
+        emit_multi_config_path,
+        config_top_n,
     })
 }
 
@@ -211,7 +279,7 @@ fn load_report(path: &PathBuf) -> Result<RewardsReport> {
 
 fn print_usage() {
     println!(
-        "Usage: poly-rewards-filter [--report path] [--profile outer_low_risk|aggressive_mid] [--sort balanced|roi_daily|roi_annual|estimated_daily_reward|daily_reward|crowdedness|safety] [--top-n N] [--min-roi-daily X] [--min-daily-reward X] [--max-crowdedness X] [--min-inside-ticks N] [--eligible-only] [--out path]"
+        "Usage: poly-rewards-filter [--report path] [--profile outer_low_risk|aggressive_mid] [--sort balanced|roi_daily|roi_annual|estimated_daily_reward|daily_reward|crowdedness|safety] [--top-n N] [--min-roi-daily X] [--min-daily-reward X] [--max-crowdedness X] [--min-inside-ticks N] [--eligible-only] [--out path] [--base-config path] [--emit-multi-config path] [--config-top-n N]"
     );
     println!("Filters an existing rewards report without fetching live market data.");
 }

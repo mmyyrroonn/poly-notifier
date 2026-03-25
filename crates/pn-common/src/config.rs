@@ -93,8 +93,9 @@ pub struct GuardConfig {
 /// LP daemon trading/client settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LpTradingConfig {
-    /// Polymarket condition ID to quote.
-    pub condition_id: String,
+    /// Legacy single-market Polymarket condition ID to quote.
+    #[serde(default)]
+    pub condition_id: Option<String>,
     /// CLOB REST base URL.
     #[serde(default = "default_clob_base_url")]
     pub clob_base_url: String,
@@ -107,6 +108,61 @@ pub struct LpTradingConfig {
     /// Polygon chain ID for the authenticated SDK client.
     #[serde(default = "default_polygon_chain_id")]
     pub chain_id: u64,
+}
+
+/// Optional per-market inventory overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LpMarketInventoryOverride {
+    pub min_usdc_balance: Option<f64>,
+    pub min_token_balance: Option<f64>,
+    pub auto_split_on_startup: Option<bool>,
+    pub startup_split_amount: Option<f64>,
+}
+
+/// Optional per-market quote strategy overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LpMarketStrategyOverride {
+    pub quote_mode: Option<String>,
+    pub quote_size: Option<f64>,
+    pub quote_offset_ticks: Option<u32>,
+    pub min_inside_ticks: Option<u32>,
+    pub min_inside_depth_multiple: Option<f64>,
+}
+
+/// Optional per-market risk overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LpMarketRiskOverride {
+    pub max_position: Option<f64>,
+    pub flat_position_tolerance: Option<f64>,
+    pub auto_flatten_after_fill: Option<bool>,
+    pub flatten_use_fok: Option<bool>,
+    pub stale_feed_after_secs: Option<u64>,
+}
+
+/// Optional per-market capital limits.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LpMarketCapitalOverride {
+    pub buy_budget_usdc: Option<f64>,
+}
+
+/// Per-market runtime entry for multi-market LP mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LpMarketConfig {
+    pub condition_id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub question: Option<String>,
+    #[serde(default)]
+    pub inventory: Option<LpMarketInventoryOverride>,
+    #[serde(default)]
+    pub strategy: Option<LpMarketStrategyOverride>,
+    #[serde(default)]
+    pub risk: Option<LpMarketRiskOverride>,
+    #[serde(default)]
+    pub capital: Option<LpMarketCapitalOverride>,
 }
 
 /// LP inventory watermarks and optional split sizing.
@@ -286,6 +342,8 @@ pub struct LpConfig {
     pub reporting: LpReportingConfig,
     pub control: LpControlConfig,
     pub logging: LpLoggingConfig,
+    #[serde(default)]
+    pub markets: Vec<LpMarketConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -428,5 +486,263 @@ impl Default for GuardConfig {
             heartbeat_timeout_secs: default_guard_heartbeat_timeout(),
             check_interval_secs: default_guard_check_interval(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::AppConfig;
+
+    fn write_temp_config(contents: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("poly-notifier-config-{unique}.toml"));
+        fs::write(&path, contents).expect("write temp config");
+        path
+    }
+
+    #[test]
+    fn load_from_supports_legacy_single_market_config() {
+        let path = write_temp_config(
+            r#"
+[database]
+url = "sqlite:test.db"
+max_connections = 1
+
+[telegram]
+rate_limit_per_user = 20
+
+[monitor]
+subscription_refresh_interval_secs = 60
+ws_ping_interval_secs = 10
+reconnect_base_delay_secs = 1
+reconnect_max_delay_secs = 60
+
+[alert]
+cache_refresh_interval_secs = 30
+default_cooldown_minutes = 60
+price_flush_interval_secs = 30
+
+[scheduler]
+daily_summary_cron = "0 0 9 * * *"
+
+[admin]
+port = 36363
+
+[guard]
+enabled = false
+bind_addr = "127.0.0.1"
+port = 37373
+heartbeat_interval_secs = 5
+heartbeat_timeout_secs = 15
+check_interval_secs = 1
+
+[lp.trading]
+condition_id = "condition-legacy"
+clob_base_url = "https://clob.polymarket.com"
+gamma_base_url = "https://gamma-api.polymarket.com"
+data_api_base_url = "https://data-api.polymarket.com"
+chain_id = 137
+
+[lp.inventory]
+min_usdc_balance = 50.0
+min_token_balance = 10.0
+auto_split_on_startup = false
+startup_split_amount = 0.0
+
+[lp.strategy]
+quote_mode = "inside"
+quote_size = 25.0
+min_spread = 0.01
+min_depth = 25.0
+quote_offset_ticks = 2
+max_quote_age_secs = 30
+reward_refresh_interval_secs = 30
+reward_stale_after_secs = 90
+reward_fetch_retries = 3
+reward_fetch_backoff_ms = 250
+min_inside_ticks = 1
+min_inside_depth_multiple = 1.5
+default_external_signal = true
+
+[lp.risk]
+max_position = 100.0
+flat_position_tolerance = 1.0
+auto_flatten_after_fill = true
+flatten_use_fok = false
+stale_feed_after_secs = 15
+
+[lp.approvals]
+require_on_startup = true
+auto_approve_on_startup = true
+
+[lp.reporting]
+operator_bot_id = ""
+operator_chat_ids = []
+summary_interval_secs = 300
+
+[lp.control]
+bind_addr = "127.0.0.1"
+heartbeat_interval_secs = 5
+reconciliation_interval_secs = 10
+
+[lp.logging]
+snapshot_interval_secs = 60
+directory = "logs"
+file_prefix = "poly-lp"
+max_files = 14
+json = true
+"#,
+        );
+
+        let config = AppConfig::load_from(path.to_str().unwrap()).expect("load config");
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            config.lp.trading.condition_id.as_deref(),
+            Some("condition-legacy")
+        );
+        assert!(config.lp.markets.is_empty());
+    }
+
+    #[test]
+    fn load_from_supports_multi_market_overrides() {
+        let path = write_temp_config(
+            r#"
+[database]
+url = "sqlite:test.db"
+max_connections = 1
+
+[telegram]
+rate_limit_per_user = 20
+
+[monitor]
+subscription_refresh_interval_secs = 60
+ws_ping_interval_secs = 10
+reconnect_base_delay_secs = 1
+reconnect_max_delay_secs = 60
+
+[alert]
+cache_refresh_interval_secs = 30
+default_cooldown_minutes = 60
+price_flush_interval_secs = 30
+
+[scheduler]
+daily_summary_cron = "0 0 9 * * *"
+
+[admin]
+port = 36363
+
+[guard]
+enabled = false
+bind_addr = "127.0.0.1"
+port = 37373
+heartbeat_interval_secs = 5
+heartbeat_timeout_secs = 15
+check_interval_secs = 1
+
+[lp.trading]
+clob_base_url = "https://clob.polymarket.com"
+gamma_base_url = "https://gamma-api.polymarket.com"
+data_api_base_url = "https://data-api.polymarket.com"
+chain_id = 137
+
+[lp.inventory]
+min_usdc_balance = 50.0
+min_token_balance = 10.0
+auto_split_on_startup = false
+startup_split_amount = 0.0
+
+[lp.strategy]
+quote_mode = "inside"
+quote_size = 25.0
+min_spread = 0.01
+min_depth = 25.0
+quote_offset_ticks = 2
+max_quote_age_secs = 30
+reward_refresh_interval_secs = 30
+reward_stale_after_secs = 90
+reward_fetch_retries = 3
+reward_fetch_backoff_ms = 250
+min_inside_ticks = 1
+min_inside_depth_multiple = 1.5
+default_external_signal = true
+
+[lp.risk]
+max_position = 100.0
+flat_position_tolerance = 1.0
+auto_flatten_after_fill = true
+flatten_use_fok = false
+stale_feed_after_secs = 15
+
+[lp.approvals]
+require_on_startup = true
+auto_approve_on_startup = true
+
+[lp.reporting]
+operator_bot_id = ""
+operator_chat_ids = []
+summary_interval_secs = 300
+
+[lp.control]
+bind_addr = "127.0.0.1"
+heartbeat_interval_secs = 5
+reconciliation_interval_secs = 10
+
+[lp.logging]
+snapshot_interval_secs = 60
+directory = "logs"
+file_prefix = "poly-lp"
+max_files = 14
+json = true
+
+[[lp.markets]]
+condition_id = "condition-a"
+slug = "market-a"
+question = "Market A?"
+
+[lp.markets.strategy]
+quote_size = 20.0
+quote_offset_ticks = 3
+
+[lp.markets.capital]
+buy_budget_usdc = 15.5
+
+[[lp.markets]]
+condition_id = "condition-b"
+slug = "market-b"
+question = "Market B?"
+enabled = false
+"#,
+        );
+
+        let config = AppConfig::load_from(path.to_str().unwrap()).expect("load config");
+        fs::remove_file(&path).ok();
+
+        assert!(config.lp.trading.condition_id.is_none());
+        assert_eq!(config.lp.markets.len(), 2);
+        assert_eq!(config.lp.markets[0].condition_id, "condition-a");
+        assert_eq!(config.lp.markets[0].slug.as_deref(), Some("market-a"));
+        assert_eq!(
+            config.lp.markets[0]
+                .strategy
+                .as_ref()
+                .and_then(|s| s.quote_size),
+            Some(20.0)
+        );
+        assert_eq!(
+            config.lp.markets[0]
+                .capital
+                .as_ref()
+                .and_then(|c| c.buy_budget_usdc),
+            Some(15.5)
+        );
+        assert!(!config.lp.markets[1].enabled);
     }
 }

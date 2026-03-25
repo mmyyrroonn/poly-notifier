@@ -9,13 +9,13 @@
 //! * `500 Internal Server Error` — unexpected database error.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use chrono::Utc;
-use pn_lp::{ControlCommand, RuntimeSnapshot};
+use pn_lp::{ControlCommand, MultiLpControlHandle, RuntimeSnapshot};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -54,7 +54,7 @@ fn lp_command_error(error: String) -> Response {
 }
 
 #[allow(clippy::result_large_err)]
-fn lp_handle(state: &AdminState) -> Result<pn_lp::LpControlHandle, Response> {
+fn lp_handles(state: &AdminState) -> Result<MultiLpControlHandle, Response> {
     state.lp_control.clone().ok_or_else(lp_unavailable)
 }
 
@@ -310,6 +310,11 @@ pub struct ReasonBody {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ConditionQuery {
+    pub condition_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SignalBody {
     pub name: String,
@@ -325,6 +330,7 @@ pub struct AmountBody {
 
 #[derive(Debug, Serialize)]
 pub struct LpHealthResponse {
+    pub condition_id: Option<String>,
     pub paused: bool,
     pub flattening: bool,
     pub heartbeat_healthy: bool,
@@ -339,126 +345,175 @@ pub struct LpHealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct LpFleetHealthResponse {
+    pub market_count: usize,
+    pub markets: Vec<LpHealthResponse>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct LpCommandResponse {
     pub status: &'static str,
 }
 
-pub async fn lp_health(State(state): State<AdminState>) -> Response {
-    let handle = match lp_handle(&state) {
+pub async fn lp_health(
+    State(state): State<AdminState>,
+    Query(query): Query<ConditionQuery>,
+) -> Response {
+    let handles = match lp_handles(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
     };
-    let snapshot = handle.snapshot();
-    Json(LpHealthResponse {
-        paused: snapshot.flags.paused,
-        flattening: snapshot.flags.flattening,
-        heartbeat_healthy: snapshot.flags.heartbeat_healthy,
-        market_feed_healthy: snapshot.flags.market_feed_healthy,
-        user_feed_healthy: snapshot.flags.user_feed_healthy,
-        open_orders: snapshot.open_orders.len(),
-        positions: snapshot.positions.len(),
-        last_market_event_at: snapshot.last_market_event_at.map(|ts| ts.to_rfc3339()),
-        last_user_event_at: snapshot.last_user_event_at.map(|ts| ts.to_rfc3339()),
-        last_heartbeat_at: snapshot.last_heartbeat_at.map(|ts| ts.to_rfc3339()),
-        last_decision_reason: snapshot.last_decision_reason,
-    })
-    .into_response()
+    match resolve_target(&handles, query.condition_id.as_deref()) {
+        Ok(TargetSelection::Single(condition_id)) => Json(build_health_response(
+            Some(condition_id.to_string()),
+            handles
+                .snapshot(condition_id)
+                .expect("resolve_target validated condition_id"),
+        ))
+        .into_response(),
+        Ok(TargetSelection::All) => {
+            let markets = handles
+                .snapshots()
+                .into_iter()
+                .map(|snapshot| {
+                    build_health_response(Some(snapshot.market.condition_id.clone()), snapshot)
+                })
+                .collect::<Vec<_>>();
+            Json(LpFleetHealthResponse {
+                market_count: markets.len(),
+                markets,
+            })
+            .into_response()
+        }
+        Err(response) => response,
+    }
 }
 
-pub async fn lp_state(State(state): State<AdminState>) -> Response {
-    let handle = match lp_handle(&state) {
+pub async fn lp_state(
+    State(state): State<AdminState>,
+    Query(query): Query<ConditionQuery>,
+) -> Response {
+    let handles = match lp_handles(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
     };
-    let snapshot: RuntimeSnapshot = handle.snapshot();
-    Json(snapshot).into_response()
+    match resolve_target(&handles, query.condition_id.as_deref()) {
+        Ok(TargetSelection::Single(condition_id)) => Json(
+            handles
+                .snapshot(condition_id)
+                .expect("resolve_target validated condition_id"),
+        )
+        .into_response(),
+        Ok(TargetSelection::All) => Json(handles.snapshots()).into_response(),
+        Err(response) => response,
+    }
 }
 
-pub async fn lp_pause(State(state): State<AdminState>, body: Option<Json<ReasonBody>>) -> Response {
-    let handle = match lp_handle(&state) {
+pub async fn lp_pause(
+    State(state): State<AdminState>,
+    Query(query): Query<ConditionQuery>,
+    body: Option<Json<ReasonBody>>,
+) -> Response {
+    let handles = match lp_handles(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
     };
     let reason = body
         .and_then(|body| body.reason.clone())
         .unwrap_or_else(|| "admin pause".to_string());
-    match handle.send(ControlCommand::Pause { reason }) {
-        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
-        Err(error) => lp_command_error(error),
-    }
+    dispatch_command(
+        &handles,
+        query.condition_id.as_deref(),
+        ControlCommand::Pause { reason },
+    )
 }
 
 pub async fn lp_resume(
     State(state): State<AdminState>,
+    Query(query): Query<ConditionQuery>,
     body: Option<Json<ReasonBody>>,
 ) -> Response {
-    let handle = match lp_handle(&state) {
+    let handles = match lp_handles(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
     };
     let reason = body
         .and_then(|body| body.reason.clone())
         .unwrap_or_else(|| "admin resume".to_string());
-    match handle.send(ControlCommand::Resume { reason }) {
-        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
-        Err(error) => lp_command_error(error),
-    }
+    dispatch_command(
+        &handles,
+        query.condition_id.as_deref(),
+        ControlCommand::Resume { reason },
+    )
 }
 
 pub async fn lp_cancel_all(
     State(state): State<AdminState>,
+    Query(query): Query<ConditionQuery>,
     body: Option<Json<ReasonBody>>,
 ) -> Response {
-    let handle = match lp_handle(&state) {
+    let handles = match lp_handles(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
     };
     let reason = body
         .and_then(|body| body.reason.clone())
         .unwrap_or_else(|| "admin cancel-all".to_string());
-    match handle.send(ControlCommand::CancelAll { reason }) {
-        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
-        Err(error) => lp_command_error(error),
-    }
+    dispatch_command(
+        &handles,
+        query.condition_id.as_deref(),
+        ControlCommand::CancelAll { reason },
+    )
 }
 
-pub async fn lp_signal(State(state): State<AdminState>, Json(body): Json<SignalBody>) -> Response {
-    let handle = match lp_handle(&state) {
+pub async fn lp_signal(
+    State(state): State<AdminState>,
+    Query(query): Query<ConditionQuery>,
+    Json(body): Json<SignalBody>,
+) -> Response {
+    let handles = match lp_handles(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
     };
     let reason = body
         .reason
         .unwrap_or_else(|| format!("admin signal {}", body.name));
-    match handle.send(ControlCommand::ExternalSignal {
-        name: body.name,
-        active: body.active,
-        reason,
-    }) {
-        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
-        Err(error) => lp_command_error(error),
-    }
+    dispatch_command(
+        &handles,
+        query.condition_id.as_deref(),
+        ControlCommand::ExternalSignal {
+            name: body.name,
+            active: body.active,
+            reason,
+        },
+    )
 }
 
 pub async fn lp_flatten(
     State(state): State<AdminState>,
+    Query(query): Query<ConditionQuery>,
     body: Option<Json<ReasonBody>>,
 ) -> Response {
-    let handle = match lp_handle(&state) {
+    let handles = match lp_handles(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
     };
     let reason = body
         .and_then(|body| body.reason.clone())
         .unwrap_or_else(|| "admin flatten".to_string());
-    match handle.send(ControlCommand::Flatten { reason }) {
-        Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
-        Err(error) => lp_command_error(error),
-    }
+    dispatch_command(
+        &handles,
+        query.condition_id.as_deref(),
+        ControlCommand::Flatten { reason },
+    )
 }
 
-pub async fn lp_split(State(state): State<AdminState>, body: Option<Json<AmountBody>>) -> Response {
-    let handle = match lp_handle(&state) {
+pub async fn lp_split(
+    State(state): State<AdminState>,
+    Query(query): Query<ConditionQuery>,
+    body: Option<Json<AmountBody>>,
+) -> Response {
+    let handles = match lp_handles(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
     };
@@ -479,20 +534,36 @@ pub async fn lp_split(State(state): State<AdminState>, body: Option<Json<AmountB
                 .into_response();
         }
     };
-    match handle.send(ControlCommand::Split {
-        amount,
-        reason: body
-            .reason
-            .clone()
-            .unwrap_or_else(|| "admin split".to_string()),
-    }) {
+    let Some(condition_id) = inventory_target(&handles, query.condition_id.as_deref()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "condition_id is required when multiple lp markets are configured"
+            })),
+        )
+            .into_response();
+    };
+    match handles.send(
+        condition_id,
+        ControlCommand::Split {
+            amount,
+            reason: body
+                .reason
+                .clone()
+                .unwrap_or_else(|| "admin split".to_string()),
+        },
+    ) {
         Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
         Err(error) => lp_command_error(error),
     }
 }
 
-pub async fn lp_merge(State(state): State<AdminState>, body: Option<Json<AmountBody>>) -> Response {
-    let handle = match lp_handle(&state) {
+pub async fn lp_merge(
+    State(state): State<AdminState>,
+    Query(query): Query<ConditionQuery>,
+    body: Option<Json<AmountBody>>,
+) -> Response {
+    let handles = match lp_handles(&state) {
         Ok(handle) => handle,
         Err(response) => return response,
     };
@@ -513,15 +584,100 @@ pub async fn lp_merge(State(state): State<AdminState>, body: Option<Json<AmountB
                 .into_response();
         }
     };
-    match handle.send(ControlCommand::Merge {
-        amount,
-        reason: body
-            .reason
-            .clone()
-            .unwrap_or_else(|| "admin merge".to_string()),
-    }) {
+    let Some(condition_id) = inventory_target(&handles, query.condition_id.as_deref()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "condition_id is required when multiple lp markets are configured"
+            })),
+        )
+            .into_response();
+    };
+    match handles.send(
+        condition_id,
+        ControlCommand::Merge {
+            amount,
+            reason: body
+                .reason
+                .clone()
+                .unwrap_or_else(|| "admin merge".to_string()),
+        },
+    ) {
         Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
         Err(error) => lp_command_error(error),
+    }
+}
+
+enum TargetSelection<'a> {
+    Single(&'a str),
+    All,
+}
+
+fn resolve_target<'a>(
+    handles: &'a MultiLpControlHandle,
+    condition_id: Option<&'a str>,
+) -> Result<TargetSelection<'a>, Response> {
+    if let Some(condition_id) = condition_id {
+        if handles.snapshot(condition_id).is_none() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("unknown lp market {condition_id}") })),
+            )
+                .into_response());
+        }
+        return Ok(TargetSelection::Single(condition_id));
+    }
+    if let Some(condition_id) = handles.sole_condition_id() {
+        return Ok(TargetSelection::Single(condition_id));
+    }
+    if handles.is_empty() {
+        return Err(lp_unavailable());
+    }
+    Ok(TargetSelection::All)
+}
+
+fn inventory_target<'a>(
+    handles: &'a MultiLpControlHandle,
+    condition_id: Option<&'a str>,
+) -> Option<&'a str> {
+    condition_id.or_else(|| handles.sole_condition_id())
+}
+
+fn dispatch_command(
+    handles: &MultiLpControlHandle,
+    condition_id: Option<&str>,
+    command: ControlCommand,
+) -> Response {
+    match resolve_target(handles, condition_id) {
+        Ok(TargetSelection::Single(condition_id)) => match handles.send(condition_id, command) {
+            Ok(()) => Json(LpCommandResponse { status: "ok" }).into_response(),
+            Err(error) => lp_command_error(error),
+        },
+        Ok(TargetSelection::All) => match handles.broadcast(command) {
+            Ok(_) => Json(LpCommandResponse { status: "ok" }).into_response(),
+            Err(error) => lp_command_error(error),
+        },
+        Err(response) => response,
+    }
+}
+
+fn build_health_response(
+    condition_id: Option<String>,
+    snapshot: RuntimeSnapshot,
+) -> LpHealthResponse {
+    LpHealthResponse {
+        condition_id,
+        paused: snapshot.flags.paused,
+        flattening: snapshot.flags.flattening,
+        heartbeat_healthy: snapshot.flags.heartbeat_healthy,
+        market_feed_healthy: snapshot.flags.market_feed_healthy,
+        user_feed_healthy: snapshot.flags.user_feed_healthy,
+        open_orders: snapshot.open_orders.len(),
+        positions: snapshot.positions.len(),
+        last_market_event_at: snapshot.last_market_event_at.map(|ts| ts.to_rfc3339()),
+        last_user_event_at: snapshot.last_user_event_at.map(|ts| ts.to_rfc3339()),
+        last_heartbeat_at: snapshot.last_heartbeat_at.map(|ts| ts.to_rfc3339()),
+        last_decision_reason: snapshot.last_decision_reason,
     }
 }
 
@@ -581,19 +737,19 @@ mod tests {
 
     use axum::{
         body::{to_bytes, Body},
-        extract::State,
+        extract::{Query, State},
         http::StatusCode,
     };
     use chrono::Utc;
     use pn_lp::types::SignalState;
     use pn_lp::{
-        AccountSnapshot, ControlCommand, LpControlHandle, MarketMetadata, RewardState,
-        RuntimeFlags, RuntimeState, TokenMetadata,
+        AccountSnapshot, ControlCommand, LpControlHandle, MarketMetadata, MultiLpControlHandle,
+        RewardState, RuntimeFlags, RuntimeState, TokenMetadata,
     };
     use sqlx::SqlitePool;
     use tokio::sync::{mpsc, watch};
 
-    use super::{lp_merge, lp_signal, lp_split, AmountBody, SignalBody};
+    use super::{lp_health, lp_merge, lp_signal, lp_split, AmountBody, ConditionQuery, SignalBody};
     use crate::AdminState;
 
     async fn test_admin_state() -> (AdminState, mpsc::UnboundedReceiver<ControlCommand>) {
@@ -604,8 +760,36 @@ mod tests {
         let (_snapshot_tx, snapshot_rx) = watch::channel(runtime_state());
         let handle = LpControlHandle::new(cmd_tx, snapshot_rx);
         (
-            AdminState::new(pool, "secret".to_string(), Some(handle)),
+            AdminState::new(
+                pool,
+                "secret".to_string(),
+                Some(MultiLpControlHandle::from_single("condition-1", handle)),
+            ),
             cmd_rx,
+        )
+    }
+
+    async fn multi_market_admin_state() -> AdminState {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        let (cmd_tx_a, _cmd_rx_a) = mpsc::unbounded_channel();
+        let (_snapshot_tx_a, snapshot_rx_a) = watch::channel(runtime_state());
+        let handle_a = LpControlHandle::new(cmd_tx_a, snapshot_rx_a);
+
+        let (cmd_tx_b, _cmd_rx_b) = mpsc::unbounded_channel();
+        let (_snapshot_tx_b, snapshot_rx_b) = watch::channel(runtime_state());
+        let handle_b = LpControlHandle::new(cmd_tx_b, snapshot_rx_b);
+
+        let handles = std::collections::BTreeMap::from([
+            ("condition-1".to_string(), handle_a),
+            ("condition-2".to_string(), handle_b),
+        ]);
+
+        AdminState::new(
+            pool,
+            "secret".to_string(),
+            Some(MultiLpControlHandle::new(handles)),
         )
     }
 
@@ -660,6 +844,7 @@ mod tests {
 
         let response = lp_split(
             State(state),
+            Query(ConditionQuery::default()),
             Some(axum::Json(AmountBody {
                 amount: "0".to_string(),
                 reason: None,
@@ -681,6 +866,7 @@ mod tests {
 
         let response = lp_merge(
             State(state),
+            Query(ConditionQuery::default()),
             Some(axum::Json(AmountBody {
                 amount: "nope".to_string(),
                 reason: None,
@@ -702,6 +888,7 @@ mod tests {
 
         let response = lp_signal(
             State(state),
+            Query(ConditionQuery::default()),
             axum::Json(SignalBody {
                 name: "external".to_string(),
                 active: false,
@@ -723,5 +910,45 @@ mod tests {
             }
             other => panic!("expected external signal command, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn lp_split_requires_target_in_multi_market_mode() {
+        let state = multi_market_admin_state().await;
+
+        let response = lp_split(
+            State(state),
+            Query(ConditionQuery::default()),
+            Some(axum::Json(AmountBody {
+                amount: "10".to_string(),
+                reason: None,
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_body_json(response.into_body()).await,
+            serde_json::json!({ "error": "condition_id is required when multiple lp markets are configured" })
+        );
+    }
+
+    #[tokio::test]
+    async fn lp_health_rejects_unknown_condition_id() {
+        let state = multi_market_admin_state().await;
+
+        let response = lp_health(
+            State(state),
+            Query(ConditionQuery {
+                condition_id: Some("condition-missing".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_body_json(response.into_body()).await,
+            serde_json::json!({ "error": "unknown lp market condition-missing" })
+        );
     }
 }

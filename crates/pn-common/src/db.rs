@@ -510,15 +510,17 @@ pub async fn get_recent_lp_positions(
 /// Persist a risk/control event.
 pub async fn insert_lp_risk_event(
     pool: &SqlitePool,
+    condition_id: Option<&str>,
     event_type: &str,
     severity: &str,
     details_json: &str,
 ) -> Result<i64> {
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO lp_risk_events (event_type, severity, details_json) \
-         VALUES (?, ?, ?) \
+        "INSERT INTO lp_risk_events (condition_id, event_type, severity, details_json) \
+         VALUES (?, ?, ?, ?) \
          RETURNING id",
     )
+    .bind(condition_id)
     .bind(event_type)
     .bind(severity)
     .bind(details_json)
@@ -531,7 +533,7 @@ pub async fn insert_lp_risk_event(
 /// Return the most recent LP risk events.
 pub async fn get_recent_lp_risk_events(pool: &SqlitePool, limit: i64) -> Result<Vec<LpRiskEvent>> {
     sqlx::query_as(
-        "SELECT id, event_type, severity, details_json, created_at \
+        "SELECT id, condition_id, event_type, severity, details_json, created_at \
          FROM lp_risk_events \
          ORDER BY created_at DESC \
          LIMIT ?",
@@ -545,15 +547,17 @@ pub async fn get_recent_lp_risk_events(pool: &SqlitePool, limit: i64) -> Result<
 /// Persist a heartbeat acknowledgement or failure.
 pub async fn insert_lp_heartbeat(
     pool: &SqlitePool,
+    condition_id: Option<&str>,
     heartbeat_id: &str,
     status: &str,
     note: Option<&str>,
 ) -> Result<i64> {
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO lp_heartbeats (heartbeat_id, status, note) \
-         VALUES (?, ?, ?) \
+        "INSERT INTO lp_heartbeats (condition_id, heartbeat_id, status, note) \
+         VALUES (?, ?, ?, ?) \
          RETURNING id",
     )
+    .bind(condition_id)
     .bind(heartbeat_id)
     .bind(status)
     .bind(note)
@@ -566,7 +570,7 @@ pub async fn insert_lp_heartbeat(
 /// Fetch recent heartbeat rows.
 pub async fn get_recent_lp_heartbeats(pool: &SqlitePool, limit: i64) -> Result<Vec<LpHeartbeat>> {
     sqlx::query_as(
-        "SELECT id, heartbeat_id, status, note, created_at \
+        "SELECT id, condition_id, heartbeat_id, status, note, created_at \
          FROM lp_heartbeats \
          ORDER BY created_at DESC \
          LIMIT ?",
@@ -578,13 +582,20 @@ pub async fn get_recent_lp_heartbeats(pool: &SqlitePool, limit: i64) -> Result<V
 }
 
 /// Persist a generated operator report.
-pub async fn insert_lp_report(pool: &SqlitePool, report_type: &str, payload: &str) -> Result<i64> {
-    let row: (i64,) =
-        sqlx::query_as("INSERT INTO lp_reports (report_type, payload) VALUES (?, ?) RETURNING id")
-            .bind(report_type)
-            .bind(payload)
-            .fetch_one(pool)
-            .await?;
+pub async fn insert_lp_report(
+    pool: &SqlitePool,
+    condition_id: Option<&str>,
+    report_type: &str,
+    payload: &str,
+) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO lp_reports (condition_id, report_type, payload) VALUES (?, ?, ?) RETURNING id",
+    )
+    .bind(condition_id)
+    .bind(report_type)
+    .bind(payload)
+    .fetch_one(pool)
+    .await?;
 
     Ok(row.0)
 }
@@ -592,7 +603,7 @@ pub async fn insert_lp_report(pool: &SqlitePool, report_type: &str, payload: &st
 /// Fetch recent reports.
 pub async fn get_recent_lp_reports(pool: &SqlitePool, limit: i64) -> Result<Vec<LpReport>> {
     sqlx::query_as(
-        "SELECT id, report_type, payload, created_at \
+        "SELECT id, condition_id, report_type, payload, created_at \
          FROM lp_reports \
          ORDER BY created_at DESC \
          LIMIT ?",
@@ -606,13 +617,15 @@ pub async fn get_recent_lp_reports(pool: &SqlitePool, limit: i64) -> Result<Vec<
 /// Persist a control action together with its originating actor.
 pub async fn insert_lp_control_action(
     pool: &SqlitePool,
+    condition_id: Option<&str>,
     action: &str,
     reason: Option<&str>,
     actor: &str,
 ) -> Result<i64> {
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO lp_control_actions (action, actor, reason) VALUES (?, ?, ?) RETURNING id",
+        "INSERT INTO lp_control_actions (condition_id, action, actor, reason) VALUES (?, ?, ?, ?) RETURNING id",
     )
+    .bind(condition_id)
     .bind(action)
     .bind(actor)
     .bind(reason)
@@ -628,7 +641,7 @@ pub async fn get_recent_lp_control_actions(
     limit: i64,
 ) -> Result<Vec<LpControlAction>> {
     sqlx::query_as(
-        "SELECT id, action, actor, reason, created_at \
+        "SELECT id, condition_id, action, actor, reason, created_at \
          FROM lp_control_actions \
          ORDER BY created_at DESC \
          LIMIT ?",
@@ -838,15 +851,22 @@ mod tests {
             .await
             .expect("in-memory sqlite pool");
 
-        insert_lp_control_action(&pool, "pause", Some("test"), "admin_api")
-            .await
-            .expect("control action inserted");
+        insert_lp_control_action(
+            &pool,
+            Some("condition-1"),
+            "pause",
+            Some("test"),
+            "admin_api",
+        )
+        .await
+        .expect("control action inserted");
 
         let actions = get_recent_lp_control_actions(&pool, 1)
             .await
             .expect("control actions fetched");
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].actor, "admin_api");
+        assert_eq!(actions[0].condition_id.as_deref(), Some("condition-1"));
     }
 
     #[tokio::test]
@@ -855,10 +875,10 @@ mod tests {
             .await
             .expect("in-memory sqlite pool");
 
-        insert_lp_heartbeat(&pool, "hb-1", "ok", None)
+        insert_lp_heartbeat(&pool, Some("condition-1"), "hb-1", "ok", None)
             .await
             .expect("first heartbeat inserted");
-        insert_lp_heartbeat(&pool, "hb-1", "ok", None)
+        insert_lp_heartbeat(&pool, Some("condition-1"), "hb-1", "ok", None)
             .await
             .expect("second heartbeat inserted");
 
@@ -866,6 +886,7 @@ mod tests {
             .await
             .expect("heartbeats fetched");
         assert_eq!(heartbeats.len(), 2);
+        assert_eq!(heartbeats[0].condition_id.as_deref(), Some("condition-1"));
     }
 
     #[tokio::test]
