@@ -1,0 +1,135 @@
+[database]
+url = "sqlite:poly-lp.db"
+max_connections = 5
+
+[telegram]
+# Bot tokens set via TELEGRAM_BOT_TOKENS env var
+rate_limit_per_user = 20  # messages per minute
+
+[monitor]
+subscription_refresh_interval_secs = 60
+ws_ping_interval_secs = 10
+reconnect_base_delay_secs = 1
+reconnect_max_delay_secs = 60
+
+[alert]
+cache_refresh_interval_secs = 30
+default_cooldown_minutes = 60
+price_flush_interval_secs = 30
+
+[scheduler]
+daily_summary_cron = "0 0 9 * * *"  # 9:00 UTC daily
+
+[admin]
+port = 36363
+# Password set via ADMIN_PASSWORD env var
+
+[guard]
+enabled = false
+bind_addr = "127.0.0.1"
+port = 37373
+heartbeat_interval_secs = 5
+heartbeat_timeout_secs = 15
+check_interval_secs = 1
+
+[lp.trading]
+condition_id = "0x306d10d4a4d51b41910dbc779ca00908bd917c131541c5c42bbbc736258d2d56"
+clob_base_url = "https://clob.polymarket.com"
+gamma_base_url = "https://gamma-api.polymarket.com"
+data_api_base_url = "https://data-api.polymarket.com"
+chain_id = 137
+
+[lp.inventory]
+min_usdc_balance = 50.0
+min_token_balance = 10.0
+auto_split_on_startup = false
+startup_split_amount = 0.0
+
+[lp.strategy]
+quote_mode = "inside"
+quote_size = 25
+min_spread = 0.01
+min_depth = 25.0
+quote_offset_ticks = 2
+max_quote_age_secs = 30
+reward_refresh_interval_secs = 30
+reward_stale_after_secs = 90
+reward_fetch_retries = 3
+reward_fetch_backoff_ms = 250
+min_inside_ticks = 1
+min_inside_depth_multiple = 1.5
+default_external_signal = true
+
+[lp.risk]
+max_position = 100.0
+flat_position_tolerance = 1.0
+auto_flatten_after_fill = true
+flatten_use_fok = false
+stale_feed_after_secs = 15
+
+[lp.approvals]
+require_on_startup = true
+auto_approve_on_startup = true
+
+[lp.reporting]
+operator_bot_id = ""
+operator_chat_ids = []
+summary_interval_secs = 300
+
+[lp.control]
+bind_addr = "127.0.0.1"
+heartbeat_interval_secs = 5
+reconciliation_interval_secs = 10
+
+[lp.logging]
+snapshot_interval_secs = 60
+directory = "logs"
+file_prefix = "poly-lp"
+max_files = 14
+json = true
+
+# Refreshed from outputs/rewards/report.json on 2026-03-25
+# Selection rule:
+# outer_low_risk + eligible_only + min_inside_ticks >= 2 + min_daily_reward >= 20 + max_crowdedness <= 10
+# Manual final pick:
+# keep high reward/high ROI while avoiding inside_ticks = 1 markets and favoring lower risk on the second slot
+
+[[lp.markets]]
+# daily_reward = 50
+# rewards_min_size = 20
+# rewards_max_spread = 4.5
+# recommended_price = 0.36
+# recommended_side = buy
+# estimated_daily_reward = 1.0128127565792316667386889050
+# roi_daily_conservative = 0.0405125102631692666695475562
+# safety_score = 0.5553030303030303030303030303
+# risk_score = 0.4446969696969696969696969697
+# inside_ticks = 2
+# crowdedness_score = 10
+condition_id = "0x6897736d782ce70f47126dfcec6669073f563d6e757e60bc61c0367370d6f73e"
+enabled = true
+slug = "kharg-island-no-longer-under-iranian-control-by-june-30-561"
+question = "Kharg Island no longer under Iranian control by June 30?"
+
+[lp.markets.strategy]
+quote_size = 20.0
+
+[[lp.markets]]
+# daily_reward = 30
+# rewards_min_size = 20
+# rewards_max_spread = 5.5
+# recommended_price = 0.28
+# recommended_side = buy
+# estimated_daily_reward = 0.7988524927748230097921563350
+# roi_daily_conservative = 0.0319540997109929203916862534
+# safety_score = 0.6061497326203208556149732620
+# risk_score = 0.3938502673796791443850267380
+# inside_ticks = 2
+# crowdedness_score = 5.80
+condition_id = "0xfe30ed0ea2dc1131508a95412fcc3d59460150a355a5313527ef2d64daf7b646"
+enabled = true
+slug = "israel-military-action-against-fordow-nuclear-facility-by-april-15"
+question = "Israel military action against Fordow nuclear facility by April 15?"
+
+[lp.markets.strategy]
+quote_size = 20.0

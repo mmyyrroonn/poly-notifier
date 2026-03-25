@@ -1,0 +1,82 @@
+{
+  "source_report": "outputs/rewards/report.json",
+  "profile": "outer_low_risk",
+  "sort_by": "balanced",
+  "count": 1,
+  "entries": [
+    {
+      "market": {
+        "condition_id": "0x02b4a096c4e3115d67b3eb05663b29ee5c982be66f53029ddaf16b22c9ce84c9",
+        "slug": "will-trump-talk-to-yoon-suk-yeol-in-april",
+        "question": "Will Trump talk to Yoon Suk Yeol in April?",
+        "daily_reward": "20",
+        "gross_annual_reward": "7300",
+        "rewards_min_size": "20",
+        "rewards_max_spread": "5.5",
+        "midpoint": "0.120",
+        "best_bid": "0.077",
+        "best_ask": "0.163",
+        "current_spread": "0.086",
+        "effective_quote_size": "25",
+        "current_config_eligible": true,
+        "existing_q_min": "11.619057851239669421487603307",
+        "outer_low_risk": {
+          "profile": "outer_low_risk",
+          "recommended_side": "sell",
+          "recommended_price": "0.172",
+          "qualifying_boundary": "0.175",
+          "inside_ticks": 9,
+          "inside_depth": "337",
+          "existing_qualified_ahead_size": "337",
+          "reward_gap_headroom": "0.003",
+          "estimated_share": "0.0021293116787067412588206736",
+          "estimated_daily_reward": "0.0425862335741348251764134720",
+          "roi_daily_conservative": "0.0017034493429653930070565389",
+          "roi_annual_conservative": "0.6217590101823684475756366985",
+          "crowdedness_score": "13.48",
+          "our_q_min": "0.0247933884297520661157024792",
+          "our_side_score": "0.0743801652892561983471074375"
+        },
+        "aggressive_mid": {
+          "profile": "aggressive_mid",
+          "recommended_side": "buy",
+          "recommended_price": "0.075",
+          "qualifying_boundary": "0.065",
+          "inside_ticks": 2,
+          "inside_depth": "220",
+          "existing_qualified_ahead_size": "220",
+          "reward_gap_headroom": "0.010",
+          "estimated_share": "0.0231603824057059770925289702",
+          "estimated_daily_reward": "0.4632076481141195418505794040",
+          "roi_daily_conservative": "0.0185283059245647816740231762",
+          "roi_annual_conservative": "6.7628316624661453110184593130",
+          "crowdedness_score": "8.80",
+          "our_q_min": "0.2754820936639118457300275483",
+          "our_side_score": "0.8264462809917355371900826450"
+        }
+      },
+      "strategy": {
+        "profile": "outer_low_risk",
+        "recommended_side": "sell",
+        "recommended_price": "0.172",
+        "qualifying_boundary": "0.175",
+        "inside_ticks": 9,
+        "inside_depth": "337",
+        "existing_qualified_ahead_size": "337",
+        "reward_gap_headroom": "0.003",
+        "estimated_share": "0.0021293116787067412588206736",
+        "estimated_daily_reward": "0.0425862335741348251764134720",
+        "roi_daily_conservative": "0.0017034493429653930070565389",
+        "roi_annual_conservative": "0.6217590101823684475756366985",
+        "crowdedness_score": "13.48",
+        "our_q_min": "0.0247933884297520661157024792",
+        "our_side_score": "0.0743801652892561983471074375"
+      },
+      "safety_score": "0.6712682069311903566047212456",
+      "risk_score": "0.3287317930688096433952787544",
+      "balanced_score": "0.0011434713860504936850658106",
+      "inside_depth_multiple": "13.48",
+      "headroom_ratio": "0.0545454545454545454545454545"
+    }
+  ]
+}
