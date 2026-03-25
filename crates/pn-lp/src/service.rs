@@ -117,18 +117,6 @@ struct AuditEnvelope<'a, T: Serialize> {
 }
 
 #[derive(Debug, Serialize)]
-struct DecisionAuditDetails {
-    decision: DecisionAuditSnapshot,
-}
-
-#[derive(Debug, Serialize)]
-struct DecisionAuditSnapshot {
-    cancel_all: bool,
-    desired_quotes: Vec<QuoteIntent>,
-    diagnostics: DecisionDiagnostics,
-}
-
-#[derive(Debug, Serialize)]
 struct FlattenAuditDetails {
     flatten: FlattenIntent,
     fill: Option<TradeFill>,
@@ -140,11 +128,6 @@ struct QuoteAuditDetails {
     action: &'static str,
     quotes: Vec<QuoteIntent>,
     open_orders: Vec<ManagedOrder>,
-}
-
-#[derive(Debug, Serialize)]
-struct SignalAuditDetails {
-    signal: crate::observability::SignalTransition,
 }
 
 impl BookActivityTracker {
@@ -635,8 +618,7 @@ impl LpService {
                         reason,
                     },
                 );
-                self.log_signal_transitions(state, &before, &state.signals)
-                    .await?;
+                self.log_signal_transitions(&before, &state.signals).await?;
             }
         }
 
@@ -669,8 +651,7 @@ impl LpService {
                 state.last_market_event_at = Some(now);
                 self.observe_book_activity(&book, now);
                 state.books.insert(book.asset_id.clone(), book);
-                self.log_signal_transitions(state, &before, &state.signals)
-                    .await?;
+                self.log_signal_transitions(&before, &state.signals).await?;
             }
             ExchangeEvent::Order(order) => {
                 info!(
@@ -1054,20 +1035,6 @@ impl LpService {
                 diagnostics = %diagnostics.as_deref().unwrap_or("{}"),
                 "decision updated"
             );
-            self.emit_audit(
-                state,
-                "decision_audit",
-                "decision_updated",
-                Some(&outcome.reason),
-                DecisionAuditDetails {
-                    decision: DecisionAuditSnapshot {
-                        cancel_all: outcome.cancel_all,
-                        desired_quotes: outcome.desired_quotes.clone(),
-                        diagnostics: outcome.diagnostics.clone(),
-                    },
-                },
-            )
-            .await?;
         }
 
         if outcome.cancel_all {
@@ -1437,7 +1404,6 @@ impl LpService {
 
     async fn log_signal_transitions(
         &self,
-        state: &RuntimeState,
         before: &HashMap<String, SignalState>,
         after: &HashMap<String, SignalState>,
     ) -> Result<()> {
@@ -1464,16 +1430,6 @@ impl LpService {
                 previous_reason = %previous_reason,
                 "signal {level}"
             );
-            self.emit_audit(
-                state,
-                "signal_audit",
-                "signal_transition",
-                Some(&transition.reason),
-                SignalAuditDetails {
-                    signal: transition.clone(),
-                },
-            )
-            .await?;
         }
         Ok(())
     }
@@ -2165,15 +2121,16 @@ mod tests {
             .expect("migrated in-memory sqlite pool")
     }
 
-    async fn latest_report_payload(pool: &SqlitePool, report_type: &str) -> serde_json::Value {
-        let reports = get_recent_lp_reports(pool, 20)
+    async fn latest_report_payload(
+        pool: &SqlitePool,
+        report_type: &str,
+    ) -> Option<serde_json::Value> {
+        get_recent_lp_reports(pool, 20)
             .await
-            .expect("recent reports fetched");
-        let report = reports
+            .expect("recent reports fetched")
             .into_iter()
             .find(|report| report.report_type == report_type)
-            .unwrap_or_else(|| panic!("missing {report_type} report"));
-        serde_json::from_str(&report.payload).expect("report payload json")
+            .map(|report| serde_json::from_str(&report.payload).expect("report payload json"))
     }
 
     #[tokio::test]
@@ -2303,7 +2260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recompute_quotes_persists_decision_audit_report() {
+    async fn recompute_quotes_does_not_persist_decision_audit_report() {
         let exchange = Arc::new(RecordingExchange::default());
         let pool = migrated_pool().await;
         let mut state = runtime_state_with_book();
@@ -2340,15 +2297,10 @@ mod tests {
             .await
             .expect("quotes recomputed");
 
-        let payload = latest_report_payload(&pool, "decision_audit").await;
-        assert_eq!(payload["event_type"], "decision_updated");
-        assert_eq!(payload["audit"], true);
-        assert_eq!(payload["condition_id"], "condition-1");
-        assert_eq!(payload["reason"], "reward-qualified single-sided quote");
-        assert_eq!(payload["state"]["market"]["question"], "Will X happen?");
-        assert_eq!(payload["state"]["books"][0]["asset_id"], "asset-yes");
-        assert_eq!(payload["state"]["positions"][0]["asset_id"], "asset-yes");
-        assert_eq!(payload["decision"]["desired_quotes"][0]["asset_id"], "asset-yes");
+        assert!(
+            latest_report_payload(&pool, "decision_audit").await.is_none(),
+            "actions_only audit should not persist decision_audit rows"
+        );
     }
 
     #[tokio::test]
@@ -2390,7 +2342,9 @@ mod tests {
             .await
             .expect("flatten succeeded");
 
-        let payload = latest_report_payload(&pool, "flatten_audit").await;
+        let payload = latest_report_payload(&pool, "flatten_audit")
+            .await
+            .expect("flatten audit report");
         assert_eq!(payload["event_type"], "flatten_submitted");
         assert_eq!(payload["audit"], true);
         assert_eq!(payload["reason"], "risk flatten");
@@ -2400,7 +2354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn book_event_persists_signal_audit_report() {
+    async fn book_event_does_not_persist_signal_audit_report() {
         let exchange = Arc::new(RecordingExchange::default());
         let pool = migrated_pool().await;
         let mut state = runtime_state_with_book();
@@ -2428,13 +2382,10 @@ mod tests {
             .await
             .expect("book event handled");
 
-        let payload = latest_report_payload(&pool, "signal_audit").await;
-        assert_eq!(payload["event_type"], "signal_transition");
-        assert_eq!(payload["audit"], true);
-        assert_eq!(payload["reason"], "book has no two-sided depth");
-        assert_eq!(payload["signal"]["name"], "orderbook");
-        assert_eq!(payload["state"]["books"][0]["asset_id"], "asset-yes");
-        assert_eq!(payload["state"]["books"][0]["asks"], serde_json::json!([]));
+        assert!(
+            latest_report_payload(&pool, "signal_audit").await.is_none(),
+            "actions_only audit should not persist signal_audit rows"
+        );
     }
 
     #[tokio::test]
