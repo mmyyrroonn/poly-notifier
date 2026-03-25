@@ -487,6 +487,48 @@ fn ensure_rustls_crypto_provider() -> Result<()> {
     Ok(())
 }
 
+fn validate_admin_password(admin_password: String) -> Result<String> {
+    if admin_password.trim().is_empty() {
+        anyhow::bail!("ADMIN_PASSWORD env var must not be empty - the admin API controls live trading");
+    }
+
+    Ok(admin_password)
+}
+
+fn load_admin_password() -> Result<String> {
+    let admin_password = std::env::var("ADMIN_PASSWORD")
+        .context("ADMIN_PASSWORD env var must be set - the admin API controls live trading")?;
+    validate_admin_password(admin_password)
+}
+
+fn build_admin_addr(config: &AppConfig) -> String {
+    format!("{}:{}", config.admin.bind_addr, config.admin.port)
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT");
+            }
+            _ = sigterm.recv() => {
+                info!("received SIGTERM");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     ensure_rustls_crypto_provider()?;
@@ -504,6 +546,7 @@ async fn main() -> Result<()> {
     let bot_registry = build_bot_registry();
     let reporter = build_reporter(&config, bot_registry.clone());
     let cancel = CancellationToken::new();
+    let admin_password = load_admin_password()?;
     let include_inventory_approval = markets
         .iter()
         .any(|market| market.auto_split_on_startup && market.startup_split_amount > 0.0);
@@ -641,24 +684,24 @@ async fn main() -> Result<()> {
         }));
     }
 
-    let admin_password = std::env::var("ADMIN_PASSWORD")
-        .expect("ADMIN_PASSWORD env var must be set - the admin API controls live trading");
     let router = create_router(
         pool.clone(),
         admin_password,
         Some(MultiLpControlHandle::new(controls)),
     );
-    let admin_addr = format!("{}:{}", config.lp.control.bind_addr, config.admin.port);
+    let admin_addr = build_admin_addr(&config);
+    let admin_listener = tokio::net::TcpListener::bind(&admin_addr)
+        .await
+        .context("failed to bind admin API")?;
+    info!(%admin_addr, "admin API listening");
     let admin_cancel = cancel.clone();
     let admin_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(&admin_addr)
-            .await
-            .expect("failed to bind admin API");
-        info!(%admin_addr, "admin API listening");
-        axum::serve(listener, router)
+        if let Err(error) = axum::serve(admin_listener, router)
             .with_graceful_shutdown(admin_cancel.cancelled_owned())
             .await
-            .expect("admin API server error");
+        {
+            error!(?error, "admin API server error");
+        }
     });
 
     let guard_heartbeat_handle = guard_heartbeat_url(&config).map(|heartbeat_url| {
@@ -674,8 +717,8 @@ async fn main() -> Result<()> {
         )
     });
 
-    info!("LP daemon started; waiting for Ctrl+C");
-    tokio::signal::ctrl_c().await?;
+    info!("LP daemon started; waiting for shutdown signal");
+    wait_for_shutdown_signal().await?;
     cancel.cancel();
 
     let _ = join_all(service_handles).await;
@@ -1054,8 +1097,9 @@ mod tests {
     };
 
     use super::{
-        build_initial_state, build_service_config, decimal, ensure_rustls_crypto_provider,
-        map_flatten_fill, parse_cli_args, validate_condition_id, QuoteMode,
+        build_admin_addr, build_initial_state, build_service_config, decimal,
+        ensure_rustls_crypto_provider, map_flatten_fill, parse_cli_args,
+        validate_admin_password, validate_condition_id, QuoteMode,
     };
 
     #[test]
@@ -1101,6 +1145,106 @@ mod tests {
     }
 
     #[test]
+    fn validate_admin_password_rejects_empty_values() {
+        let error = validate_admin_password(String::new())
+            .expect_err("empty password should fail");
+        assert!(error.to_string().contains("ADMIN_PASSWORD"));
+    }
+
+    #[test]
+    fn build_admin_addr_uses_admin_bind_addr() {
+        let config = AppConfig {
+            database: DatabaseConfig {
+                url: "sqlite::memory:".to_string(),
+                max_connections: 1,
+            },
+            telegram: TelegramConfig {
+                rate_limit_per_user: 60,
+            },
+            monitor: MonitorConfig {
+                subscription_refresh_interval_secs: 60,
+                ws_ping_interval_secs: 30,
+                reconnect_base_delay_secs: 1,
+                reconnect_max_delay_secs: 60,
+            },
+            alert: AlertConfig {
+                cache_refresh_interval_secs: 60,
+                default_cooldown_minutes: 5,
+                price_flush_interval_secs: 30,
+            },
+            scheduler: SchedulerConfig {
+                daily_summary_cron: "0 0 9 * * *".to_string(),
+            },
+            admin: AdminConfig {
+                bind_addr: "0.0.0.0".to_string(),
+                port: 3000,
+            },
+            guard: GuardConfig::default(),
+            lp: LpConfig {
+                trading: LpTradingConfig {
+                    condition_id: Some("0xabc".to_string()),
+                    clob_base_url: "https://clob.example".to_string(),
+                    gamma_base_url: "https://gamma.example".to_string(),
+                    data_api_base_url: "https://data.example".to_string(),
+                    chain_id: 137,
+                },
+                inventory: LpInventoryConfig {
+                    min_usdc_balance: 100.0,
+                    min_token_balance: 10.0,
+                    auto_split_on_startup: false,
+                    startup_split_amount: 0.0,
+                },
+                strategy: LpStrategyConfig {
+                    quote_mode: "inside".to_string(),
+                    quote_size: 10.0,
+                    min_spread: 0.01,
+                    min_depth: 50.0,
+                    quote_offset_ticks: 1,
+                    max_quote_age_secs: 10,
+                    reward_refresh_interval_secs: 30,
+                    reward_stale_after_secs: 90,
+                    reward_fetch_retries: 3,
+                    reward_fetch_backoff_ms: 250,
+                    min_inside_ticks: 1,
+                    min_inside_depth_multiple: 1.5,
+                    default_external_signal: true,
+                },
+                risk: LpRiskConfig {
+                    max_position: 100.0,
+                    flat_position_tolerance: 1.0,
+                    auto_flatten_after_fill: true,
+                    flatten_use_fok: false,
+                    stale_feed_after_secs: 15,
+                },
+                approvals: LpApprovalConfig {
+                    require_on_startup: true,
+                    auto_approve_on_startup: false,
+                },
+                reporting: LpReportingConfig {
+                    operator_bot_id: None,
+                    operator_chat_ids: Vec::new(),
+                    summary_interval_secs: 60,
+                },
+                control: LpControlConfig {
+                    bind_addr: "127.0.0.1".to_string(),
+                    heartbeat_interval_secs: 30,
+                    reconciliation_interval_secs: 30,
+                },
+                logging: LpLoggingConfig {
+                    snapshot_interval_secs: 60,
+                    directory: "logs".to_string(),
+                    file_prefix: "lp".to_string(),
+                    max_files: 3,
+                    json: true,
+                },
+                markets: Vec::new(),
+            },
+        };
+
+        assert_eq!(build_admin_addr(&config), "0.0.0.0:3000");
+    }
+
+    #[test]
     fn build_initial_state_starts_with_market_feed_gated_until_live_book_arrives() {
         let config = AppConfig {
             database: DatabaseConfig {
@@ -1124,7 +1268,10 @@ mod tests {
             scheduler: SchedulerConfig {
                 daily_summary_cron: "0 0 9 * * *".to_string(),
             },
-            admin: AdminConfig { port: 3000 },
+            admin: AdminConfig {
+                bind_addr: "127.0.0.1".to_string(),
+                port: 3000,
+            },
             guard: GuardConfig::default(),
             lp: LpConfig {
                 trading: LpTradingConfig {
@@ -1262,7 +1409,10 @@ mod tests {
             scheduler: SchedulerConfig {
                 daily_summary_cron: "0 0 9 * * *".to_string(),
             },
-            admin: AdminConfig { port: 3000 },
+            admin: AdminConfig {
+                bind_addr: "127.0.0.1".to_string(),
+                port: 3000,
+            },
             guard: GuardConfig::default(),
             lp: LpConfig {
                 trading: LpTradingConfig {
@@ -1363,7 +1513,10 @@ mod tests {
             scheduler: SchedulerConfig {
                 daily_summary_cron: "0 0 9 * * *".to_string(),
             },
-            admin: AdminConfig { port: 3000 },
+            admin: AdminConfig {
+                bind_addr: "127.0.0.1".to_string(),
+                port: 3000,
+            },
             guard: GuardConfig::default(),
             lp: LpConfig {
                 trading: LpTradingConfig {

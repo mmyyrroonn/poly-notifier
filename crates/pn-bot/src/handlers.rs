@@ -10,8 +10,8 @@ use teloxide::prelude::*;
 use tracing::{instrument, warn};
 
 use pn_common::db::{
-    count_active_subscriptions, get_last_feedback_time, get_or_create_user, get_user_subscriptions,
-    insert_feedback,
+    count_active_subscriptions, delete_subscription_for_telegram_user, get_last_feedback_time,
+    get_or_create_user, get_user_subscriptions, insert_feedback,
 };
 use pn_polymarket::ClobClient;
 
@@ -368,6 +368,7 @@ pub async fn callback_unsubscribe(
     bot: Bot,
     q: CallbackQuery,
     pool: SqlitePool,
+    bot_id: Arc<String>,
     sub_id: i64,
 ) -> anyhow::Result<()> {
     bot.answer_callback_query(q.id.clone()).await?;
@@ -377,14 +378,12 @@ pub async fn callback_unsubscribe(
         None => return Ok(()),
     };
 
-    // Delete the subscription row so CASCADE removes associated alerts.
-    let result = sqlx::query("DELETE FROM subscriptions WHERE id = ?")
-        .bind(sub_id)
-        .execute(&pool)
-        .await;
+    let telegram_id = q.from.id.0 as i64;
+    let result =
+        delete_subscription_for_telegram_user(&pool, sub_id, telegram_id, bot_id.as_ref()).await;
 
     match result {
-        Ok(r) if r.rows_affected() > 0 => {
+        Ok(rows_affected) if rows_affected > 0 => {
             bot.send_message(chat_id, "Subscription and its alerts removed.")
                 .await?;
         }

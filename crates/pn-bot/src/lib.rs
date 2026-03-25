@@ -301,8 +301,16 @@ fn schema() -> UpdateHandler<anyhow::Error> {
                         |bot: Bot,
                          dialogue: MyDialogue,
                          q: CallbackQuery,
-                         pool: SqlitePool| async move {
-                            handle_alert_subscription_selection(bot, dialogue, q, pool).await
+                         pool: SqlitePool,
+                         bot_id: Arc<String>| async move {
+                            handle_alert_subscription_selection(
+                                bot,
+                                dialogue,
+                                q,
+                                pool,
+                                (*bot_id).clone(),
+                            )
+                            .await
                         },
                     ),
                 )
@@ -331,8 +339,8 @@ fn schema() -> UpdateHandler<anyhow::Error> {
 
     // One-shot callback handler for non-dialogue inline actions.
     let callback_handler = Update::filter_callback_query().endpoint(
-        |bot: Bot, q: CallbackQuery, pool: SqlitePool| async move {
-            dispatch_callback(bot, q, pool).await
+        |bot: Bot, q: CallbackQuery, pool: SqlitePool, bot_id: Arc<String>| async move {
+            dispatch_callback(bot, q, pool, bot_id).await
         },
     );
 
@@ -350,7 +358,12 @@ fn schema() -> UpdateHandler<anyhow::Error> {
 ///
 /// Handled prefixes:
 /// * `unsub:{id}` – delete a subscription (cascade deletes alerts).
-async fn dispatch_callback(bot: Bot, q: CallbackQuery, pool: SqlitePool) -> anyhow::Result<()> {
+async fn dispatch_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    pool: SqlitePool,
+    bot_id: Arc<String>,
+) -> anyhow::Result<()> {
     let data = match q.data.as_deref() {
         Some(d) => d.to_string(),
         None => {
@@ -361,7 +374,7 @@ async fn dispatch_callback(bot: Bot, q: CallbackQuery, pool: SqlitePool) -> anyh
 
     if let Some(id_str) = data.strip_prefix("unsub:") {
         if let Ok(sub_id) = id_str.parse::<i64>() {
-            return callback_unsubscribe(bot, q, pool, sub_id).await;
+            return callback_unsubscribe(bot, q, pool, bot_id, sub_id).await;
         }
     }
 

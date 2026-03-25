@@ -329,7 +329,10 @@ mod tests {
             scheduler: SchedulerConfig {
                 daily_summary_cron: "0 0 9 * * *".to_string(),
             },
-            admin: AdminConfig { port: 36363 },
+            admin: AdminConfig {
+                bind_addr: "127.0.0.1".to_string(),
+                port: 36363,
+            },
             guard: GuardConfig {
                 enabled: true,
                 bind_addr: "0.0.0.0".to_string(),

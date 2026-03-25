@@ -25,6 +25,30 @@ impl CancelAllTransport for DirectCancelAllTransport {
 
 static RUSTLS_PROVIDER_READY: OnceLock<()> = OnceLock::new();
 
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT");
+            }
+            _ = sigterm.recv() => {
+                info!("received SIGTERM");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     ensure_rustls_crypto_provider()?;
@@ -44,8 +68,8 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     let (listen_addr, handle) = run_guard(runtime_config, transport, cancel.clone()).await?;
 
-    info!(%listen_addr, "poly-guard started; waiting for Ctrl+C");
-    tokio::signal::ctrl_c().await?;
+    info!(%listen_addr, "poly-guard started; waiting for shutdown signal");
+    wait_for_shutdown_signal().await?;
     cancel.cancel();
     handle.await??;
     Ok(())

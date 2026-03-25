@@ -131,10 +131,13 @@ impl NotifyService {
         );
 
         // Resolve internal user ID (needed for the FK in notification_log).
-        let user_id_opt = resolve_user_id_by_telegram(&self.pool, req.user_telegram_id)
+        let user_id_opt = resolve_user_id_by_telegram(&self.pool, req.user_telegram_id, &req.bot_id)
             .await
             .with_context(|| {
-                format!("resolving user_id for telegram_id={}", req.user_telegram_id)
+                format!(
+                    "resolving user_id for telegram_id={} bot_id={}",
+                    req.user_telegram_id, req.bot_id
+                )
             })?;
 
         let Some(user_id) = user_id_opt else {

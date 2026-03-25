@@ -13,7 +13,7 @@
 //! * **Alert** – modify or add alerts on an existing subscription.
 
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use teloxide::{
     dispatching::dialogue::{Dialogue, InMemStorage},
@@ -21,7 +21,10 @@ use teloxide::{
 };
 use tracing::{debug, instrument, warn};
 
-use pn_common::db::{count_active_subscriptions, get_or_create_user, get_user_subscriptions};
+use pn_common::db::{
+    count_active_subscriptions, get_or_create_user, get_subscription_question_for_telegram_user,
+    get_user_subscriptions,
+};
 use pn_polymarket::GammaClient;
 
 use crate::keyboards::{
@@ -678,6 +681,7 @@ pub async fn handle_alert_subscription_selection(
     dialogue: MyDialogue,
     q: CallbackQuery,
     pool: SqlitePool,
+    bot_id: String,
 ) -> anyhow::Result<()> {
     bot.answer_callback_query(q.id.clone()).await?;
 
@@ -696,24 +700,16 @@ pub async fn handle_alert_subscription_selection(
         None => return Ok(()),
     };
 
-    // Fetch the subscription's market question.
-    let row = sqlx::query(
-        r#"
-        SELECT m.question
-        FROM subscriptions s
-        JOIN markets m ON m.id = s.market_id
-        WHERE s.id = ?
-        "#,
+    let telegram_id = q.from.id.0 as i64;
+    let question = match get_subscription_question_for_telegram_user(
+        &pool,
+        sub_id,
+        telegram_id,
+        &bot_id,
     )
-    .bind(sub_id)
-    .fetch_optional(&pool)
-    .await?;
-
-    let question = match row {
-        Some(r) => {
-            let q_str: String = r.get("question");
-            q_str
-        }
+    .await?
+    {
+        Some(question) => question,
         None => {
             bot.send_message(chat_id, "Subscription not found. Please try /alert again.")
                 .await?;

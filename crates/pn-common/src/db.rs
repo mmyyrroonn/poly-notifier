@@ -64,9 +64,9 @@ pub async fn init_db(database_url: &str, max_connections: u32) -> Result<SqliteP
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 use sqlx::Executor;
-                conn.execute("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-                    .await
-                    .map(|_| ())
+                conn.execute("PRAGMA journal_mode=WAL;").await?;
+                conn.execute("PRAGMA foreign_keys=ON;").await?;
+                Ok(())
             })
         })
         .connect(database_url)
@@ -199,6 +199,65 @@ pub async fn get_user_subscriptions(
     .fetch_all(pool)
     .await
     .map_err(Error::Database)
+}
+
+/// Fetch the subscribed market question only if the subscription belongs to
+/// the Telegram user identified by `(telegram_id, bot_id)`.
+pub async fn get_subscription_question_for_telegram_user(
+    pool: &SqlitePool,
+    subscription_id: i64,
+    telegram_id: i64,
+    bot_id: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT m.question
+        FROM subscriptions s
+        JOIN markets m ON m.id = s.market_id
+        JOIN users u ON u.id = s.user_id
+        WHERE s.id = ?
+          AND u.telegram_id = ?
+          AND u.bot_id = ?
+        "#,
+    )
+    .bind(subscription_id)
+    .bind(telegram_id)
+    .bind(bot_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(Error::Database)?;
+
+    Ok(row.map(|(question,)| question))
+}
+
+/// Delete a subscription only if it belongs to the Telegram user identified by
+/// `(telegram_id, bot_id)`.
+pub async fn delete_subscription_for_telegram_user(
+    pool: &SqlitePool,
+    subscription_id: i64,
+    telegram_id: i64,
+    bot_id: &str,
+) -> Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM subscriptions
+        WHERE id = ?
+          AND user_id = (
+              SELECT id
+              FROM users
+              WHERE telegram_id = ?
+                AND bot_id = ?
+          )
+        "#,
+    )
+    .bind(subscription_id)
+    .bind(telegram_id)
+    .bind(bot_id)
+    .execute(pool)
+    .await
+    .map_err(Error::Database)?;
+
+    Ok(result.rows_affected())
 }
 
 /// Return every active subscription in the system together with its market and
@@ -743,9 +802,13 @@ pub async fn mark_notification_delivered(pool: &SqlitePool, log_id: i64) -> Resu
 pub async fn resolve_user_id_by_telegram(
     pool: &SqlitePool,
     telegram_id: i64,
+    bot_id: &str,
 ) -> Result<Option<i64>> {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM users WHERE telegram_id = ? LIMIT 1")
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM users WHERE telegram_id = ? AND bot_id = ? LIMIT 1",
+    )
         .bind(telegram_id)
+        .bind(bot_id)
         .fetch_optional(pool)
         .await
         .map_err(Error::Database)?;
@@ -830,8 +893,10 @@ mod tests {
     };
 
     use super::{
-        get_recent_lp_control_actions, get_recent_lp_heartbeats, init_db, insert_lp_control_action,
-        insert_lp_heartbeat,
+        delete_subscription_for_telegram_user, get_or_create_user,
+        get_recent_lp_control_actions, get_recent_lp_heartbeats,
+        get_subscription_question_for_telegram_user, init_db, insert_lp_control_action,
+        insert_lp_heartbeat, resolve_user_id_by_telegram, upsert_market,
     };
 
     fn unique_db_path(test_name: &str) -> PathBuf {
@@ -904,5 +969,110 @@ mod tests {
         assert!(db_path.exists(), "sqlite database file should exist");
 
         std::fs::remove_file(&db_path).expect("temporary sqlite database removed");
+    }
+
+    #[tokio::test]
+    async fn init_db_enables_foreign_keys() {
+        let pool = init_db("sqlite::memory:", 1)
+            .await
+            .expect("in-memory sqlite pool");
+
+        let row: (i64,) = sqlx::query_as("PRAGMA foreign_keys;")
+            .fetch_one(&pool)
+            .await
+            .expect("pragma foreign_keys");
+
+        assert_eq!(row.0, 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_user_id_by_telegram_scopes_by_bot_id() {
+        let pool = init_db("sqlite::memory:", 1)
+            .await
+            .expect("in-memory sqlite pool");
+
+        let primary = get_or_create_user(&pool, 42, "bot-a", Some("alice"))
+            .await
+            .expect("user for bot-a");
+        let secondary = get_or_create_user(&pool, 42, "bot-b", Some("alice"))
+            .await
+            .expect("user for bot-b");
+
+        let resolved_primary = resolve_user_id_by_telegram(&pool, 42, "bot-a")
+            .await
+            .expect("resolve bot-a");
+        let resolved_secondary = resolve_user_id_by_telegram(&pool, 42, "bot-b")
+            .await
+            .expect("resolve bot-b");
+
+        assert_eq!(resolved_primary, Some(primary.id));
+        assert_eq!(resolved_secondary, Some(secondary.id));
+        assert_ne!(resolved_primary, resolved_secondary);
+    }
+
+    #[tokio::test]
+    async fn subscription_helpers_enforce_telegram_user_ownership() {
+        let pool = init_db("sqlite::memory:", 1)
+            .await
+            .expect("in-memory sqlite pool");
+
+        let owner = get_or_create_user(&pool, 1001, "bot-a", Some("owner"))
+            .await
+            .expect("owner user");
+        let intruder = get_or_create_user(&pool, 2002, "bot-a", Some("intruder"))
+            .await
+            .expect("intruder user");
+        let market_id = upsert_market(
+            &pool,
+            "condition-1",
+            "Will ownership hold?",
+            None,
+            r#"["Yes","No"]"#,
+            r#"["tok-yes","tok-no"]"#,
+        )
+        .await
+        .expect("market inserted");
+
+        let subscription_id = sqlx::query(
+            "INSERT INTO subscriptions (user_id, market_id, outcome_index) VALUES (?, ?, 0)",
+        )
+        .bind(owner.id)
+        .bind(market_id)
+        .execute(&pool)
+        .await
+        .expect("subscription inserted")
+        .last_insert_rowid();
+
+        let intruder_question = get_subscription_question_for_telegram_user(
+            &pool,
+            subscription_id,
+            intruder.telegram_id,
+            "bot-a",
+        )
+        .await
+        .expect("intruder lookup");
+        assert!(intruder_question.is_none());
+
+        let owner_question = get_subscription_question_for_telegram_user(
+            &pool,
+            subscription_id,
+            owner.telegram_id,
+            "bot-a",
+        )
+        .await
+        .expect("owner lookup");
+        assert_eq!(owner_question.as_deref(), Some("Will ownership hold?"));
+
+        let deleted_by_intruder =
+            delete_subscription_for_telegram_user(&pool, subscription_id, intruder.telegram_id, "bot-a")
+                .await
+                .expect("intruder delete");
+        assert_eq!(deleted_by_intruder, 0);
+
+        let deleted_by_owner =
+            delete_subscription_for_telegram_user(&pool, subscription_id, owner.telegram_id, "bot-a")
+                .await
+                .expect("owner delete");
+        assert_eq!(deleted_by_owner, 1);
     }
 }

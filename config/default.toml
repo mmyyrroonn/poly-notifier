@@ -21,6 +21,7 @@ price_flush_interval_secs = 30
 daily_summary_cron = "0 0 9 * * *"  # 9:00 UTC daily
 
 [admin]
+bind_addr = "127.0.0.1"
 port = 36363
 # Password set via ADMIN_PASSWORD env var
 

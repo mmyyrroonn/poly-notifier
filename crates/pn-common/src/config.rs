@@ -63,6 +63,9 @@ pub struct SchedulerConfig {
 /// Admin HTTP server settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
+    /// Hostname/interface for the admin listener.
+    #[serde(default = "default_admin_bind_addr")]
+    pub bind_addr: String,
     /// TCP port the admin server listens on.
     pub port: u16,
 }
@@ -431,6 +434,10 @@ fn default_control_bind_addr() -> String {
     "127.0.0.1".to_string()
 }
 
+fn default_admin_bind_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
 fn default_guard_bind_addr() -> String {
     "127.0.0.1".to_string()
 }
@@ -533,6 +540,7 @@ price_flush_interval_secs = 30
 daily_summary_cron = "0 0 9 * * *"
 
 [admin]
+bind_addr = "0.0.0.0"
 port = 36363
 
 [guard]
@@ -604,6 +612,7 @@ json = true
         let config = AppConfig::load_from(path.to_str().unwrap()).expect("load config");
         fs::remove_file(&path).ok();
 
+        assert_eq!(config.admin.bind_addr, "0.0.0.0");
         assert_eq!(
             config.lp.trading.condition_id.as_deref(),
             Some("condition-legacy")
@@ -637,6 +646,7 @@ price_flush_interval_secs = 30
 daily_summary_cron = "0 0 9 * * *"
 
 [admin]
+bind_addr = "127.0.0.9"
 port = 36363
 
 [guard]
@@ -725,6 +735,7 @@ enabled = false
         let config = AppConfig::load_from(path.to_str().unwrap()).expect("load config");
         fs::remove_file(&path).ok();
 
+        assert_eq!(config.admin.bind_addr, "127.0.0.9");
         assert!(config.lp.trading.condition_id.is_none());
         assert_eq!(config.lp.markets.len(), 2);
         assert_eq!(config.lp.markets[0].condition_id, "condition-a");
