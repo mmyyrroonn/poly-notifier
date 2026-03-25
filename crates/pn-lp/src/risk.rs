@@ -1,5 +1,6 @@
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
+use serde::Serialize;
 
 use crate::types::{QuoteSide, RuntimeState, TradeFill};
 
@@ -12,7 +13,7 @@ pub struct RiskConfig {
     pub flatten_use_fok: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FlattenIntent {
     pub asset_id: String,
     pub side: QuoteSide,

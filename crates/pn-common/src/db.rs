@@ -673,6 +673,26 @@ pub async fn get_recent_lp_reports(pool: &SqlitePool, limit: i64) -> Result<Vec<
     .map_err(Error::Database)
 }
 
+/// Fetch recent reports for a specific LP market.
+pub async fn get_lp_reports_for_condition(
+    pool: &SqlitePool,
+    condition_id: &str,
+    limit: i64,
+) -> Result<Vec<LpReport>> {
+    sqlx::query_as(
+        "SELECT id, condition_id, report_type, payload, created_at \
+         FROM lp_reports \
+         WHERE condition_id = ? \
+         ORDER BY created_at DESC \
+         LIMIT ?",
+    )
+    .bind(condition_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::Database)
+}
+
 /// Persist a control action together with its originating actor.
 pub async fn insert_lp_control_action(
     pool: &SqlitePool,
@@ -893,10 +913,10 @@ mod tests {
     };
 
     use super::{
-        delete_subscription_for_telegram_user, get_or_create_user,
+        delete_subscription_for_telegram_user, get_lp_reports_for_condition, get_or_create_user,
         get_recent_lp_control_actions, get_recent_lp_heartbeats,
         get_subscription_question_for_telegram_user, init_db, insert_lp_control_action,
-        insert_lp_heartbeat, resolve_user_id_by_telegram, upsert_market,
+        insert_lp_heartbeat, insert_lp_report, resolve_user_id_by_telegram, upsert_market,
     };
 
     fn unique_db_path(test_name: &str) -> PathBuf {
@@ -952,6 +972,28 @@ mod tests {
             .expect("heartbeats fetched");
         assert_eq!(heartbeats.len(), 2);
         assert_eq!(heartbeats[0].condition_id.as_deref(), Some("condition-1"));
+    }
+
+    #[tokio::test]
+    async fn get_lp_reports_for_condition_scopes_results() {
+        let pool = init_db("sqlite::memory:", 1)
+            .await
+            .expect("in-memory sqlite pool");
+
+        insert_lp_report(&pool, Some("condition-1"), "decision_audit", "{\"audit\":true}")
+            .await
+            .expect("condition-1 report inserted");
+        insert_lp_report(&pool, Some("condition-2"), "decision_audit", "{\"audit\":true}")
+            .await
+            .expect("condition-2 report inserted");
+
+        let reports = get_lp_reports_for_condition(&pool, "condition-1", 10)
+            .await
+            .expect("reports fetched");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].condition_id.as_deref(), Some("condition-1"));
+        assert_eq!(reports[0].report_type, "decision_audit");
     }
 
     #[tokio::test]

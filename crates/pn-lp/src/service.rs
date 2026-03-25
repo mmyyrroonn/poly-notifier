@@ -10,6 +10,7 @@ use pn_common::db::{
     insert_lp_risk_event, upsert_lp_order, upsert_lp_trade,
 };
 use rust_decimal::Decimal;
+use serde::Serialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, watch};
@@ -19,7 +20,7 @@ use tracing::{error, info, warn};
 
 use crate::control::{ControlCommand, LpControlHandle};
 use crate::decision::{DecisionConfig, DecisionDiagnostics, DecisionEngine, DecisionOutcome};
-use crate::observability::{signal_transitions, summarize_quotes};
+use crate::observability::{runtime_state_snapshot, signal_transitions, summarize_quotes};
 use crate::risk::{FlattenIntent, RiskAction, RiskConfig, RiskEngine};
 use crate::signals::{SignalAggregator, SignalUpdate};
 use crate::types::{
@@ -99,6 +100,51 @@ impl BookActivityWindow {
 #[derive(Debug, Default)]
 struct BookActivityTracker {
     windows: HashMap<String, BookActivityWindow>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditEnvelope<'a, T: Serialize> {
+    audit: bool,
+    report_type: &'a str,
+    event_type: &'a str,
+    condition_id: &'a str,
+    question: &'a str,
+    reason: Option<&'a str>,
+    recorded_at: DateTime<Utc>,
+    state: crate::observability::AuditStateSnapshot,
+    #[serde(flatten)]
+    details: T,
+}
+
+#[derive(Debug, Serialize)]
+struct DecisionAuditDetails {
+    decision: DecisionAuditSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct DecisionAuditSnapshot {
+    cancel_all: bool,
+    desired_quotes: Vec<QuoteIntent>,
+    diagnostics: DecisionDiagnostics,
+}
+
+#[derive(Debug, Serialize)]
+struct FlattenAuditDetails {
+    flatten: FlattenIntent,
+    fill: Option<TradeFill>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct QuoteAuditDetails {
+    action: &'static str,
+    quotes: Vec<QuoteIntent>,
+    open_orders: Vec<ManagedOrder>,
+}
+
+#[derive(Debug, Serialize)]
+struct SignalAuditDetails {
+    signal: crate::observability::SignalTransition,
 }
 
 impl BookActivityTracker {
@@ -589,7 +635,8 @@ impl LpService {
                         reason,
                     },
                 );
-                self.log_signal_transitions(&before, &state.signals);
+                self.log_signal_transitions(state, &before, &state.signals)
+                    .await?;
             }
         }
 
@@ -619,10 +666,11 @@ impl LpService {
                     }
                 };
                 SignalAggregator.apply(state, signal_state);
-                self.log_signal_transitions(&before, &state.signals);
                 state.last_market_event_at = Some(now);
                 self.observe_book_activity(&book, now);
                 state.books.insert(book.asset_id.clone(), book);
+                self.log_signal_transitions(state, &before, &state.signals)
+                    .await?;
             }
             ExchangeEvent::Order(order) => {
                 info!(
@@ -884,6 +932,18 @@ impl LpService {
                     }),
                 )
                 .await?;
+                self.emit_audit(
+                    state,
+                    "flatten_audit",
+                    "flatten_submitted",
+                    Some(reason),
+                    FlattenAuditDetails {
+                        flatten: intent.clone(),
+                        fill: Some(fill),
+                        error: None,
+                    },
+                )
+                .await?;
             }
             Ok(None) => {
                 state.flags.flattening = false;
@@ -904,6 +964,18 @@ impl LpService {
                         "side": intent.side.to_string(),
                         "size": intent.size.to_string(),
                     }),
+                )
+                .await?;
+                self.emit_audit(
+                    state,
+                    "flatten_audit",
+                    "flatten_submitted",
+                    Some(reason),
+                    FlattenAuditDetails {
+                        flatten: intent.clone(),
+                        fill: None,
+                        error: None,
+                    },
                 )
                 .await?;
             }
@@ -928,6 +1000,18 @@ impl LpService {
                         "size": intent.size.to_string(),
                         "error": error.to_string(),
                     }),
+                )
+                .await?;
+                self.emit_audit(
+                    state,
+                    "flatten_audit",
+                    "flatten_error",
+                    Some(reason),
+                    FlattenAuditDetails {
+                        flatten: intent.clone(),
+                        fill: None,
+                        error: Some(error.to_string()),
+                    },
                 )
                 .await?;
             }
@@ -970,10 +1054,25 @@ impl LpService {
                 diagnostics = %diagnostics.as_deref().unwrap_or("{}"),
                 "decision updated"
             );
+            self.emit_audit(
+                state,
+                "decision_audit",
+                "decision_updated",
+                Some(&outcome.reason),
+                DecisionAuditDetails {
+                    decision: DecisionAuditSnapshot {
+                        cancel_all: outcome.cancel_all,
+                        desired_quotes: outcome.desired_quotes.clone(),
+                        diagnostics: outcome.diagnostics.clone(),
+                    },
+                },
+            )
+            .await?;
         }
 
         if outcome.cancel_all {
             if !state.open_orders.is_empty() {
+                let canceled_orders = state.open_orders.clone();
                 warn!(
                     target: "lp.quote",
                     open_orders = state.open_orders.len(),
@@ -981,8 +1080,19 @@ impl LpService {
                     diagnostics = %diagnostics.as_deref().unwrap_or("{}"),
                     "decision requested quote cancellation"
                 );
+                self.emit_audit(
+                    state,
+                    "quote_audit",
+                    "quote_cancelled",
+                    Some(&outcome.reason),
+                    QuoteAuditDetails {
+                        action: "cancel_all",
+                        quotes: outcome.desired_quotes.clone(),
+                        open_orders: canceled_orders.clone(),
+                    },
+                )
+                .await?;
                 self.exchange.cancel_all().await?;
-                let canceled_orders = state.open_orders.clone();
                 remember_terminal_orders(state, &canceled_orders);
                 self.mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
                     .await?;
@@ -996,13 +1106,25 @@ impl LpService {
         }
 
         if !state.open_orders.is_empty() {
+            let canceled_orders = state.open_orders.clone();
             info!(
                 target: "lp.quote",
                 open_orders = state.open_orders.len(),
                 "refreshing existing quotes before reposting"
             );
+            self.emit_audit(
+                state,
+                "quote_audit",
+                "quote_cancelled",
+                Some("refreshing existing quotes before reposting"),
+                QuoteAuditDetails {
+                    action: "refresh",
+                    quotes: outcome.desired_quotes.clone(),
+                    open_orders: canceled_orders.clone(),
+                },
+            )
+            .await?;
             self.exchange.cancel_all().await?;
-            let canceled_orders = state.open_orders.clone();
             remember_terminal_orders(state, &canceled_orders);
             self.mark_orders_status(&state.market.condition_id, &canceled_orders, "CANCELED")
                 .await?;
@@ -1051,6 +1173,18 @@ impl LpService {
             );
         }
         replace_open_orders(state, posted);
+        self.emit_audit(
+            state,
+            "quote_audit",
+            "quote_submitted",
+            Some(&outcome.reason),
+            QuoteAuditDetails {
+                action: "submit",
+                quotes: outcome.desired_quotes.clone(),
+                open_orders: state.open_orders.clone(),
+            },
+        )
+        .await?;
 
         Ok(())
     }
@@ -1221,6 +1355,45 @@ impl LpService {
         Ok(())
     }
 
+    async fn emit_audit<T: Serialize>(
+        &self,
+        state: &RuntimeState,
+        report_type: &str,
+        event_type: &str,
+        reason: Option<&str>,
+        details: T,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(&AuditEnvelope {
+            audit: true,
+            report_type,
+            event_type,
+            condition_id: &state.market.condition_id,
+            question: &state.market.question,
+            reason,
+            recorded_at: Utc::now(),
+            state: runtime_state_snapshot(state),
+            details,
+        })?;
+
+        insert_lp_report(
+            &self.pool,
+            Some(&state.market.condition_id),
+            report_type,
+            &payload,
+        )
+        .await?;
+        info!(
+            target: "lp.audit",
+            audit = true,
+            report_type = %report_type,
+            event_type = %event_type,
+            reason = reason.unwrap_or(""),
+            payload = %payload,
+            "audit event persisted"
+        );
+        Ok(())
+    }
+
     fn refresh_health_flags(&self, state: &mut RuntimeState) {
         let now = Utc::now();
         state.flags.market_feed_healthy = state
@@ -1262,11 +1435,12 @@ impl LpService {
         }
     }
 
-    fn log_signal_transitions(
+    async fn log_signal_transitions(
         &self,
+        state: &RuntimeState,
         before: &HashMap<String, SignalState>,
         after: &HashMap<String, SignalState>,
-    ) {
+    ) -> Result<()> {
         for transition in signal_transitions(before, after) {
             let previous_active = transition
                 .previous_active
@@ -1290,7 +1464,18 @@ impl LpService {
                 previous_reason = %previous_reason,
                 "signal {level}"
             );
+            self.emit_audit(
+                state,
+                "signal_audit",
+                "signal_transition",
+                Some(&transition.reason),
+                SignalAuditDetails {
+                    signal: transition.clone(),
+                },
+            )
+            .await?;
         }
+        Ok(())
     }
 
     fn flatten_intents_from_positions(&self, state: &RuntimeState) -> Vec<FlattenIntent> {
@@ -1476,7 +1661,7 @@ mod tests {
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use chrono::Utc;
-    use pn_common::db::init_db;
+    use pn_common::db::{get_recent_lp_reports, init_db};
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
     use tokio::sync::mpsc;
@@ -1980,6 +2165,17 @@ mod tests {
             .expect("migrated in-memory sqlite pool")
     }
 
+    async fn latest_report_payload(pool: &SqlitePool, report_type: &str) -> serde_json::Value {
+        let reports = get_recent_lp_reports(pool, 20)
+            .await
+            .expect("recent reports fetched");
+        let report = reports
+            .into_iter()
+            .find(|report| report.report_type == report_type)
+            .unwrap_or_else(|| panic!("missing {report_type} report"));
+        serde_json::from_str(&report.payload).expect("report payload json")
+    }
+
     #[tokio::test]
     async fn trade_event_updates_position_before_risk_flatten() {
         let exchange = Arc::new(RecordingExchange::default());
@@ -2104,6 +2300,141 @@ mod tests {
             .expect("flatten succeeded");
 
         assert!(!state.flags.flattening);
+    }
+
+    #[tokio::test]
+    async fn recompute_quotes_persists_decision_audit_report() {
+        let exchange = Arc::new(RecordingExchange::default());
+        let pool = migrated_pool().await;
+        let mut state = runtime_state_with_book();
+        state.books.get_mut("asset-yes").unwrap().bids = vec![BookLevel {
+            price: dec!(0.50),
+            size: dec!(100),
+        }];
+        state.books.get_mut("asset-yes").unwrap().asks = vec![BookLevel {
+            price: dec!(0.51),
+            size: dec!(120),
+        }];
+        state.positions.insert(
+            "asset-yes".to_string(),
+            PositionSnapshot {
+                asset_id: "asset-yes".to_string(),
+                size: dec!(25),
+                avg_price: dec!(0.42),
+            },
+        );
+        state
+            .account
+            .token_balances
+            .insert("asset-yes".to_string(), dec!(40));
+        let (service, _) = LpService::new(
+            exchange,
+            pool.clone(),
+            service_config(),
+            None,
+            state.clone(),
+        );
+
+        service
+            .recompute_quotes(&mut state)
+            .await
+            .expect("quotes recomputed");
+
+        let payload = latest_report_payload(&pool, "decision_audit").await;
+        assert_eq!(payload["event_type"], "decision_updated");
+        assert_eq!(payload["audit"], true);
+        assert_eq!(payload["condition_id"], "condition-1");
+        assert_eq!(payload["reason"], "reward-qualified single-sided quote");
+        assert_eq!(payload["state"]["market"]["question"], "Will X happen?");
+        assert_eq!(payload["state"]["books"][0]["asset_id"], "asset-yes");
+        assert_eq!(payload["state"]["positions"][0]["asset_id"], "asset-yes");
+        assert_eq!(payload["decision"]["desired_quotes"][0]["asset_id"], "asset-yes");
+    }
+
+    #[tokio::test]
+    async fn execute_flatten_persists_flatten_audit_report() {
+        let exchange = Arc::new(RecordingExchange::with_flatten_result(Some(TradeFill {
+            trade_id: "trade-ack".to_string(),
+            order_id: Some("order-ack".to_string()),
+            asset_id: "asset-yes".to_string(),
+            side: QuoteSide::Sell,
+            price: dec!(0.43),
+            size: dec!(25),
+            status: "MATCHED".to_string(),
+            received_at: Utc::now(),
+        })));
+        let pool = migrated_pool().await;
+        let mut state = runtime_state_with_book();
+        state.positions.insert(
+            "asset-yes".to_string(),
+            PositionSnapshot {
+                asset_id: "asset-yes".to_string(),
+                size: dec!(25),
+                avg_price: dec!(0.42),
+            },
+        );
+        let (service, _) = LpService::new(exchange, pool.clone(), service_config(), None, state.clone());
+
+        service
+            .execute_flatten(
+                &mut state,
+                "risk flatten",
+                &FlattenIntent {
+                    asset_id: "asset-yes".to_string(),
+                    side: QuoteSide::Sell,
+                    price: dec!(0.43),
+                    size: dec!(25),
+                    use_fok: false,
+                },
+            )
+            .await
+            .expect("flatten succeeded");
+
+        let payload = latest_report_payload(&pool, "flatten_audit").await;
+        assert_eq!(payload["event_type"], "flatten_submitted");
+        assert_eq!(payload["audit"], true);
+        assert_eq!(payload["reason"], "risk flatten");
+        assert_eq!(payload["flatten"]["asset_id"], "asset-yes");
+        assert_eq!(payload["flatten"]["size"], "25");
+        assert_eq!(payload["state"]["positions"][0]["asset_id"], "asset-yes");
+    }
+
+    #[tokio::test]
+    async fn book_event_persists_signal_audit_report() {
+        let exchange = Arc::new(RecordingExchange::default());
+        let pool = migrated_pool().await;
+        let mut state = runtime_state_with_book();
+        let (service, _) = LpService::new(
+            exchange,
+            pool.clone(),
+            service_config(),
+            None,
+            state.clone(),
+        );
+
+        service
+            .handle_exchange_event(
+                &mut state,
+                ExchangeEvent::Book(BookSnapshot {
+                    asset_id: "asset-yes".to_string(),
+                    bids: vec![BookLevel {
+                        price: dec!(0.40),
+                        size: dec!(100),
+                    }],
+                    asks: vec![],
+                    received_at: Utc::now(),
+                }),
+            )
+            .await
+            .expect("book event handled");
+
+        let payload = latest_report_payload(&pool, "signal_audit").await;
+        assert_eq!(payload["event_type"], "signal_transition");
+        assert_eq!(payload["audit"], true);
+        assert_eq!(payload["reason"], "book has no two-sided depth");
+        assert_eq!(payload["signal"]["name"], "orderbook");
+        assert_eq!(payload["state"]["books"][0]["asset_id"], "asset-yes");
+        assert_eq!(payload["state"]["books"][0]["asks"], serde_json::json!([]));
     }
 
     #[tokio::test]
