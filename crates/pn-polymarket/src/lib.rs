@@ -37,5 +37,8 @@ pub use lp::{
     QuoteRequest, QuoteSide, ReconciliationState, StreamEvent, TokenMetadata, TradeFill,
 };
 pub use rewards::{RewardClient, RewardSnapshot};
-pub use types::{GammaMarket, GammaToken, WsEvent};
+pub use types::{
+    GammaClobReward, GammaMarket, GammaMarketSummary, GammaToken, PublicBookLevel,
+    PublicOrderBook, WsEvent,
+};
 pub use ws::PolymarketWs;

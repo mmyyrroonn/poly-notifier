@@ -34,11 +34,14 @@ use reqwest::Client;
 use rust_decimal::Decimal;
 use tracing::{debug, instrument, warn};
 
-use crate::types::{MidpointResponse, PriceResponse};
+use crate::types::{
+    MidpointResponse, PriceResponse, PublicBookLevel, PublicOrderBook, RawPublicOrderBook,
+};
 
 const DEFAULT_BASE_URL: &str = "https://clob.polymarket.com";
 
 /// HTTP client for the Polymarket CLOB REST API.
+#[derive(Clone)]
 pub struct ClobClient {
     http: Client,
     base_url: String,
@@ -117,6 +120,33 @@ impl ClobClient {
         Ok(map)
     }
 
+    /// Fetch a public order book snapshot for one outcome token.
+    #[instrument(skip(self), fields(token_id))]
+    pub async fn get_order_book(&self, token_id: &str) -> Result<PublicOrderBook> {
+        let url = format!("{}/book", self.base_url);
+        debug!(%url, %token_id, "fetching public order book");
+
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("token_id", token_id)])
+            .send()
+            .await
+            .with_context(|| format!("GET {url}?token_id={token_id} failed"))?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .with_context(|| "reading book response body")?;
+
+        if !status.is_success() {
+            anyhow::bail!("CLOB /book returned {status} for {token_id}: {body}");
+        }
+
+        parse_order_book_response(&body)
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -185,5 +215,89 @@ impl ClobClient {
 impl Default for ClobClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn parse_order_book_response(body: &str) -> Result<PublicOrderBook> {
+    let raw: RawPublicOrderBook =
+        serde_json::from_str(body).with_context(|| "parsing book response")?;
+
+    let mut bids: Vec<PublicBookLevel> = raw
+        .bids
+        .into_iter()
+        .map(parse_book_level)
+        .collect::<Result<_>>()?;
+    bids.sort_by(|left, right| right.price.cmp(&left.price));
+
+    let mut asks: Vec<PublicBookLevel> = raw
+        .asks
+        .into_iter()
+        .map(parse_book_level)
+        .collect::<Result<_>>()?;
+    asks.sort_by(|left, right| left.price.cmp(&right.price));
+
+    Ok(PublicOrderBook {
+        market: raw.market,
+        asset_id: raw.asset_id,
+        timestamp: raw.timestamp,
+        hash: raw.hash,
+        bids,
+        asks,
+        min_order_size: raw.min_order_size,
+        tick_size: raw.tick_size,
+        neg_risk: raw.neg_risk,
+        last_trade_price: raw.last_trade_price,
+    })
+}
+
+fn parse_book_level(raw: crate::types::RawBookLevel) -> Result<PublicBookLevel> {
+    Ok(PublicBookLevel {
+        price: Decimal::from_str(&raw.price)
+            .with_context(|| format!("parsing book price '{}'", raw.price))?,
+        size: Decimal::from_str(&raw.size)
+            .with_context(|| format!("parsing book size '{}'", raw.size))?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_decimal_macros::dec;
+
+    use super::parse_order_book_response;
+
+    #[test]
+    fn order_book_response_parses_and_normalizes_bid_ask_ordering() {
+        let body = r#"{
+          "market": "condition-1",
+          "asset_id": "asset-yes",
+          "timestamp": "1774417100226",
+          "hash": "748febc1ad907c7c57d5f56234ac7042bc7ef348",
+          "bids": [
+            {"price":"0.041","size":"240"},
+            {"price":"0.046","size":"60.81"},
+            {"price":"0.043","size":"1100"}
+          ],
+          "asks": [
+            {"price":"0.349","size":"100"},
+            {"price":"0.111","size":"120.16"},
+            {"price":"0.25","size":"400.75"}
+          ],
+          "min_order_size":"5",
+          "tick_size":"0.001",
+          "neg_risk":false,
+          "last_trade_price":"0.111"
+        }"#;
+
+        let book = parse_order_book_response(body).expect("book parses");
+
+        assert_eq!(book.asset_id, "asset-yes");
+        assert_eq!(book.tick_size, dec!(0.001));
+        assert_eq!(book.min_order_size, dec!(5));
+        assert_eq!(book.bids[0].price, dec!(0.046));
+        assert_eq!(book.bids[1].price, dec!(0.043));
+        assert_eq!(book.bids[2].price, dec!(0.041));
+        assert_eq!(book.asks[0].price, dec!(0.111));
+        assert_eq!(book.asks[1].price, dec!(0.25));
+        assert_eq!(book.asks[2].price, dec!(0.349));
     }
 }

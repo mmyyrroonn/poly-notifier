@@ -15,6 +15,10 @@ path = "src/bin/poly-target.rs"
 name = "poly-guard"
 path = "src/bin/poly-guard.rs"
 
+[[bin]]
+name = "poly-rewards"
+path = "src/bin/poly-rewards.rs"
+
 [dependencies]
 pn-common = { workspace = true }
 pn-polymarket = { workspace = true }
@@ -33,7 +37,10 @@ dotenvy = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 teloxide = { workspace = true }
+futures-util = { workspace = true }
 rustls = "0.23"
