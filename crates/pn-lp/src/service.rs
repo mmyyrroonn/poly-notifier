@@ -1467,7 +1467,7 @@ impl std::fmt::Display for QuoteSide {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1756,7 +1756,7 @@ mod tests {
         flatten_result: Option<TradeFill>,
         reconcile_snapshot: Mutex<Option<ReconciliationSnapshot>>,
         start_events: Mutex<Vec<ExchangeEvent>>,
-        reward_snapshots: Mutex<Vec<TestRewardResponse>>,
+        reward_snapshots: Mutex<VecDeque<TestRewardResponse>>,
     }
 
     type TestRewardResponse = std::result::Result<Option<RewardSnapshot>, String>;
@@ -1785,7 +1785,7 @@ mod tests {
 
         fn with_reward_snapshots(reward_snapshots: Vec<TestRewardResponse>) -> Self {
             Self {
-                reward_snapshots: Mutex::new(reward_snapshots),
+                reward_snapshots: Mutex::new(reward_snapshots.into()),
                 ..Self::default()
             }
         }
@@ -1875,7 +1875,7 @@ mod tests {
             self.reward_snapshots
                 .lock()
                 .expect("reward snapshots mutex")
-                .pop()
+                .pop_front()
                 .unwrap_or(Ok(None))
                 .map_err(|error| anyhow!(error))
         }
@@ -2147,7 +2147,14 @@ mod tests {
         let handle = tokio::spawn(async move { service.run(service_cancel).await });
 
         timeout(Duration::from_secs(1), async {
-            while exchange.cancel_all_calls.load(Ordering::SeqCst) == 0 {
+            loop {
+                let snapshot = control.snapshot();
+                if exchange.cancel_all_calls.load(Ordering::SeqCst) > 0
+                    && snapshot.open_orders.is_empty()
+                    && snapshot.reward.snapshot.is_none()
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -2296,7 +2303,7 @@ mod tests {
         config.reconciliation_interval = Duration::from_secs(3600);
         config.report_interval = Duration::from_secs(3600);
         config.snapshot_interval = Duration::from_secs(3600);
-        config.reward_refresh_interval = Duration::from_millis(10);
+        config.reward_refresh_interval = Duration::from_secs(3600);
 
         let (service, control) =
             LpService::new(exchange.clone(), pool, config, None, initial_state);
@@ -2305,7 +2312,14 @@ mod tests {
         let handle = tokio::spawn(async move { service.run(service_cancel).await });
 
         timeout(Duration::from_secs(1), async {
-            while exchange.cancel_all_calls.load(Ordering::SeqCst) == 0 {
+            loop {
+                let snapshot = control.snapshot();
+                if exchange.cancel_all_calls.load(Ordering::SeqCst) > 0
+                    && snapshot.open_orders.is_empty()
+                    && snapshot.reward.snapshot.is_none()
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -2363,7 +2377,7 @@ mod tests {
         config.reconciliation_interval = Duration::from_secs(3600);
         config.report_interval = Duration::from_secs(3600);
         config.snapshot_interval = Duration::from_secs(3600);
-        config.reward_refresh_interval = Duration::from_millis(10);
+        config.reward_refresh_interval = Duration::from_secs(3600);
 
         let (service, control) =
             LpService::new(exchange.clone(), pool, config, None, initial_state);
@@ -2372,7 +2386,15 @@ mod tests {
         let handle = tokio::spawn(async move { service.run(service_cancel).await });
 
         timeout(Duration::from_secs(1), async {
-            while exchange.cancel_all_calls.load(Ordering::SeqCst) == 0 {
+            loop {
+                let snapshot = control.snapshot();
+                if exchange.cancel_all_calls.load(Ordering::SeqCst) > 0
+                    && snapshot.open_orders.is_empty()
+                    && snapshot.reward.snapshot.is_none()
+                    && snapshot.reward.last_error.as_deref() == Some("temporary reward failure")
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
